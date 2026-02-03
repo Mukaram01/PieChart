@@ -322,8 +322,11 @@ End Function
 ' ─────────────────────────────────────────────────────────────────────
 Private Sub AggregatePeriod(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal periodKey, ByVal startDt, ByVal endDt)
     Dim sDisp, sCore, frac, pct, pctRounded, tagPct, tagPie, pieVal
+    Dim pctValues, allZero
 
     Log "Aggregate", "Range  " & TS3(startDt) & " → " & TS3(endDt)
+
+    Set pctValues = CreateObject("Scripting.Dictionary")
 
     For Each sDisp In G_STATUS_NAMES.Keys
         sCore = G_STATUS_NAMES(sDisp)
@@ -336,14 +339,35 @@ Private Sub AggregatePeriod(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByV
 
         pctRounded = Round(pct, 2)
 
+        pctValues.Add sDisp, pctRounded
+    Next
+
+    allZero = True
+    For Each sDisp In G_STATUS_NAMES.Keys
+        If pctValues(sDisp) <> 0 Then
+            allZero = False
+            Exit For
+        End If
+    Next
+
+    For Each sDisp In G_STATUS_NAMES.Keys
+        pctRounded = pctValues(sDisp)
+
         ' main % (can be 0)
         tagPct = OutTagName(machineId, periodKey, sDisp, False)
         WriteTag tagPct, pctRounded
         Log "Aggregate", tagPct & " = " & pctRounded
 
-        ' pie chart (min 1)
-        pieVal = pctRounded
-        If pieVal < 1 Then pieVal = 1
+        ' pie chart (tagPct unless 0; if all 0, force 1)
+        If allZero Then
+            pieVal = 1
+        Else
+            If pctRounded <> 0 Then
+                pieVal = pctRounded
+            Else
+                pieVal = 1
+            End If
+        End If
         tagPie = OutTagName(machineId, periodKey, sDisp, True)
         WriteTag tagPie, pieVal
         Log "Aggregate", tagPie & " = " & pieVal

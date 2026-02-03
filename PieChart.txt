@@ -1,0 +1,420 @@
+' ======================================================================
+'  WinCC Global Script: Status % Aggregation (WinCC 8.1 / PH 2024)
+'  Computes Aborted/Halted/Running % over 1D / 7D / 30D
+'  via master.dbo.cp_TagStatisticEx using parameterized ADO calls.
+'
+'  OUTPUT TAGS (exact, as required):
+'    <Machine>_<Period>_Machine_<Status>_Percentage              (can be 0)
+'    <Machine>_<Period>_Machine_<Status>_Percentage_PieChart     (min 1)
+'
+'  SOURCE TAGS (boolean 0/1 sampled ~500 ms):
+'    <Prefix>\<Machine>_ProgramStatus_<Status>_Count   (primary)
+'    <Prefix>\<Machine>_ProgramStatus_<Status>         (fallback)
+' ======================================================================
+
+Option Explicit
+
+' ─────────────────────────────────────────────────────────────────────
+' Redundancy helper
+' ─────────────────────────────────────────────────────────────────────
+Private Function IsMaster()
+    On Error Resume Next
+    IsMaster = (CLng(HMIRuntime.Tags("@RM_MASTER").Read) = 1)
+    On Error GoTo 0
+End Function
+
+' ─────────────────────────────────────────────────────────────────────
+' Configuration
+' ─────────────────────────────────────────────────────────────────────
+Const DEFAULT_PROVIDER       = "MSOLEDBSQL"
+Const FALLBACK_PROVIDER      = "SQLNCLI11"
+Const SQL_INSTANCE           = ".\WinCC"      ' adjust if instance differs
+Const INITIAL_CATALOG        = "master"       ' cp_ proc lives in master
+Const SQL_TIMEOUT_SECONDS    = 600            ' per-exec command timeout
+
+' ─────────────────────────────────────────────────────────────────────
+' Runtime throttling (minutes)
+' ─────────────────────────────────────────────────────────────────────
+Const THROTTLE_1D_MINUTES    = 10
+Const THROTTLE_7D_MINUTES    = 15
+Const THROTTLE_30D_MINUTES   = 57
+
+' ─────────────────────────────────────────────────────────────────────
+' ADO constants (no adovbs.inc dependency)
+' ─────────────────────────────────────────────────────────────────────
+Const adCmdText        = 1
+Const adCmdStoredProc  = 4
+Const adParamInput     = 1
+Const adVarWChar       = 202
+Const adDBTimeStamp    = 135
+Const adStateOpen      = 1
+
+' ─────────────────────────────────────────────────────────────────────
+' Runtime state
+' ─────────────────────────────────────────────────────────────────────
+Dim g_lastRun1D, g_lastRun7D, g_lastRun30D
+Dim g_cpExArity : g_cpExArity = -1  ' cached param count of cp_TagStatisticEx
+Dim G_MACHINES, G_STATUS_NAMES
+
+' ─────────────────────────────────────────────────────────────────────
+' Init dictionaries
+' ─────────────────────────────────────────────────────────────────────
+Private Sub InitGlobals()
+    If IsObject(G_MACHINES) Then Exit Sub
+
+    Set G_MACHINES = CreateObject("Scripting.Dictionary")
+    ' MachineId → Tag-logging prefix (left of backslash)
+    G_MACHINES.Add "MNA_0269", "DMG_Mori1_MNA_0269"
+    G_MACHINES.Add "MNA_0270", "DMG_Mori2_MNA_0270"
+    G_MACHINES.Add "MNA_0332", "DMG_Mori3_MNA_0332"
+    
+    'Wheelabrator
+    G_MACHINES.Add "MNA_0164", "Wheelabrator_MNP_0164"
+    
+    'Droop & Rein
+    G_MACHINES.Add "MNA_0085", "Droop_Rein_1_MNA_0085_LM33H"
+    G_MACHINES.Add "MNA_0087", "Droop_Rein_4_MNA_0087_LM33F"
+    
+
+    Set G_STATUS_NAMES = CreateObject("Scripting.Dictionary")
+    ' Display name → core status
+    G_STATUS_NAMES.Add "Aborted",  "Aborted"
+    G_STATUS_NAMES.Add "Halted",   "Halted"
+    G_STATUS_NAMES.Add "Running",  "Running"
+End Sub
+
+' ─────────────────────────────────────────────────────────────────────
+' Logging + sleep helpers
+' ─────────────────────────────────────────────────────────────────────
+Private Function S(ByVal v)
+    If IsNull(v) Or IsEmpty(v) Then
+        S = ""
+    Else
+        S = CStr(v)
+    End If
+End Function
+
+Private Sub Log(ByVal src, ByVal msg)
+    On Error Resume Next
+    HMIRuntime.Trace _
+        FormatDateTime(Now(), vbShortDate) & " " & _
+        FormatDateTime(Now(), vbLongTime) & " [" & src & "] " & S(msg) & vbCrLf
+    On Error GoTo 0
+End Sub
+
+
+Private Sub SleepMs(ByVal ms)
+    On Error Resume Next
+    HMIRuntime.Sleep ms
+    On Error GoTo 0
+End Sub
+
+' ─────────────────────────────────────────────────────────────────────
+' SQL helpers
+' ─────────────────────────────────────────────────────────────────────
+Private Function OpenConnection()
+    On Error Resume Next
+    Dim cn, prov
+    prov = DEFAULT_PROVIDER
+
+    Set cn = CreateObject("ADODB.Connection")
+    cn.Open "Provider=" & prov & ";Data Source=" & SQL_INSTANCE & ";Initial Catalog=" & INITIAL_CATALOG & ";Integrated Security=SSPI;"
+
+    If Err.Number <> 0 Then
+        Log "OpenConnection", "Switching provider from " & prov & " to " & FALLBACK_PROVIDER & " (" & Err.Description & ")"
+        Err.Clear
+        prov = FALLBACK_PROVIDER
+        cn.Open "Provider=" & prov & ";Data Source=" & SQL_INSTANCE & ";Initial Catalog=" & INITIAL_CATALOG & ";Integrated Security=SSPI;"
+    End If
+
+    If Err.Number <> 0 Then
+        Log "OpenConnection", "ERROR opening ADO connection: " & Err.Description
+        Set cn = Nothing
+    End If
+
+    Set OpenConnection = cn
+    On Error GoTo 0
+End Function
+
+Private Sub CloseConn(ByVal cn)
+    On Error Resume Next
+    If Not cn Is Nothing Then If cn.State = adStateOpen Then cn.Close
+    Set cn = Nothing
+    On Error GoTo 0
+End Sub
+
+' Use the runtime catalog tag (like your teammate)
+Private Function GetRuntimeCatalog()
+    On Error Resume Next
+    Dim cat
+    cat = HMIRuntime.Tags("@DatasourceNameRT").Read
+    If Len(cat & "") > 0 Then
+        GetRuntimeCatalog = CStr(cat)
+    Else
+        GetRuntimeCatalog = "WinCC"
+    End If
+    On Error GoTo 0
+End Function
+
+' Timestamp formatter
+Function TS3(ByVal dt)
+    TS3 = Year(dt) & "-" & Right("0" & Month(dt),2) & "-" & Right("0" & Day(dt),2) & _
+          " " & Right("0" & Hour(dt),2) & ":" & Right("0" & Minute(dt),2) & ":" & Right("0" & Second(dt),2) & ".000"
+End Function
+
+' ─────────────────────────────────────────────────────────────────────
+' Parameterized call to cp_TagStatisticEx with retry.
+' Returns Empty on failure; else numeric result.
+' ─────────────────────────────────────────────────────────────────────
+Private Function ExecCpTagStatisticEx(ByVal cn, ByVal useFiveArgs, ByVal runtimeCatalog, ByVal tagSetDef, ByVal tFrom, ByVal tTo, ByVal aggList)
+    Dim i, cmd, rs, lastErrNum, lastErrDesc, dbg, sSql
+    
+    ' Extract just the tag name from tagSetDef (format: TAG:R,'tagname')
+    Dim tagNameOnly
+    tagNameOnly = Replace(tagSetDef, "TAG:R,'", "")
+    tagNameOnly = Left(tagNameOnly, Len(tagNameOnly) - 1) ' Remove trailing quote
+    
+    For i = 1 To 3
+        On Error Resume Next
+        Set cmd = CreateObject("ADODB.Command")
+        Set cmd.ActiveConnection = cn
+        cmd.CommandTimeout = SQL_TIMEOUT_SECONDS
+        cmd.CommandType = 1  ' adCmdText
+        
+        ' Build SQL with 3 parameters - the middle one contains tag, dates all in one!
+        sSql = "cp_TagStatisticEx '" & runtimeCatalog & "'," & _
+               "'TAG:R,''" & tagNameOnly & "'',''" & TS3(tFrom) & "'',''" & TS3(tTo) & "'''," & _
+               "'" & aggList & "'"
+        
+        cmd.CommandText = sSql
+        
+        dbg = "SQL=[" & sSql & "]"
+        Log "cp_TagStatisticEx", dbg
+        
+        Set rs = cmd.Execute
+        
+        If Err.Number = 0 Then
+            If Not (rs Is Nothing) And Not rs.EOF Then
+                If rs.Fields.Count = 1 Then
+                    ExecCpTagStatisticEx = rs.Fields(0).Value
+                    Log "cp_TagStatisticEx", "result=" & CStr(ExecCpTagStatisticEx)
+                Else
+                    Log "cp_TagStatisticEx", "Wrong field count: " & rs.Fields.Count
+                    ExecCpTagStatisticEx = Empty
+                End If
+            Else
+                ExecCpTagStatisticEx = Empty
+                Log "cp_TagStatisticEx", "result=(empty/EOF)"
+            End If
+            On Error Resume Next
+            If Not (rs Is Nothing) Then rs.Close
+            Set rs = Nothing
+            Set cmd = Nothing
+            On Error GoTo 0
+            Exit Function
+        Else
+            lastErrNum = Err.Number
+            lastErrDesc = Err.Description
+            Log "cp_TagStatisticEx", "Attempt " & i & " failed: #" & lastErrNum & " " & lastErrDesc
+            Err.Clear
+            On Error GoTo 0
+            SleepMs 500
+        End If
+    Next
+    
+    ExecCpTagStatisticEx = Empty
+End Function
+
+
+' Wrapper builds TagSetDefinition and chooses arity
+Private Function CpAggregate(ByVal cn, ByVal runtimeCatalog, ByVal tagFullName, ByVal t1, ByVal t2, ByVal agg)
+    Dim tagExpr, res
+
+    tagExpr = "TAG:R,'" & tagFullName & "'"
+    Log "CpAggregate", "tagExpr=" & S(tagExpr)
+    
+    ' Always use 5 args (with catalog)
+    res = ExecCpTagStatisticEx(cn, True, runtimeCatalog, tagExpr, t1, t2, agg)
+
+    If IsEmpty(res) Or IsNull(res) Or (CStr(res) = "") Then
+        Log "CpAggregate", "Final result is empty/null, returning 0"
+        CpAggregate = 0
+    Else
+        CpAggregate = CDbl(res)
+        Log "CpAggregate", "Final result=" & CpAggregate
+    End If
+End Function
+
+' ─────────────────────────────────────────────────────────────────────
+' Resolve the archive tag and compute fraction in [0,1]
+' Order: *_Count → plain
+' Aggregation fields order: AVG(RealValue) → AVG(Value) → AVG(ValueScaled)
+' ─────────────────────────────────────────────────────────────────────
+Private Function GetStateFraction(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal statusName, ByVal t1, ByVal t2)
+    Dim basePrefix, baseCore, tagFull, v
+
+    basePrefix = G_MACHINES(machineId)
+    baseCore   = machineId & "_ProgramStatus_" & statusName
+
+    ' 1) *_Count (your boolean tag naming)
+    tagFull = basePrefix & "\" & baseCore & "_Count"
+    v = TryAvgFraction(cn, runtimeCatalog, tagFull, t1, t2)
+    If IsNumeric(v) Then GetStateFraction = v : Exit Function
+
+    ' 2) plain boolean
+    tagFull = basePrefix & "\" & baseCore
+    v = TryAvgFraction(cn, runtimeCatalog, tagFull, t1, t2)
+    If IsNumeric(v) Then GetStateFraction = v : Exit Function
+
+    ' none produced a [0,1] average
+    Log "Aggregate", "WARNING: No boolean-like average in [0,1] for " & basePrefix & "\" & baseCore & "."
+    GetStateFraction = 0
+End Function
+
+Private Function TryAvgFraction(ByVal cn, ByVal runtimeCatalog, ByVal tagFull, ByVal t1, ByVal t2)
+    Dim v
+
+    ' Prefer RealValue (as in your teammate’s module)
+    v = CpAggregate(cn, runtimeCatalog, tagFull, t1, t2, "AVG(RealValue)")
+    If IsNumeric(v) Then If v >= 0 And v <= 1 Then TryAvgFraction = v : Exit Function
+
+    v = CpAggregate(cn, runtimeCatalog, tagFull, t1, t2, "AVG(Value)")
+    If IsNumeric(v) Then If v >= 0 And v <= 1 Then TryAvgFraction = v : Exit Function
+
+    v = CpAggregate(cn, runtimeCatalog, tagFull, t1, t2, "AVG(ValueScaled)")
+    If IsNumeric(v) Then If v >= 0 And v <= 1 Then TryAvgFraction = v : Exit Function
+
+    TryAvgFraction = Empty
+End Function
+
+' ─────────────────────────────────────────────────────────────────────
+' Build output tag name (exact pattern you use)
+' <Machine>_<Period>_Machine_<Status>_Percentage[ _PieChart ]
+' ─────────────────────────────────────────────────────────────────────
+Private Function OutTagName(ByVal machineId, ByVal periodKey, ByVal statusDispName, ByVal pieChart)
+    If pieChart Then
+        OutTagName = machineId & "_" & periodKey & "_Machine_" & statusDispName & "_Percentage_PieChart"
+    Else
+        OutTagName = machineId & "_" & periodKey & "_Machine_" & statusDispName & "_Percentage"
+    End If
+End Function
+
+' ─────────────────────────────────────────────────────────────────────
+' Aggregate for one machine and write % values to HMI tags
+' Writes:
+'   <...>_Percentage              (can be 0)
+'   <...>_Percentage_PieChart     (min 1)
+' ─────────────────────────────────────────────────────────────────────
+Private Sub AggregatePeriod(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal periodKey, ByVal startDt, ByVal endDt)
+    Dim sDisp, sCore, frac, pct, pctRounded, tagPct, tagPie, pieVal
+
+    Log "Aggregate", "Range  " & TS3(startDt) & " → " & TS3(endDt)
+
+    For Each sDisp In G_STATUS_NAMES.Keys
+        sCore = G_STATUS_NAMES(sDisp)
+
+        ' fraction in [0,1]
+        frac = GetStateFraction(cn, runtimeCatalog, machineId, sCore, startDt, endDt)
+
+        pct = 0
+        If IsNumeric(frac) Then pct = CDbl(frac) * 100
+
+        pctRounded = Round(pct, 2)
+
+        ' main % (can be 0)
+        tagPct = OutTagName(machineId, periodKey, sDisp, False)
+        WriteTag tagPct, pctRounded
+        Log "Aggregate", tagPct & " = " & pctRounded
+
+        ' pie chart (min 1)
+        pieVal = pctRounded
+        If pieVal < 1 Then pieVal = 1
+        tagPie = OutTagName(machineId, periodKey, sDisp, True)
+        WriteTag tagPie, pieVal
+        Log "Aggregate", tagPie & " = " & pieVal
+    Next
+End Sub
+
+Private Sub WriteTag(ByVal tag, ByVal val)
+    On Error Resume Next
+    HMIRuntime.Tags(tag).Write val
+    If Err.Number <> 0 Then
+        Log "HMITag", "Write failed for '" & tag & "': " & Err.Description
+        Err.Clear
+    End If
+    On Error GoTo 0
+End Sub
+
+Private Function ShouldRun(ByVal lastRun, ByVal throttleMin)
+    If IsEmpty(lastRun) Or IsNull(lastRun) Then
+        ShouldRun = True
+        Exit Function
+    End If
+    ShouldRun = (DateDiff("n", lastRun, Now()) >= throttleMin)
+End Function
+
+' ─────────────────────────────────────────────────────────────────────
+' Entry point per machineId
+' ─────────────────────────────────────────────────────────────────────
+Public Sub MainStatusAggregation(ByVal machineId)
+    If Not IsMaster() Then
+        Log "MainStatusAggregation", "standby → exit"
+        Exit Sub
+    End If
+
+    Dim cn, rtCat, nowDT
+    Dim t1d1, t1d2, t7d1, t7d2, t30d1, t30d2
+
+    InitGlobals
+    Log "MainStatusAggregation", "=== START for " & machineId
+
+    If Not G_MACHINES.Exists(machineId) Then
+        Log "MainStatusAggregation", "Unknown machineId: " & machineId
+        Exit Sub
+    End If
+
+    Set cn = OpenConnection()
+    If cn Is Nothing Or cn.State <> adStateOpen Then
+        Log "MainStatusAggregation", "ERROR: cannot open SQL connection."
+        Exit Sub
+    End If
+
+    rtCat = GetRuntimeCatalog()
+    nowDT = Now()
+
+    ' 1D
+    If ShouldRun(g_lastRun1D, THROTTLE_1D_MINUTES) Then
+        g_lastRun1D = nowDT
+        t1d2 = nowDT
+        t1d1 = DateAdd("d", -1, t1d2)
+        Log "MainStatusAggregation", "1D: RUN"
+        AggregatePeriod cn, rtCat, machineId, "1D", t1d1, t1d2
+    Else
+        Log "MainStatusAggregation", "1D: skip (throttle)"
+    End If
+
+    ' 7D
+    If ShouldRun(g_lastRun7D, THROTTLE_7D_MINUTES) Then
+        g_lastRun7D = nowDT
+        t7d2 = nowDT
+        t7d1 = DateAdd("d", -7, t7d2)
+        Log "MainStatusAggregation", "7D: RUN"
+        AggregatePeriod cn, rtCat, machineId, "7D", t7d1, t7d2
+    Else
+        Log "MainStatusAggregation", "7D: skip (throttle)"
+    End If
+
+    ' 30D
+    If ShouldRun(g_lastRun30D, THROTTLE_30D_MINUTES) Then
+        g_lastRun30D = nowDT
+        t30d2 = nowDT
+        t30d1 = DateAdd("d", -30, t30d2)
+        Log "MainStatusAggregation", "30D: RUN"
+        AggregatePeriod cn, rtCat, machineId, "30D", t30d1, t30d2
+    Else
+        Log "MainStatusAggregation", "30D: skip (throttle)"
+    End If
+
+    Log "MainStatusAggregation", "=== END for " & machineId
+    CloseConn cn
+End Sub

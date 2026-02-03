@@ -196,8 +196,15 @@ Private Function ExecCpTagStatisticEx(ByVal cn, ByVal useFiveArgs, ByVal runtime
         If Err.Number = 0 Then
             If Not (rs Is Nothing) And Not rs.EOF Then
                 If rs.Fields.Count = 1 Then
-                    ExecCpTagStatisticEx = rs.Fields(0).Value
-                    Log "cp_TagStatisticEx", "result=" & CStr(ExecCpTagStatisticEx)
+                    Dim fieldValue
+                    fieldValue = rs.Fields(0).Value
+                    If IsNull(fieldValue) Or IsEmpty(fieldValue) Then
+                        ExecCpTagStatisticEx = Empty
+                        Log "cp_TagStatisticEx", "result=(null/empty)"
+                    Else
+                        ExecCpTagStatisticEx = fieldValue
+                        Log "cp_TagStatisticEx", "result=" & CStr(ExecCpTagStatisticEx)
+                    End If
                 Else
                     Log "cp_TagStatisticEx", "Wrong field count: " & rs.Fields.Count
                     ExecCpTagStatisticEx = Empty
@@ -237,8 +244,8 @@ Private Function CpAggregate(ByVal cn, ByVal runtimeCatalog, ByVal tagFullName, 
     res = ExecCpTagStatisticEx(cn, True, runtimeCatalog, tagExpr, t1, t2, agg)
 
     If IsEmpty(res) Or IsNull(res) Or (CStr(res) = "") Then
-        Log "CpAggregate", "Final result is empty/null, returning 0"
-        CpAggregate = 0
+        Log "CpAggregate", "Final result is empty/null, returning Empty"
+        CpAggregate = Empty
     Else
         CpAggregate = CDbl(res)
         Log "CpAggregate", "Final result=" & CpAggregate
@@ -276,13 +283,19 @@ Private Function TryAvgFraction(ByVal cn, ByVal runtimeCatalog, ByVal tagFull, B
 
     ' Prefer RealValue (as in your teammate’s module)
     v = CpAggregate(cn, runtimeCatalog, tagFull, t1, t2, "AVG(RealValue)")
-    If IsNumeric(v) Then If v >= 0 And v <= 1 Then TryAvgFraction = v : Exit Function
+    If Not (IsEmpty(v) Or IsNull(v) Or v = "") Then
+        If IsNumeric(v) Then If v >= 0 And v <= 1 Then TryAvgFraction = v : Exit Function
+    End If
 
     v = CpAggregate(cn, runtimeCatalog, tagFull, t1, t2, "AVG(Value)")
-    If IsNumeric(v) Then If v >= 0 And v <= 1 Then TryAvgFraction = v : Exit Function
+    If Not (IsEmpty(v) Or IsNull(v) Or v = "") Then
+        If IsNumeric(v) Then If v >= 0 And v <= 1 Then TryAvgFraction = v : Exit Function
+    End If
 
     v = CpAggregate(cn, runtimeCatalog, tagFull, t1, t2, "AVG(ValueScaled)")
-    If IsNumeric(v) Then If v >= 0 And v <= 1 Then TryAvgFraction = v : Exit Function
+    If Not (IsEmpty(v) Or IsNull(v) Or v = "") Then
+        If IsNumeric(v) Then If v >= 0 And v <= 1 Then TryAvgFraction = v : Exit Function
+    End If
 
     TryAvgFraction = Empty
 End Function

@@ -412,11 +412,12 @@ End Function
 ' ─────────────────────────────────────────────────────────────────────
 Private Sub AggregatePeriod(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal periodKey, ByVal startDt, ByVal endDt)
     Dim sDisp, sCore, frac, pct, pctRounded, tagPct, tagPie, pieVal
-    Dim pctValues, allZero
+    Dim pctValues, pieValues, allZero
 
     Log "Aggregate", "Range  " & TS3(startDt) & " → " & TS3(endDt)
 
     Set pctValues = CreateObject("Scripting.Dictionary")
+    Set pieValues = CreateObject("Scripting.Dictionary")
 
     For Each sDisp In G_STATUS_NAMES.Keys
         sCore = G_STATUS_NAMES(sDisp)
@@ -446,6 +447,10 @@ Private Sub AggregatePeriod(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByV
         tagPct = OutTagName(machineId, periodKey, sDisp, False)
         WriteTag tagPct, pctRounded
         Log "Aggregate", tagPct & " = " & pctRounded
+    Next
+
+    For Each sDisp In G_STATUS_NAMES.Keys
+        pctRounded = pctValues(sDisp)
 
         ' pie chart (min 1 if 0, and if all 0 then all are 1)
         If allZero Then
@@ -456,9 +461,44 @@ Private Sub AggregatePeriod(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByV
             pieVal = 1
         End If
 
+        pieValues.Add sDisp, pieVal
+    Next
+
+    NormalizePieValues pieValues, 100, 1
+
+    For Each sDisp In G_STATUS_NAMES.Keys
+        pieVal = pieValues(sDisp)
         tagPie = OutTagName(machineId, periodKey, sDisp, True)
         WriteTag tagPie, pieVal
         Log "Aggregate", tagPie & " = " & pieVal
+    Next
+End Sub
+
+Private Sub NormalizePieValues(ByVal values, ByVal targetTotal, ByVal minValue)
+    Dim sDisp, sumVals, scale, iter, clamped
+
+    For iter = 1 To 5
+        sumVals = 0
+        For Each sDisp In values.Keys
+            sumVals = sumVals + CDbl(values(sDisp))
+        Next
+
+        If sumVals = 0 Then Exit For
+
+        scale = targetTotal / sumVals
+        For Each sDisp In values.Keys
+            values(sDisp) = CDbl(values(sDisp)) * scale
+        Next
+
+        clamped = False
+        For Each sDisp In values.Keys
+            If CDbl(values(sDisp)) < minValue Then
+                values(sDisp) = minValue
+                clamped = True
+            End If
+        Next
+
+        If Not clamped Then Exit For
     Next
 End Sub
 

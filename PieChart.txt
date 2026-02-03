@@ -1,7 +1,7 @@
 ' ======================================================================
 '  WinCC Global Script: Status % Aggregation (WinCC 8.1 / PH 2024)
 '  Computes Aborted/Halted/Running % over 1D / 7D / 30D
-'  via master.dbo.cp_TagStatisticEx using parameterized ADO calls.
+'  via master.dbo.cp_TagStatisticEx.
 '
 '  OUTPUT TAGS (exact, as required):
 '    <Machine>_<Period>_Machine_<Status>_Percentage              (can be 0)
@@ -10,6 +10,13 @@
 '  SOURCE TAGS (boolean 0/1 sampled ~500 ms):
 '    <Prefix>\<Machine>_ProgramStatus_<Status>_Count   (primary)
 '    <Prefix>\<Machine>_ProgramStatus_<Status>         (fallback)
+'
+'  FIXES INCLUDED:
+'   - Per-machine + per-period throttling (prevents cross-machine starvation)
+'   - Null-safe handling of cp_TagStatisticEx results (no "Invalid use of Null")
+'   - Fallback logic: AVG(RealValue) -> AVG(Value) -> AVG(ValueScaled), and
+'     suffix _Count -> plain; with per machine+status caching for performance
+'   - PieChart min-1 rule to keep WinCC graphics visible even when 0%
 ' ======================================================================
 
 Option Explicit
@@ -43,40 +50,48 @@ Const THROTTLE_30D_MINUTES   = 57
 ' ADO constants (no adovbs.inc dependency)
 ' ─────────────────────────────────────────────────────────────────────
 Const adCmdText        = 1
-Const adCmdStoredProc  = 4
-Const adParamInput     = 1
-Const adVarWChar       = 202
-Const adDBTimeStamp    = 135
 Const adStateOpen      = 1
 
 ' ─────────────────────────────────────────────────────────────────────
 ' Runtime state
 ' ─────────────────────────────────────────────────────────────────────
 Dim g_lastRunByMachinePeriod
-Dim g_cpExArity : g_cpExArity = -1  ' cached param count of cp_TagStatisticEx
 Dim G_MACHINES, G_STATUS_NAMES
+Dim g_lastFieldByMachineStatus, g_lastSuffixByMachineStatus
 
 ' ─────────────────────────────────────────────────────────────────────
 ' Init dictionaries
 ' ─────────────────────────────────────────────────────────────────────
 Private Sub InitGlobals()
-    If IsObject(G_MACHINES) Then Exit Sub
 
-    Set g_lastRunByMachinePeriod = CreateObject("Scripting.Dictionary")
+    ' Always ensure runtime dictionaries exist
+    If Not IsObject(g_lastRunByMachinePeriod) Then
+        Set g_lastRunByMachinePeriod = CreateObject("Scripting.Dictionary")
+    End If
+    If Not IsObject(g_lastFieldByMachineStatus) Then
+        Set g_lastFieldByMachineStatus = CreateObject("Scripting.Dictionary")
+    End If
+    If Not IsObject(g_lastSuffixByMachineStatus) Then
+        Set g_lastSuffixByMachineStatus = CreateObject("Scripting.Dictionary")
+    End If
+
+    ' Machines/status dictionaries only need building once
+    If IsObject(G_MACHINES) Then Exit Sub
 
     Set G_MACHINES = CreateObject("Scripting.Dictionary")
     ' MachineId → Tag-logging prefix (left of backslash)
     G_MACHINES.Add "MNA_0269", "DMG_Mori1_MNA_0269"
     G_MACHINES.Add "MNA_0270", "DMG_Mori2_MNA_0270"
     G_MACHINES.Add "MNA_0332", "DMG_Mori3_MNA_0332"
-    
-    'Wheelabrator
+
+    ' Wheelabrator (log showed Unknown machineId: MNP_0164, so include it)
+    G_MACHINES.Add "MNP_0164", "Wheelabrator_MNP_0164"
+    ' (keep old key too if you sometimes call it with MNA_0164 by mistake)
     G_MACHINES.Add "MNA_0164", "Wheelabrator_MNP_0164"
-    
-    'Droop & Rein
+
+    ' Droop & Rein
     G_MACHINES.Add "MNA_0085", "Droop_Rein_1_MNA_0085_LM33H"
     G_MACHINES.Add "MNA_0087", "Droop_Rein_4_MNA_0087_LM33F"
-    
 
     Set G_STATUS_NAMES = CreateObject("Scripting.Dictionary")
     ' Display name → core status
@@ -103,7 +118,6 @@ Private Sub Log(ByVal src, ByVal msg)
         FormatDateTime(Now(), vbLongTime) & " [" & src & "] " & S(msg) & vbCrLf
     On Error GoTo 0
 End Sub
-
 
 Private Sub SleepMs(ByVal ms)
     On Error Resume Next
@@ -132,6 +146,7 @@ Private Function OpenConnection()
     If Err.Number <> 0 Then
         Log "OpenConnection", "ERROR opening ADO connection: " & Err.Description
         Set cn = Nothing
+        Err.Clear
     End If
 
     Set OpenConnection = cn
@@ -145,7 +160,7 @@ Private Sub CloseConn(ByVal cn)
     On Error GoTo 0
 End Sub
 
-' Use the runtime catalog tag (like your teammate)
+' Use the runtime catalog tag
 Private Function GetRuntimeCatalog()
     On Error Resume Next
     Dim cat
@@ -158,63 +173,66 @@ Private Function GetRuntimeCatalog()
     On Error GoTo 0
 End Function
 
-' Timestamp formatter
-Function TS3(ByVal dt)
+' Timestamp formatter: yyyy-mm-dd hh:mm:ss.000
+Private Function TS3(ByVal dt)
     TS3 = Year(dt) & "-" & Right("0" & Month(dt),2) & "-" & Right("0" & Day(dt),2) & _
           " " & Right("0" & Hour(dt),2) & ":" & Right("0" & Minute(dt),2) & ":" & Right("0" & Second(dt),2) & ".000"
 End Function
 
 ' ─────────────────────────────────────────────────────────────────────
-' Parameterized call to cp_TagStatisticEx with retry.
-' Returns Empty on failure; else numeric result.
+' Call cp_TagStatisticEx with retry.
+' Returns Empty on failure/no-data; else numeric (variant).
+' NOTE: This keeps your working call style (as seen in logs).
 ' ─────────────────────────────────────────────────────────────────────
 Private Function ExecCpTagStatisticEx(ByVal cn, ByVal useFiveArgs, ByVal runtimeCatalog, ByVal tagSetDef, ByVal tFrom, ByVal tTo, ByVal aggList)
-    Dim i, cmd, rs, lastErrNum, lastErrDesc, dbg, sSql
-    
-    ' Extract just the tag name from tagSetDef (format: TAG:R,'tagname')
-    Dim tagNameOnly
+    Dim i, cmd, rs, lastErrNum, lastErrDesc, sSql
+    Dim tagNameOnly, fieldValue
+
+    ' Extract just tag name from tagSetDef (format: TAG:R,'tagname')
     tagNameOnly = Replace(tagSetDef, "TAG:R,'", "")
-    tagNameOnly = Left(tagNameOnly, Len(tagNameOnly) - 1) ' Remove trailing quote
-    
+    If Len(tagNameOnly) > 0 Then
+        If Right(tagNameOnly, 1) = "'" Then tagNameOnly = Left(tagNameOnly, Len(tagNameOnly) - 1)
+    End If
+
     For i = 1 To 3
         On Error Resume Next
+
         Set cmd = CreateObject("ADODB.Command")
         Set cmd.ActiveConnection = cn
         cmd.CommandTimeout = SQL_TIMEOUT_SECONDS
-        cmd.CommandType = 1  ' adCmdText
-        
-        ' Build SQL with 3 parameters - the middle one contains tag, dates all in one!
+        cmd.CommandType = adCmdText
+
+        ' Build SQL in the same format you already run successfully:
+        ' cp_TagStatisticEx 'CAT','TAG:R,''tag'',''from'',''to''','AVG(RealValue)'
         sSql = "cp_TagStatisticEx '" & runtimeCatalog & "'," & _
                "'TAG:R,''" & tagNameOnly & "'',''" & TS3(tFrom) & "'',''" & TS3(tTo) & "'''," & _
                "'" & aggList & "'"
-        
+
         cmd.CommandText = sSql
-        
-        dbg = "SQL=[" & sSql & "]"
-        Log "cp_TagStatisticEx", dbg
-        
+        Log "cp_TagStatisticEx", "SQL=[" & sSql & "]"
+
         Set rs = cmd.Execute
-        
+
         If Err.Number = 0 Then
             If Not (rs Is Nothing) And Not rs.EOF Then
-                If rs.Fields.Count = 1 Then
-                    Dim fieldValue
+                If rs.Fields.Count >= 1 Then
                     fieldValue = rs.Fields(0).Value
                     If IsNull(fieldValue) Or IsEmpty(fieldValue) Then
                         ExecCpTagStatisticEx = Empty
                         Log "cp_TagStatisticEx", "result=(null/empty)"
                     Else
                         ExecCpTagStatisticEx = fieldValue
-                        Log "cp_TagStatisticEx", "result=" & CStr(ExecCpTagStatisticEx)
+                        Log "cp_TagStatisticEx", "result=" & S(fieldValue)
                     End If
                 Else
-                    Log "cp_TagStatisticEx", "Wrong field count: " & rs.Fields.Count
                     ExecCpTagStatisticEx = Empty
+                    Log "cp_TagStatisticEx", "result=(no fields)"
                 End If
             Else
                 ExecCpTagStatisticEx = Empty
-                Log "cp_TagStatisticEx", "result=(empty/EOF)"
+                Log "cp_TagStatisticEx", "result=(EOF/empty)"
             End If
+
             On Error Resume Next
             If Not (rs Is Nothing) Then rs.Close
             Set rs = Nothing
@@ -230,80 +248,150 @@ Private Function ExecCpTagStatisticEx(ByVal cn, ByVal useFiveArgs, ByVal runtime
             SleepMs 500
         End If
     Next
-    
+
     ExecCpTagStatisticEx = Empty
 End Function
 
-
-' Wrapper builds TagSetDefinition and chooses arity
+' Wrapper builds TagSetDefinition and returns numeric or Empty
 Private Function CpAggregate(ByVal cn, ByVal runtimeCatalog, ByVal tagFullName, ByVal t1, ByVal t2, ByVal agg)
     Dim tagExpr, res
 
     tagExpr = "TAG:R,'" & tagFullName & "'"
     Log "CpAggregate", "tagExpr=" & S(tagExpr)
-    
-    ' Always use 5 args (with catalog)
+
     res = ExecCpTagStatisticEx(cn, True, runtimeCatalog, tagExpr, t1, t2, agg)
 
-    If IsEmpty(res) Or IsNull(res) Or (CStr(res) = "") Then
-        Log "CpAggregate", "Final result is empty/null, returning Empty"
+    ' IMPORTANT: never evaluate CStr() on Null
+    If IsEmpty(res) Or IsNull(res) Then
         CpAggregate = Empty
-    Else
+        Exit Function
+    ElseIf CStr(res) = "" Then
+        CpAggregate = Empty
+        Exit Function
+    End If
+
+    If IsNumeric(res) Then
         CpAggregate = CDbl(res)
-        Log "CpAggregate", "Final result=" & CpAggregate
+        Log "CpAggregate", "Final result=" & S(CpAggregate)
+    Else
+        CpAggregate = Empty
+        Log "CpAggregate", "Final result=(non-numeric)"
     End If
 End Function
 
 ' ─────────────────────────────────────────────────────────────────────
 ' Resolve the archive tag and compute fraction in [0,1]
 ' Order: *_Count → plain
-' Aggregation fields order: AVG(RealValue) → AVG(Value) → AVG(ValueScaled)
+' Fields order: RealValue → Value → ValueScaled
+' With caching per machine+status for speed.
 ' ─────────────────────────────────────────────────────────────────────
 Private Function GetStateFraction(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal statusName, ByVal t1, ByVal t2)
     Dim basePrefix, baseCore, tagFull, v
+    Dim key, cachedSuffix, cachedField, fields, suffixes
+    Dim usedSuffix, usedField, nextField
+    Dim cachedFieldIndex, i
 
     basePrefix = G_MACHINES(machineId)
     baseCore   = machineId & "_ProgramStatus_" & statusName
+    key = machineId & "|" & statusName
 
-    ' 1) *_Count (your boolean tag naming)
-    tagFull = basePrefix & "\" & baseCore & "_Count"
-    v = TryAvgFraction(cn, runtimeCatalog, tagFull, t1, t2)
-    If IsNumeric(v) Then GetStateFraction = v : Exit Function
+    suffixes = Array("_Count", "")
+    fields = Array("RealValue", "Value", "ValueScaled")
 
-    ' 2) plain boolean
-    tagFull = basePrefix & "\" & baseCore
-    v = TryAvgFraction(cn, runtimeCatalog, tagFull, t1, t2)
-    If IsNumeric(v) Then GetStateFraction = v : Exit Function
+    cachedSuffix = "_Count"
+    If g_lastSuffixByMachineStatus.Exists(key) Then cachedSuffix = g_lastSuffixByMachineStatus(key)
 
-    ' none produced a [0,1] average
+    cachedField = "RealValue"
+    If g_lastFieldByMachineStatus.Exists(key) Then cachedField = g_lastFieldByMachineStatus(key)
+
+    ' 1) cached suffix + cached field
+    tagFull = basePrefix & "\" & baseCore & cachedSuffix
+    v = TryAvgFractionField(cn, runtimeCatalog, tagFull, t1, t2, cachedField)
+    If IsNumeric(v) Then
+        g_lastSuffixByMachineStatus(key) = cachedSuffix
+        g_lastFieldByMachineStatus(key) = cachedField
+        GetStateFraction = v
+        Exit Function
+    End If
+
+    ' 2) cached suffix + next field (one step)
+    cachedFieldIndex = -1
+    For i = LBound(fields) To UBound(fields)
+        If fields(i) = cachedField Then cachedFieldIndex = i : Exit For
+    Next
+    If cachedFieldIndex > -1 And cachedFieldIndex < UBound(fields) Then
+        nextField = fields(cachedFieldIndex + 1)
+        v = TryAvgFractionField(cn, runtimeCatalog, tagFull, t1, t2, nextField)
+        If IsNumeric(v) Then
+            g_lastSuffixByMachineStatus(key) = cachedSuffix
+            g_lastFieldByMachineStatus(key) = nextField
+            LogFallback statusName, cachedSuffix, cachedField, cachedSuffix, nextField
+            GetStateFraction = v
+            Exit Function
+        End If
+    End If
+
+    ' 3) other suffix + all fields
+    usedSuffix = suffixes(0)
+    If cachedSuffix = suffixes(0) Then usedSuffix = suffixes(1)
+
+    For i = LBound(fields) To UBound(fields)
+        usedField = fields(i)
+        tagFull = basePrefix & "\" & baseCore & usedSuffix
+        v = TryAvgFractionField(cn, runtimeCatalog, tagFull, t1, t2, usedField)
+        If IsNumeric(v) Then
+            g_lastSuffixByMachineStatus(key) = usedSuffix
+            g_lastFieldByMachineStatus(key) = usedField
+            LogFallback statusName, cachedSuffix, cachedField, usedSuffix, usedField
+            GetStateFraction = v
+            Exit Function
+        End If
+    Next
+
+    ' No data anywhere => 0
     Log "Aggregate", "WARNING: No boolean-like average in [0,1] for " & basePrefix & "\" & baseCore & "."
     GetStateFraction = 0
 End Function
 
-Private Function TryAvgFraction(ByVal cn, ByVal runtimeCatalog, ByVal tagFull, ByVal t1, ByVal t2)
+Private Function TryAvgFractionField(ByVal cn, ByVal runtimeCatalog, ByVal tagFull, ByVal t1, ByVal t2, ByVal fieldName)
     Dim v
+    v = CpAggregate(cn, runtimeCatalog, tagFull, t1, t2, "AVG(" & fieldName & ")")
 
-    ' Prefer RealValue (as in your teammate’s module)
-    v = CpAggregate(cn, runtimeCatalog, tagFull, t1, t2, "AVG(RealValue)")
-    If Not (IsEmpty(v) Or IsNull(v) Or v = "") Then
-        If IsNumeric(v) Then If v >= 0 And v <= 1 Then TryAvgFraction = v : Exit Function
+    If IsNumeric(v) Then
+        If v >= 0 And v <= 1 Then
+            TryAvgFractionField = v
+            Exit Function
+        End If
     End If
 
-    v = CpAggregate(cn, runtimeCatalog, tagFull, t1, t2, "AVG(Value)")
-    If Not (IsEmpty(v) Or IsNull(v) Or v = "") Then
-        If IsNumeric(v) Then If v >= 0 And v <= 1 Then TryAvgFraction = v : Exit Function
-    End If
-
-    v = CpAggregate(cn, runtimeCatalog, tagFull, t1, t2, "AVG(ValueScaled)")
-    If Not (IsEmpty(v) Or IsNull(v) Or v = "") Then
-        If IsNumeric(v) Then If v >= 0 And v <= 1 Then TryAvgFraction = v : Exit Function
-    End If
-
-    TryAvgFraction = Empty
+    TryAvgFractionField = Empty
 End Function
 
+Private Sub LogFallback(ByVal statusName, ByVal fromSuffix, ByVal fromField, ByVal toSuffix, ByVal toField)
+    Dim parts, fromSuffixLabel, toSuffixLabel
+    parts = ""
+
+    fromSuffixLabel = S(fromSuffix)
+    If fromSuffixLabel = "" Then fromSuffixLabel = "plain"
+    toSuffixLabel = S(toSuffix)
+    If toSuffixLabel = "" Then toSuffixLabel = "plain"
+
+    If fromSuffix <> toSuffix Then
+        parts = parts & "suffix=" & fromSuffixLabel & " -> " & toSuffixLabel
+    End If
+
+    If fromField <> toField Then
+        If Len(parts) > 0 Then parts = parts & ", "
+        parts = parts & "field=" & S(fromField) & " -> " & S(toField)
+    End If
+
+    If Len(parts) > 0 Then
+        Log "Aggregate", "INFO: " & statusName & " fallback: " & parts
+    End If
+End Sub
+
 ' ─────────────────────────────────────────────────────────────────────
-' Build output tag name (exact pattern you use)
+' Build output tag name (exact pattern)
 ' <Machine>_<Period>_Machine_<Status>_Percentage[ _PieChart ]
 ' ─────────────────────────────────────────────────────────────────────
 Private Function OutTagName(ByVal machineId, ByVal periodKey, ByVal statusDispName, ByVal pieChart)
@@ -338,7 +426,6 @@ Private Sub AggregatePeriod(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByV
         If IsNumeric(frac) Then pct = CDbl(frac) * 100
 
         pctRounded = Round(pct, 2)
-
         pctValues.Add sDisp, pctRounded
     Next
 
@@ -358,16 +445,15 @@ Private Sub AggregatePeriod(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByV
         WriteTag tagPct, pctRounded
         Log "Aggregate", tagPct & " = " & pctRounded
 
-        ' pie chart (tagPct unless 0; if all 0, force 1)
+        ' pie chart (min 1 if 0, and if all 0 then all are 1)
         If allZero Then
             pieVal = 1
+        ElseIf pctRounded <> 0 Then
+            pieVal = pctRounded
         Else
-            If pctRounded <> 0 Then
-                pieVal = pctRounded
-            Else
-                pieVal = 1
-            End If
+            pieVal = 1
         End If
+
         tagPie = OutTagName(machineId, periodKey, sDisp, True)
         WriteTag tagPie, pieVal
         Log "Aggregate", tagPie & " = " & pieVal
@@ -429,6 +515,7 @@ Public Sub MainStatusAggregation(ByVal machineId)
     Else
         lastRun = Empty
     End If
+
     If ShouldRun(lastRun, THROTTLE_1D_MINUTES) Then
         g_lastRunByMachinePeriod(key1d) = nowDT
         t1d2 = nowDT
@@ -446,6 +533,7 @@ Public Sub MainStatusAggregation(ByVal machineId)
     Else
         lastRun = Empty
     End If
+
     If ShouldRun(lastRun, THROTTLE_7D_MINUTES) Then
         g_lastRunByMachinePeriod(key7d) = nowDT
         t7d2 = nowDT
@@ -463,6 +551,7 @@ Public Sub MainStatusAggregation(ByVal machineId)
     Else
         lastRun = Empty
     End If
+
     If ShouldRun(lastRun, THROTTLE_30D_MINUTES) Then
         g_lastRunByMachinePeriod(key30d) = nowDT
         t30d2 = nowDT

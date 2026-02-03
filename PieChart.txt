@@ -7,6 +7,10 @@
 '    <Machine>_<Period>_Machine_<Status>_Percentage              (can be 0)
 '    <Machine>_<Period>_Machine_<Status>_Percentage_PieChart     (min 1)
 '
+'  NOTE: If pctAborted + pctHalted + pctRunning is non-zero but not close to
+'  100, only the PieChart values are normalized to 100 (tag % stays raw).
+'  The min-1 rule is applied after any normalization.
+'
 '  SOURCE TAGS (boolean 0/1 sampled ~500 ms):
 '    <Prefix>\<Machine>_ProgramStatus_<Status>_Count   (primary)
 '    <Prefix>\<Machine>_ProgramStatus_<Status>         (fallback)
@@ -31,6 +35,7 @@ Const FALLBACK_PROVIDER      = "SQLNCLI11"
 Const SQL_INSTANCE           = ".\WinCC"      ' adjust if instance differs
 Const INITIAL_CATALOG        = "master"       ' cp_ proc lives in master
 Const SQL_TIMEOUT_SECONDS    = 600            ' per-exec command timeout
+Const NORMALIZE_TOLERANCE    = 0.05           ' % tolerance for sum ≈ 100
 
 ' ─────────────────────────────────────────────────────────────────────
 ' Runtime throttling (minutes)
@@ -307,8 +312,13 @@ End Function
 ' ─────────────────────────────────────────────────────────────────────
 Private Sub AggregatePeriod(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal periodKey, ByVal startDt, ByVal endDt)
     Dim sDisp, sCore, frac, pct, pctRounded, tagPct, tagPie, pieVal
+    Dim pctRawMap, pctRoundedMap, sumPct, normalizePie, piePct, piePctRounded
 
     Log "Aggregate", "Range  " & TS3(startDt) & " → " & TS3(endDt)
+
+    Set pctRawMap = CreateObject("Scripting.Dictionary")
+    Set pctRoundedMap = CreateObject("Scripting.Dictionary")
+    sumPct = 0
 
     For Each sDisp In G_STATUS_NAMES.Keys
         sCore = G_STATUS_NAMES(sDisp)
@@ -320,14 +330,28 @@ Private Sub AggregatePeriod(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByV
         If IsNumeric(frac) Then pct = CDbl(frac) * 100
 
         pctRounded = Round(pct, 2)
+        pctRawMap(sDisp) = pct
+        pctRoundedMap(sDisp) = pctRounded
+        sumPct = sumPct + pct
+    Next
 
+    normalizePie = (sumPct > 0 And Abs(sumPct - 100) > NORMALIZE_TOLERANCE)
+
+    For Each sDisp In G_STATUS_NAMES.Keys
         ' main % (can be 0)
         tagPct = OutTagName(machineId, periodKey, sDisp, False)
-        WriteTag tagPct, pctRounded
-        Log "Aggregate", tagPct & " = " & pctRounded
+        WriteTag tagPct, pctRoundedMap(sDisp)
+        Log "Aggregate", tagPct & " = " & pctRoundedMap(sDisp)
 
         ' pie chart (min 1)
-        pieVal = pctRounded
+        If normalizePie Then
+            piePct = (pctRawMap(sDisp) / sumPct) * 100
+            piePctRounded = Round(piePct, 2)
+            pieVal = piePctRounded
+        Else
+            pieVal = pctRoundedMap(sDisp)
+        End If
+
         If pieVal < 1 Then pieVal = 1
         tagPie = OutTagName(machineId, periodKey, sDisp, True)
         WriteTag tagPie, pieVal

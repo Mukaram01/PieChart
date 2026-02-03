@@ -31,6 +31,9 @@ Const FALLBACK_PROVIDER      = "SQLNCLI11"
 Const SQL_INSTANCE           = ".\WinCC"      ' adjust if instance differs
 Const INITIAL_CATALOG        = "master"       ' cp_ proc lives in master
 Const SQL_TIMEOUT_SECONDS    = 600            ' per-exec command timeout
+Const LOG_LEVEL_INFO         = 1
+Const LOG_LEVEL_DEBUG        = 2
+Const LOG_LEVEL              = LOG_LEVEL_INFO
 
 ' ─────────────────────────────────────────────────────────────────────
 ' Runtime throttling (minutes)
@@ -94,12 +97,21 @@ Private Function S(ByVal v)
     End If
 End Function
 
-Private Sub Log(ByVal src, ByVal msg)
+Private Sub Log(ByVal level, ByVal src, ByVal msg)
+    If level > LOG_LEVEL Then Exit Sub
     On Error Resume Next
     HMIRuntime.Trace _
         FormatDateTime(Now(), vbShortDate) & " " & _
         FormatDateTime(Now(), vbLongTime) & " [" & src & "] " & S(msg) & vbCrLf
     On Error GoTo 0
+End Sub
+
+Private Sub LogInfo(ByVal src, ByVal msg)
+    Log LOG_LEVEL_INFO, src, msg
+End Sub
+
+Private Sub LogDebug(ByVal src, ByVal msg)
+    Log LOG_LEVEL_DEBUG, src, msg
 End Sub
 
 
@@ -121,14 +133,14 @@ Private Function OpenConnection()
     cn.Open "Provider=" & prov & ";Data Source=" & SQL_INSTANCE & ";Initial Catalog=" & INITIAL_CATALOG & ";Integrated Security=SSPI;"
 
     If Err.Number <> 0 Then
-        Log "OpenConnection", "Switching provider from " & prov & " to " & FALLBACK_PROVIDER & " (" & Err.Description & ")"
+        LogInfo "OpenConnection", "Switching provider from " & prov & " to " & FALLBACK_PROVIDER & " (" & Err.Description & ")"
         Err.Clear
         prov = FALLBACK_PROVIDER
         cn.Open "Provider=" & prov & ";Data Source=" & SQL_INSTANCE & ";Initial Catalog=" & INITIAL_CATALOG & ";Integrated Security=SSPI;"
     End If
 
     If Err.Number <> 0 Then
-        Log "OpenConnection", "ERROR opening ADO connection: " & Err.Description
+        LogInfo "OpenConnection", "ERROR opening ADO connection: " & Err.Description
         Set cn = Nothing
     End If
 
@@ -189,7 +201,7 @@ Private Function ExecCpTagStatisticEx(ByVal cn, ByVal useFiveArgs, ByVal runtime
         cmd.CommandText = sSql
         
         dbg = "SQL=[" & sSql & "]"
-        Log "cp_TagStatisticEx", dbg
+        LogDebug "cp_TagStatisticEx", dbg
         
         Set rs = cmd.Execute
         
@@ -197,14 +209,14 @@ Private Function ExecCpTagStatisticEx(ByVal cn, ByVal useFiveArgs, ByVal runtime
             If Not (rs Is Nothing) And Not rs.EOF Then
                 If rs.Fields.Count = 1 Then
                     ExecCpTagStatisticEx = rs.Fields(0).Value
-                    Log "cp_TagStatisticEx", "result=" & CStr(ExecCpTagStatisticEx)
+                    LogInfo "cp_TagStatisticEx", "result=" & CStr(ExecCpTagStatisticEx)
                 Else
-                    Log "cp_TagStatisticEx", "Wrong field count: " & rs.Fields.Count
+                    LogInfo "cp_TagStatisticEx", "Wrong field count: " & rs.Fields.Count
                     ExecCpTagStatisticEx = Empty
                 End If
             Else
                 ExecCpTagStatisticEx = Empty
-                Log "cp_TagStatisticEx", "result=(empty/EOF)"
+                LogInfo "cp_TagStatisticEx", "result=(empty/EOF)"
             End If
             On Error Resume Next
             If Not (rs Is Nothing) Then rs.Close
@@ -215,7 +227,7 @@ Private Function ExecCpTagStatisticEx(ByVal cn, ByVal useFiveArgs, ByVal runtime
         Else
             lastErrNum = Err.Number
             lastErrDesc = Err.Description
-            Log "cp_TagStatisticEx", "Attempt " & i & " failed: #" & lastErrNum & " " & lastErrDesc
+            LogInfo "cp_TagStatisticEx", "Attempt " & i & " failed: #" & lastErrNum & " " & lastErrDesc
             Err.Clear
             On Error GoTo 0
             SleepMs 500
@@ -231,17 +243,17 @@ Private Function CpAggregate(ByVal cn, ByVal runtimeCatalog, ByVal tagFullName, 
     Dim tagExpr, res
 
     tagExpr = "TAG:R,'" & tagFullName & "'"
-    Log "CpAggregate", "tagExpr=" & S(tagExpr)
+    LogInfo "CpAggregate", "tagExpr=" & S(tagExpr)
     
     ' Always use 5 args (with catalog)
     res = ExecCpTagStatisticEx(cn, True, runtimeCatalog, tagExpr, t1, t2, agg)
 
     If IsEmpty(res) Or IsNull(res) Or (CStr(res) = "") Then
-        Log "CpAggregate", "Final result is empty/null, returning 0"
+        LogInfo "CpAggregate", "Final result is empty/null, returning 0"
         CpAggregate = 0
     Else
         CpAggregate = CDbl(res)
-        Log "CpAggregate", "Final result=" & CpAggregate
+        LogInfo "CpAggregate", "Final result=" & CpAggregate
     End If
 End Function
 
@@ -267,7 +279,7 @@ Private Function GetStateFraction(ByVal cn, ByVal runtimeCatalog, ByVal machineI
     If IsNumeric(v) Then GetStateFraction = v : Exit Function
 
     ' none produced a [0,1] average
-    Log "Aggregate", "WARNING: No boolean-like average in [0,1] for " & basePrefix & "\" & baseCore & "."
+    LogInfo "Aggregate", "WARNING: No boolean-like average in [0,1] for " & basePrefix & "\" & baseCore & "."
     GetStateFraction = 0
 End Function
 
@@ -308,7 +320,7 @@ End Function
 Private Sub AggregatePeriod(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal periodKey, ByVal startDt, ByVal endDt)
     Dim sDisp, sCore, frac, pct, pctRounded, tagPct, tagPie, pieVal
 
-    Log "Aggregate", "Range  " & TS3(startDt) & " → " & TS3(endDt)
+    LogInfo "Aggregate", "Range  " & TS3(startDt) & " → " & TS3(endDt)
 
     For Each sDisp In G_STATUS_NAMES.Keys
         sCore = G_STATUS_NAMES(sDisp)
@@ -324,14 +336,14 @@ Private Sub AggregatePeriod(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByV
         ' main % (can be 0)
         tagPct = OutTagName(machineId, periodKey, sDisp, False)
         WriteTag tagPct, pctRounded
-        Log "Aggregate", tagPct & " = " & pctRounded
+        LogInfo "Aggregate", tagPct & " = " & pctRounded
 
         ' pie chart (min 1)
         pieVal = pctRounded
         If pieVal < 1 Then pieVal = 1
         tagPie = OutTagName(machineId, periodKey, sDisp, True)
         WriteTag tagPie, pieVal
-        Log "Aggregate", tagPie & " = " & pieVal
+        LogInfo "Aggregate", tagPie & " = " & pieVal
     Next
 End Sub
 
@@ -339,7 +351,7 @@ Private Sub WriteTag(ByVal tag, ByVal val)
     On Error Resume Next
     HMIRuntime.Tags(tag).Write val
     If Err.Number <> 0 Then
-        Log "HMITag", "Write failed for '" & tag & "': " & Err.Description
+        LogInfo "HMITag", "Write failed for '" & tag & "': " & Err.Description
         Err.Clear
     End If
     On Error GoTo 0
@@ -358,7 +370,7 @@ End Function
 ' ─────────────────────────────────────────────────────────────────────
 Public Sub MainStatusAggregation(ByVal machineId)
     If Not IsMaster() Then
-        Log "MainStatusAggregation", "standby → exit"
+        LogInfo "MainStatusAggregation", "standby → exit"
         Exit Sub
     End If
 
@@ -366,16 +378,16 @@ Public Sub MainStatusAggregation(ByVal machineId)
     Dim t1d1, t1d2, t7d1, t7d2, t30d1, t30d2
 
     InitGlobals
-    Log "MainStatusAggregation", "=== START for " & machineId
+    LogInfo "MainStatusAggregation", "=== START for " & machineId
 
     If Not G_MACHINES.Exists(machineId) Then
-        Log "MainStatusAggregation", "Unknown machineId: " & machineId
+        LogInfo "MainStatusAggregation", "Unknown machineId: " & machineId
         Exit Sub
     End If
 
     Set cn = OpenConnection()
     If cn Is Nothing Or cn.State <> adStateOpen Then
-        Log "MainStatusAggregation", "ERROR: cannot open SQL connection."
+        LogInfo "MainStatusAggregation", "ERROR: cannot open SQL connection."
         Exit Sub
     End If
 
@@ -387,10 +399,10 @@ Public Sub MainStatusAggregation(ByVal machineId)
         g_lastRun1D = nowDT
         t1d2 = nowDT
         t1d1 = DateAdd("d", -1, t1d2)
-        Log "MainStatusAggregation", "1D: RUN"
+        LogInfo "MainStatusAggregation", "1D: RUN"
         AggregatePeriod cn, rtCat, machineId, "1D", t1d1, t1d2
     Else
-        Log "MainStatusAggregation", "1D: skip (throttle)"
+        LogInfo "MainStatusAggregation", "1D: skip (throttle)"
     End If
 
     ' 7D
@@ -398,10 +410,10 @@ Public Sub MainStatusAggregation(ByVal machineId)
         g_lastRun7D = nowDT
         t7d2 = nowDT
         t7d1 = DateAdd("d", -7, t7d2)
-        Log "MainStatusAggregation", "7D: RUN"
+        LogInfo "MainStatusAggregation", "7D: RUN"
         AggregatePeriod cn, rtCat, machineId, "7D", t7d1, t7d2
     Else
-        Log "MainStatusAggregation", "7D: skip (throttle)"
+        LogInfo "MainStatusAggregation", "7D: skip (throttle)"
     End If
 
     ' 30D
@@ -409,12 +421,12 @@ Public Sub MainStatusAggregation(ByVal machineId)
         g_lastRun30D = nowDT
         t30d2 = nowDT
         t30d1 = DateAdd("d", -30, t30d2)
-        Log "MainStatusAggregation", "30D: RUN"
+        LogInfo "MainStatusAggregation", "30D: RUN"
         AggregatePeriod cn, rtCat, machineId, "30D", t30d1, t30d2
     Else
-        Log "MainStatusAggregation", "30D: skip (throttle)"
+        LogInfo "MainStatusAggregation", "30D: skip (throttle)"
     End If
 
-    Log "MainStatusAggregation", "=== END for " & machineId
+    LogInfo "MainStatusAggregation", "=== END for " & machineId
     CloseConn cn
 End Sub

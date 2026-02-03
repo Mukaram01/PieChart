@@ -52,7 +52,7 @@ Const adStateOpen      = 1
 ' ─────────────────────────────────────────────────────────────────────
 ' Runtime state
 ' ─────────────────────────────────────────────────────────────────────
-Dim g_lastRun1D, g_lastRun7D, g_lastRun30D
+Dim g_lastRunByMachinePeriod
 Dim g_cpExArity : g_cpExArity = -1  ' cached param count of cp_TagStatisticEx
 Dim G_MACHINES, G_STATUS_NAMES
 
@@ -61,6 +61,8 @@ Dim G_MACHINES, G_STATUS_NAMES
 ' ─────────────────────────────────────────────────────────────────────
 Private Sub InitGlobals()
     If IsObject(G_MACHINES) Then Exit Sub
+
+    Set g_lastRunByMachinePeriod = CreateObject("Scripting.Dictionary")
 
     Set G_MACHINES = CreateObject("Scripting.Dictionary")
     ' MachineId → Tag-logging prefix (left of backslash)
@@ -364,6 +366,7 @@ Public Sub MainStatusAggregation(ByVal machineId)
 
     Dim cn, rtCat, nowDT
     Dim t1d1, t1d2, t7d1, t7d2, t30d1, t30d2
+    Dim key1d, key7d, key30d, lastRun
 
     InitGlobals
     Log "MainStatusAggregation", "=== START for " & machineId
@@ -383,8 +386,14 @@ Public Sub MainStatusAggregation(ByVal machineId)
     nowDT = Now()
 
     ' 1D
-    If ShouldRun(g_lastRun1D, THROTTLE_1D_MINUTES) Then
-        g_lastRun1D = nowDT
+    key1d = machineId & "|1D"
+    If g_lastRunByMachinePeriod.Exists(key1d) Then
+        lastRun = g_lastRunByMachinePeriod(key1d)
+    Else
+        lastRun = Empty
+    End If
+    If ShouldRun(lastRun, THROTTLE_1D_MINUTES) Then
+        g_lastRunByMachinePeriod(key1d) = nowDT
         t1d2 = nowDT
         t1d1 = DateAdd("d", -1, t1d2)
         Log "MainStatusAggregation", "1D: RUN"
@@ -394,8 +403,14 @@ Public Sub MainStatusAggregation(ByVal machineId)
     End If
 
     ' 7D
-    If ShouldRun(g_lastRun7D, THROTTLE_7D_MINUTES) Then
-        g_lastRun7D = nowDT
+    key7d = machineId & "|7D"
+    If g_lastRunByMachinePeriod.Exists(key7d) Then
+        lastRun = g_lastRunByMachinePeriod(key7d)
+    Else
+        lastRun = Empty
+    End If
+    If ShouldRun(lastRun, THROTTLE_7D_MINUTES) Then
+        g_lastRunByMachinePeriod(key7d) = nowDT
         t7d2 = nowDT
         t7d1 = DateAdd("d", -7, t7d2)
         Log "MainStatusAggregation", "7D: RUN"
@@ -405,8 +420,14 @@ Public Sub MainStatusAggregation(ByVal machineId)
     End If
 
     ' 30D
-    If ShouldRun(g_lastRun30D, THROTTLE_30D_MINUTES) Then
-        g_lastRun30D = nowDT
+    key30d = machineId & "|30D"
+    If g_lastRunByMachinePeriod.Exists(key30d) Then
+        lastRun = g_lastRunByMachinePeriod(key30d)
+    Else
+        lastRun = Empty
+    End If
+    If ShouldRun(lastRun, THROTTLE_30D_MINUTES) Then
+        g_lastRunByMachinePeriod(key30d) = nowDT
         t30d2 = nowDT
         t30d1 = DateAdd("d", -30, t30d2)
         Log "MainStatusAggregation", "30D: RUN"

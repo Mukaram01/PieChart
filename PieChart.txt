@@ -186,13 +186,15 @@ End Function
 ' ─────────────────────────────────────────────────────────────────────
 Private Function ExecCpTagStatisticEx(ByVal cn, ByVal useFiveArgs, ByVal runtimeCatalog, ByVal tagSetDef, ByVal tFrom, ByVal tTo, ByVal aggList)
     Dim i, cmd, rs, lastErrNum, lastErrDesc, sSql
-    Dim tagNameOnly, fieldValue
+    Dim tagNameOnly, safeTagName, fieldValue
 
     ' Extract just tag name from tagSetDef (format: TAG:R,'tagname')
     tagNameOnly = Replace(tagSetDef, "TAG:R,'", "")
     If Len(tagNameOnly) > 0 Then
         If Right(tagNameOnly, 1) = "'" Then tagNameOnly = Left(tagNameOnly, Len(tagNameOnly) - 1)
     End If
+
+    safeTagName = Replace(tagNameOnly, "'", "''")
 
     For i = 1 To 3
         On Error Resume Next
@@ -205,7 +207,7 @@ Private Function ExecCpTagStatisticEx(ByVal cn, ByVal useFiveArgs, ByVal runtime
         ' Build SQL in the same format you already run successfully:
         ' cp_TagStatisticEx 'CAT','TAG:R,''tag'',''from'',''to''','AVG(RealValue)'
         sSql = "cp_TagStatisticEx '" & runtimeCatalog & "'," & _
-               "'TAG:R,''" & tagNameOnly & "'',''" & TS3(tFrom) & "'',''" & TS3(tTo) & "'''," & _
+               "'TAG:R,''" & safeTagName & "'',''" & TS3(tFrom) & "'',''" & TS3(tTo) & "'''," & _
                "'" & aggList & "'"
 
         cmd.CommandText = sSql

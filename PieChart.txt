@@ -55,6 +55,7 @@ Const adStateOpen      = 1
 Dim g_lastRun1D, g_lastRun7D, g_lastRun30D
 Dim g_cpExArity : g_cpExArity = -1  ' cached param count of cp_TagStatisticEx
 Dim G_MACHINES, G_STATUS_NAMES
+Dim g_lastFieldByMachineStatus, g_lastSuffixByMachineStatus
 
 ' ─────────────────────────────────────────────────────────────────────
 ' Init dictionaries
@@ -81,6 +82,9 @@ Private Sub InitGlobals()
     G_STATUS_NAMES.Add "Aborted",  "Aborted"
     G_STATUS_NAMES.Add "Halted",   "Halted"
     G_STATUS_NAMES.Add "Running",  "Running"
+
+    Set g_lastFieldByMachineStatus = CreateObject("Scripting.Dictionary")
+    Set g_lastSuffixByMachineStatus = CreateObject("Scripting.Dictionary")
 End Sub
 
 ' ─────────────────────────────────────────────────────────────────────
@@ -252,40 +256,102 @@ End Function
 ' ─────────────────────────────────────────────────────────────────────
 Private Function GetStateFraction(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal statusName, ByVal t1, ByVal t2)
     Dim basePrefix, baseCore, tagFull, v
+    Dim key, cachedSuffix, cachedField, fields, suffixes
+    Dim usedSuffix, usedField, fallbackParts, nextField
+    Dim cachedFieldIndex, i
 
     basePrefix = G_MACHINES(machineId)
     baseCore   = machineId & "_ProgramStatus_" & statusName
+    key = machineId & "|" & statusName
 
-    ' 1) *_Count (your boolean tag naming)
-    tagFull = basePrefix & "\" & baseCore & "_Count"
-    v = TryAvgFraction(cn, runtimeCatalog, tagFull, t1, t2)
-    If IsNumeric(v) Then GetStateFraction = v : Exit Function
+    suffixes = Array("_Count", "")
+    fields = Array("RealValue", "Value", "ValueScaled")
 
-    ' 2) plain boolean
-    tagFull = basePrefix & "\" & baseCore
-    v = TryAvgFraction(cn, runtimeCatalog, tagFull, t1, t2)
-    If IsNumeric(v) Then GetStateFraction = v : Exit Function
+    cachedSuffix = "_Count"
+    If g_lastSuffixByMachineStatus.Exists(key) Then cachedSuffix = g_lastSuffixByMachineStatus(key)
+
+    cachedField = "RealValue"
+    If g_lastFieldByMachineStatus.Exists(key) Then cachedField = g_lastFieldByMachineStatus(key)
+
+    ' 1) cached suffix + cached field
+    tagFull = basePrefix & "\" & baseCore & cachedSuffix
+    v = TryAvgFractionField(cn, runtimeCatalog, tagFull, t1, t2, cachedField)
+    If IsNumeric(v) Then
+        g_lastSuffixByMachineStatus(key) = cachedSuffix
+        g_lastFieldByMachineStatus(key) = cachedField
+        GetStateFraction = v
+        Exit Function
+    End If
+
+    ' 2) cached suffix + next field
+    cachedFieldIndex = -1
+    For i = LBound(fields) To UBound(fields)
+        If fields(i) = cachedField Then cachedFieldIndex = i : Exit For
+    Next
+    If cachedFieldIndex > -1 And cachedFieldIndex < UBound(fields) Then
+        nextField = fields(cachedFieldIndex + 1)
+        v = TryAvgFractionField(cn, runtimeCatalog, tagFull, t1, t2, nextField)
+        If IsNumeric(v) Then
+            g_lastSuffixByMachineStatus(key) = cachedSuffix
+            g_lastFieldByMachineStatus(key) = nextField
+            LogFallback statusName, cachedSuffix, cachedField, cachedSuffix, nextField
+            GetStateFraction = v
+            Exit Function
+        End If
+    End If
+
+    ' 3) next suffix + fields in order RealValue, Value, ValueScaled
+    usedSuffix = suffixes(0)
+    If cachedSuffix = suffixes(0) Then usedSuffix = suffixes(1)
+    For i = LBound(fields) To UBound(fields)
+        usedField = fields(i)
+        tagFull = basePrefix & "\" & baseCore & usedSuffix
+        v = TryAvgFractionField(cn, runtimeCatalog, tagFull, t1, t2, usedField)
+        If IsNumeric(v) Then
+            g_lastSuffixByMachineStatus(key) = usedSuffix
+            g_lastFieldByMachineStatus(key) = usedField
+            LogFallback statusName, cachedSuffix, cachedField, usedSuffix, usedField
+            GetStateFraction = v
+            Exit Function
+        End If
+    Next
 
     ' none produced a [0,1] average
     Log "Aggregate", "WARNING: No boolean-like average in [0,1] for " & basePrefix & "\" & baseCore & "."
     GetStateFraction = 0
 End Function
 
-Private Function TryAvgFraction(ByVal cn, ByVal runtimeCatalog, ByVal tagFull, ByVal t1, ByVal t2)
+Private Function TryAvgFractionField(ByVal cn, ByVal runtimeCatalog, ByVal tagFull, ByVal t1, ByVal t2, ByVal fieldName)
     Dim v
 
-    ' Prefer RealValue (as in your teammate’s module)
-    v = CpAggregate(cn, runtimeCatalog, tagFull, t1, t2, "AVG(RealValue)")
-    If IsNumeric(v) Then If v >= 0 And v <= 1 Then TryAvgFraction = v : Exit Function
+    v = CpAggregate(cn, runtimeCatalog, tagFull, t1, t2, "AVG(" & fieldName & ")")
+    If IsNumeric(v) Then
+        If v >= 0 And v <= 1 Then
+            TryAvgFractionField = v
+            Exit Function
+        End If
+    End If
 
-    v = CpAggregate(cn, runtimeCatalog, tagFull, t1, t2, "AVG(Value)")
-    If IsNumeric(v) Then If v >= 0 And v <= 1 Then TryAvgFraction = v : Exit Function
-
-    v = CpAggregate(cn, runtimeCatalog, tagFull, t1, t2, "AVG(ValueScaled)")
-    If IsNumeric(v) Then If v >= 0 And v <= 1 Then TryAvgFraction = v : Exit Function
-
-    TryAvgFraction = Empty
+    TryAvgFractionField = Empty
 End Function
+
+Private Sub LogFallback(ByVal statusName, ByVal fromSuffix, ByVal fromField, ByVal toSuffix, ByVal toField)
+    Dim parts
+    parts = ""
+
+    If fromSuffix <> toSuffix Then
+        parts = parts & "suffix=" & S(fromSuffix) & " -> " & S(toSuffix)
+    End If
+
+    If fromField <> toField Then
+        If Len(parts) > 0 Then parts = parts & ", "
+        parts = parts & "field=" & S(fromField) & " -> " & S(toField)
+    End If
+
+    If Len(parts) > 0 Then
+        Log "Aggregate", "INFO: " & statusName & " fallback: " & parts
+    End If
+End Sub
 
 ' ─────────────────────────────────────────────────────────────────────
 ' Build output tag name (exact pattern you use)

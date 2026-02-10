@@ -177,11 +177,25 @@ Private Function TS3(ByVal dt)
           " " & Right("0" & Hour(dt),2) & ":" & Right("0" & Minute(dt),2) & ":" & Right("0" & Second(dt),2) & ".000"
 End Function
 
+Private Function ElapsedMs(ByVal timerStart)
+    Dim timerEnd
+    timerEnd = Timer
+    If timerEnd < timerStart Then timerEnd = timerEnd + 86400
+    ElapsedMs = CLng((timerEnd - timerStart) * 1000)
+End Function
+
 ' ─────────────────────────────────────────────────────────────────────
 ' cp_TagStatisticEx (3 retries, null-safe)
 ' ─────────────────────────────────────────────────────────────────────
-Private Function ExecCpTagStatisticEx(ByVal cn, ByVal runtimeCatalog, ByVal tagFullName, ByVal tFrom, ByVal tTo, ByVal aggList)
+Private Function ExecCpTagStatisticEx(ByVal cn, ByVal runtimeCatalog, ByVal tagFullName, ByVal tFrom, ByVal tTo, ByVal aggList, ByVal machineId, ByVal periodKey, ByVal statusName)
     Dim i, cmd, rs, sSql, safeTag, fieldValue
+    Dim startTimer, startedAt, completedAt, elapsedMs
+    Dim returnedRows, valueText, infoMsg
+
+    startedAt = Now
+    startTimer = Timer
+    returnedRows = 0
+    valueText = ""
 
     safeTag = Replace(tagFullName, "'", "''")
 
@@ -210,10 +224,14 @@ Private Function ExecCpTagStatisticEx(ByVal cn, ByVal runtimeCatalog, ByVal tagF
 
             If Not (rs Is Nothing) Then
                 If Not rs.EOF Then
+                    returnedRows = 1
                     If rs.Fields.Count >= 1 Then
                         fieldValue = rs.Fields(0).Value
                         If Not (IsNull(fieldValue) Or IsEmpty(fieldValue)) Then
                             ExecCpTagStatisticEx = fieldValue
+                            valueText = CStr(fieldValue)
+                        Else
+                            valueText = "<null>"
                         End If
                     End If
                 End If
@@ -223,6 +241,22 @@ Private Function ExecCpTagStatisticEx(ByVal cn, ByVal runtimeCatalog, ByVal tagF
             Set rs = Nothing
             Set cmd = Nothing
             On Error GoTo 0
+
+            completedAt = Now
+            elapsedMs = ElapsedMs(startTimer)
+            If valueText = "" Then valueText = "<empty>"
+            infoMsg = "machine=" & machineId & _
+                      " window=" & periodKey & _
+                      " status=" & statusName & _
+                      " sql_from=" & TS3(tFrom) & _
+                      " sql_to=" & TS3(tTo) & _
+                      " started=" & TS3(startedAt) & _
+                      " ended=" & TS3(completedAt) & _
+                      " elapsed_ms=" & elapsedMs & _
+                      " success=true" & _
+                      " rows=" & returnedRows & _
+                      " value=" & valueText
+            LogMsg LOG_LEVEL_INFO, "cp_TagStatisticEx", infoMsg
             Exit Function
         Else
             LogMsg LOG_LEVEL_WARN, "cp_TagStatisticEx", "Attempt " & i & " failed: " & S(Err.Description)
@@ -233,11 +267,23 @@ Private Function ExecCpTagStatisticEx(ByVal cn, ByVal runtimeCatalog, ByVal tagF
     Next
 
     ExecCpTagStatisticEx = Empty
+    completedAt = Now
+    elapsedMs = ElapsedMs(startTimer)
+    infoMsg = "machine=" & machineId & _
+              " window=" & periodKey & _
+              " status=" & statusName & _
+              " sql_from=" & TS3(tFrom) & _
+              " sql_to=" & TS3(tTo) & _
+              " started=" & TS3(startedAt) & _
+              " ended=" & TS3(completedAt) & _
+              " elapsed_ms=" & elapsedMs & _
+              " success=false rows=0 value=<none>"
+    LogMsg LOG_LEVEL_INFO, "cp_TagStatisticEx", infoMsg
 End Function
 
-Private Function CpAggregate(ByVal cn, ByVal runtimeCatalog, ByVal tagFullName, ByVal t1, ByVal t2, ByVal agg)
+Private Function CpAggregate(ByVal cn, ByVal runtimeCatalog, ByVal tagFullName, ByVal t1, ByVal t2, ByVal agg, ByVal machineId, ByVal periodKey, ByVal statusName)
     Dim res
-    res = ExecCpTagStatisticEx(cn, runtimeCatalog, tagFullName, t1, t2, agg)
+    res = ExecCpTagStatisticEx(cn, runtimeCatalog, tagFullName, t1, t2, agg, machineId, periodKey, statusName)
 
     If IsNull(res) Or IsEmpty(res) Or (CStr(res) = "") Then
         CpAggregate = Empty
@@ -248,16 +294,16 @@ Private Function CpAggregate(ByVal cn, ByVal runtimeCatalog, ByVal tagFullName, 
     End If
 End Function
 
-Private Function TryAvgFraction(ByVal cn, ByVal runtimeCatalog, ByVal tagFull, ByVal t1, ByVal t2)
+Private Function TryAvgFraction(ByVal cn, ByVal runtimeCatalog, ByVal tagFull, ByVal t1, ByVal t2, ByVal machineId, ByVal periodKey, ByVal statusName)
     Dim v
 
-    v = CpAggregate(cn, runtimeCatalog, tagFull, t1, t2, "AVG(RealValue)")
+    v = CpAggregate(cn, runtimeCatalog, tagFull, t1, t2, "AVG(RealValue)", machineId, periodKey, statusName)
     If IsNumeric(v) Then If v >= 0 And v <= 1 Then TryAvgFraction = v : Exit Function
 
-    v = CpAggregate(cn, runtimeCatalog, tagFull, t1, t2, "AVG(Value)")
+    v = CpAggregate(cn, runtimeCatalog, tagFull, t1, t2, "AVG(Value)", machineId, periodKey, statusName)
     If IsNumeric(v) Then If v >= 0 And v <= 1 Then TryAvgFraction = v : Exit Function
 
-    v = CpAggregate(cn, runtimeCatalog, tagFull, t1, t2, "AVG(ValueScaled)")
+    v = CpAggregate(cn, runtimeCatalog, tagFull, t1, t2, "AVG(ValueScaled)", machineId, periodKey, statusName)
     If IsNumeric(v) Then If v >= 0 And v <= 1 Then TryAvgFraction = v : Exit Function
 
     TryAvgFraction = Empty
@@ -266,14 +312,14 @@ End Function
 ' ─────────────────────────────────────────────────────────────────────
 ' READ ONLY *_Count (your requirement)
 ' ─────────────────────────────────────────────────────────────────────
-Private Function GetCountFraction(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal statusName, ByVal t1, ByVal t2)
+Private Function GetCountFraction(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal statusName, ByVal periodKey, ByVal t1, ByVal t2)
     Dim basePrefix, baseCore, tagFull, v
 
     basePrefix = G_MACHINES(machineId)
     baseCore   = machineId & "_ProgramStatus_" & statusName
 
     tagFull = basePrefix & "\" & baseCore & "_Count"
-    v = TryAvgFraction(cn, runtimeCatalog, tagFull, t1, t2)
+    v = TryAvgFraction(cn, runtimeCatalog, tagFull, t1, t2, machineId, periodKey, statusName)
 
     If IsNumeric(v) Then
         GetCountFraction = CDbl(v)
@@ -286,14 +332,14 @@ End Function
 ' ─────────────────────────────────────────────────────────────────────
 ' Combine 5 → 3 (your rule), normalize if overlap makes sum > 1
 ' ─────────────────────────────────────────────────────────────────────
-Private Sub GetCombinedFractions(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal t1, ByVal t2, ByRef fRun, ByRef fHalt, ByRef fAbort)
+Private Sub GetCombinedFractions(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal periodKey, ByVal t1, ByVal t2, ByRef fRun, ByRef fHalt, ByRef fAbort)
     Dim a, h, r, w, i, total
 
-    a = GetCountFraction(cn, runtimeCatalog, machineId, "Aborted",     t1, t2)
-    h = GetCountFraction(cn, runtimeCatalog, machineId, "Halted",      t1, t2)
-    r = GetCountFraction(cn, runtimeCatalog, machineId, "Running",     t1, t2)
-    w = GetCountFraction(cn, runtimeCatalog, machineId, "Waiting",     t1, t2)
-    i = GetCountFraction(cn, runtimeCatalog, machineId, "Interrupted", t1, t2)
+    a = GetCountFraction(cn, runtimeCatalog, machineId, "Aborted",     periodKey, t1, t2)
+    h = GetCountFraction(cn, runtimeCatalog, machineId, "Halted",      periodKey, t1, t2)
+    r = GetCountFraction(cn, runtimeCatalog, machineId, "Running",     periodKey, t1, t2)
+    w = GetCountFraction(cn, runtimeCatalog, machineId, "Waiting",     periodKey, t1, t2)
+    i = GetCountFraction(cn, runtimeCatalog, machineId, "Interrupted", periodKey, t1, t2)
 
     fRun   = r
     fHalt  = h + i
@@ -344,7 +390,7 @@ Private Sub AggregatePeriod(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByV
 
     LogMsg LOG_LEVEL_INFO, "Aggregate", machineId & " " & periodKey & "  " & TS3(startDt) & " -> " & TS3(endDt)
 
-    Call GetCombinedFractions(cn, runtimeCatalog, machineId, startDt, endDt, fRun, fHalt, fAbort)
+    Call GetCombinedFractions(cn, runtimeCatalog, machineId, periodKey, startDt, endDt, fRun, fHalt, fAbort)
 
     pctRun   = Round(CDbl(fRun)   * 100, 2)
     pctHalt  = Round(CDbl(fHalt)  * 100, 2)

@@ -189,7 +189,7 @@ End Function
 ' ─────────────────────────────────────────────────────────────────────
 Private Function ExecCpTagStatisticEx(ByVal cn, ByVal runtimeCatalog, ByVal tagFullName, ByVal tFrom, ByVal tTo, ByVal aggList, ByVal machineId, ByVal periodKey, ByVal statusName)
     Dim i, cmd, rs, sSql, safeTag, fieldValue
-    Dim startTimer, startedAt, completedAt, elapsedMs
+    Dim startTimer, startedAt, completedAt, elapsedMsValue
     Dim returnedRows, valueText, infoMsg
 
     startedAt = Now
@@ -243,7 +243,7 @@ Private Function ExecCpTagStatisticEx(ByVal cn, ByVal runtimeCatalog, ByVal tagF
             On Error GoTo 0
 
             completedAt = Now
-            elapsedMs = ElapsedMs(startTimer)
+            elapsedMsValue = ElapsedMs(startTimer)
             If valueText = "" Then valueText = "<empty>"
             infoMsg = "machine=" & machineId & _
                       " window=" & periodKey & _
@@ -252,7 +252,7 @@ Private Function ExecCpTagStatisticEx(ByVal cn, ByVal runtimeCatalog, ByVal tagF
                       " sql_to=" & TS3(tTo) & _
                       " started=" & TS3(startedAt) & _
                       " ended=" & TS3(completedAt) & _
-                      " elapsed_ms=" & elapsedMs & _
+                      " elapsed_ms=" & elapsedMsValue & _
                       " success=true" & _
                       " rows=" & returnedRows & _
                       " value=" & valueText
@@ -268,7 +268,7 @@ Private Function ExecCpTagStatisticEx(ByVal cn, ByVal runtimeCatalog, ByVal tagF
 
     ExecCpTagStatisticEx = Empty
     completedAt = Now
-    elapsedMs = ElapsedMs(startTimer)
+    elapsedMsValue = ElapsedMs(startTimer)
     infoMsg = "machine=" & machineId & _
               " window=" & periodKey & _
               " status=" & statusName & _
@@ -276,7 +276,7 @@ Private Function ExecCpTagStatisticEx(ByVal cn, ByVal runtimeCatalog, ByVal tagF
               " sql_to=" & TS3(tTo) & _
               " started=" & TS3(startedAt) & _
               " ended=" & TS3(completedAt) & _
-              " elapsed_ms=" & elapsedMs & _
+              " elapsed_ms=" & elapsedMsValue & _
               " success=false rows=0 value=<none>"
     LogMsg LOG_LEVEL_INFO, "cp_TagStatisticEx", infoMsg
 End Function

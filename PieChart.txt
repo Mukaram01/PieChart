@@ -137,6 +137,7 @@ Private Function OpenConnection()
         LogMsg LOG_LEVEL_WARN, "OpenConnection", "Switching provider to " & FALLBACK_PROVIDER & " (" & S(Err.Description) & ")"
         Err.Clear
         prov = FALLBACK_PROVIDER
+        Set cn = CreateObject("ADODB.Connection")
         cn.Open "Provider=" & prov & ";Data Source=" & SQL_INSTANCE & ";Initial Catalog=" & INITIAL_CATALOG & ";Integrated Security=SSPI;"
     End If
 
@@ -335,6 +336,9 @@ End Function
 Private Sub GetCombinedFractions(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal periodKey, ByVal t1, ByVal t2, ByRef fRun, ByRef fHalt, ByRef fAbort)
     Dim a, h, r, w, i, total
 
+    ' Initialise outputs so callers always receive well-defined values
+    fRun = 0 : fHalt = 0 : fAbort = 0
+
     a = GetCountFraction(cn, runtimeCatalog, machineId, "Aborted",     periodKey, t1, t2)
     h = GetCountFraction(cn, runtimeCatalog, machineId, "Halted",      periodKey, t1, t2)
     r = GetCountFraction(cn, runtimeCatalog, machineId, "Running",     periodKey, t1, t2)
@@ -402,13 +406,19 @@ Private Sub AggregatePeriod(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByV
     tagPct = OutTagName(machineId, periodKey, "Aborted", False): WriteTag tagPct, pctAbort
 
     ' pie chart (min 1 for display, DOES NOT affect main %)
-    pieVal = pctRun:   If pieVal < 1 Then pieVal = 1
+    ' Only apply the minimum-1 floor when there is actual activity; if the
+    ' machine was completely idle all three raw percentages are 0 and forcing
+    ' each to 1 would create a false 33/33/33 split on the chart.
+    Dim totalPct
+    totalPct = pctRun + pctHalt + pctAbort
+
+    pieVal = pctRun:   If pieVal < 1 And totalPct > 0 Then pieVal = 1
     tagPie = OutTagName(machineId, periodKey, "Running", True): WriteTag tagPie, pieVal
 
-    pieVal = pctHalt:  If pieVal < 1 Then pieVal = 1
+    pieVal = pctHalt:  If pieVal < 1 And totalPct > 0 Then pieVal = 1
     tagPie = OutTagName(machineId, periodKey, "Halted", True): WriteTag tagPie, pieVal
 
-    pieVal = pctAbort: If pieVal < 1 Then pieVal = 1
+    pieVal = pctAbort: If pieVal < 1 And totalPct > 0 Then pieVal = 1
     tagPie = OutTagName(machineId, periodKey, "Aborted", True): WriteTag tagPie, pieVal
 End Sub
 
@@ -438,8 +448,13 @@ Public Sub MainStatusAggregation(ByVal machineId)
     End If
 
     Set cn = OpenConnection()
-    If cn Is Nothing Or cn.State <> adStateOpen Then
+    If cn Is Nothing Then
         LogMsg LOG_LEVEL_ERROR, "MainStatusAggregation", "ERROR: cannot open SQL connection"
+        Exit Sub
+    End If
+    If cn.State <> adStateOpen Then
+        LogMsg LOG_LEVEL_ERROR, "MainStatusAggregation", "ERROR: cannot open SQL connection"
+        CloseConn cn
         Exit Sub
     End If
 
@@ -451,9 +466,9 @@ Public Sub MainStatusAggregation(ByVal machineId)
     lastRun = Empty
     If g_lastRunByMachinePeriod.Exists(key) Then lastRun = g_lastRunByMachinePeriod(key)
     If ShouldRun(lastRun, THROTTLE_1D_MINUTES) Then
-        g_lastRunByMachinePeriod(key) = nowDT
         tTo = nowDT: tFrom = DateAdd("d", -1, tTo)
         AggregatePeriod cn, rtCat, machineId, "1D", tFrom, tTo
+        g_lastRunByMachinePeriod(key) = nowDT
     End If
 
     ' 7D
@@ -461,9 +476,9 @@ Public Sub MainStatusAggregation(ByVal machineId)
     lastRun = Empty
     If g_lastRunByMachinePeriod.Exists(key) Then lastRun = g_lastRunByMachinePeriod(key)
     If ShouldRun(lastRun, THROTTLE_7D_MINUTES) Then
-        g_lastRunByMachinePeriod(key) = nowDT
         tTo = nowDT: tFrom = DateAdd("d", -7, tTo)
         AggregatePeriod cn, rtCat, machineId, "7D", tFrom, tTo
+        g_lastRunByMachinePeriod(key) = nowDT
     End If
 
     ' 30D
@@ -471,9 +486,9 @@ Public Sub MainStatusAggregation(ByVal machineId)
     lastRun = Empty
     If g_lastRunByMachinePeriod.Exists(key) Then lastRun = g_lastRunByMachinePeriod(key)
     If ShouldRun(lastRun, THROTTLE_30D_MINUTES) Then
-        g_lastRunByMachinePeriod(key) = nowDT
         tTo = nowDT: tFrom = DateAdd("d", -30, tTo)
         AggregatePeriod cn, rtCat, machineId, "30D", tFrom, tTo
+        g_lastRunByMachinePeriod(key) = nowDT
     End If
 
     CloseConn cn

@@ -439,6 +439,7 @@ Public Sub MainStatusAggregation(ByVal machineId)
     Dim cn, rtCat, nowDT
     Dim tFrom, tTo
     Dim key, lastRun
+    Dim due1D, due7D, due30D
 
     InitGlobals
 
@@ -446,6 +447,27 @@ Public Sub MainStatusAggregation(ByVal machineId)
         LogMsg LOG_LEVEL_WARN, "MainStatusAggregation", "Unknown machineId: " & S(machineId)
         Exit Sub
     End If
+
+    nowDT = Now()
+    due1D = False : due7D = False : due30D = False
+
+    key = machineId & "|1D"
+    lastRun = Empty
+    If g_lastRunByMachinePeriod.Exists(key) Then lastRun = g_lastRunByMachinePeriod(key)
+    due1D = ShouldRun(lastRun, THROTTLE_1D_MINUTES)
+
+    key = machineId & "|7D"
+    lastRun = Empty
+    If g_lastRunByMachinePeriod.Exists(key) Then lastRun = g_lastRunByMachinePeriod(key)
+    due7D = ShouldRun(lastRun, THROTTLE_7D_MINUTES)
+
+    key = machineId & "|30D"
+    lastRun = Empty
+    If g_lastRunByMachinePeriod.Exists(key) Then lastRun = g_lastRunByMachinePeriod(key)
+    due30D = ShouldRun(lastRun, THROTTLE_30D_MINUTES)
+
+    ' Important: avoid SQL connection work when nothing is due.
+    If Not (due1D Or due7D Or due30D) Then Exit Sub
 
     Set cn = OpenConnection()
     If cn Is Nothing Then
@@ -459,36 +481,26 @@ Public Sub MainStatusAggregation(ByVal machineId)
     End If
 
     rtCat = GetRuntimeCatalog()
-    nowDT = Now()
 
     ' 1D
-    key = machineId & "|1D"
-    lastRun = Empty
-    If g_lastRunByMachinePeriod.Exists(key) Then lastRun = g_lastRunByMachinePeriod(key)
-    If ShouldRun(lastRun, THROTTLE_1D_MINUTES) Then
+    If due1D Then
         tTo = nowDT: tFrom = DateAdd("d", -1, tTo)
         AggregatePeriod cn, rtCat, machineId, "1D", tFrom, tTo
-        g_lastRunByMachinePeriod(key) = nowDT
+        g_lastRunByMachinePeriod(machineId & "|1D") = nowDT
     End If
 
     ' 7D
-    key = machineId & "|7D"
-    lastRun = Empty
-    If g_lastRunByMachinePeriod.Exists(key) Then lastRun = g_lastRunByMachinePeriod(key)
-    If ShouldRun(lastRun, THROTTLE_7D_MINUTES) Then
+    If due7D Then
         tTo = nowDT: tFrom = DateAdd("d", -7, tTo)
         AggregatePeriod cn, rtCat, machineId, "7D", tFrom, tTo
-        g_lastRunByMachinePeriod(key) = nowDT
+        g_lastRunByMachinePeriod(machineId & "|7D") = nowDT
     End If
 
     ' 30D
-    key = machineId & "|30D"
-    lastRun = Empty
-    If g_lastRunByMachinePeriod.Exists(key) Then lastRun = g_lastRunByMachinePeriod(key)
-    If ShouldRun(lastRun, THROTTLE_30D_MINUTES) Then
+    If due30D Then
         tTo = nowDT: tFrom = DateAdd("d", -30, tTo)
         AggregatePeriod cn, rtCat, machineId, "30D", tFrom, tTo
-        g_lastRunByMachinePeriod(key) = nowDT
+        g_lastRunByMachinePeriod(machineId & "|30D") = nowDT
     End If
 
     CloseConn cn

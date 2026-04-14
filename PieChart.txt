@@ -522,25 +522,23 @@ Public Sub MainStatusAggregation(ByVal machineId)
 
     rtCat = GetRuntimeCatalog()
 
-    ' 1D
+    ' Execute at most one period per invocation, with fixed priority:
+    ' 1D -> 7D -> 30D
     If due1D Then
         tTo = nowDT: tFrom = DateAdd("d", -1, tTo)
         AggregatePeriod cn, rtCat, machineId, "1D", tFrom, tTo
         g_lastRunByMachinePeriod(machineId & "|1D") = nowDT
-    End If
-
-    ' 7D
-    If due7D Then
+        guardReason = "ran_1D"
+    ElseIf due7D Then
         tTo = nowDT: tFrom = DateAdd("d", -7, tTo)
         AggregatePeriod cn, rtCat, machineId, "7D", tFrom, tTo
         g_lastRunByMachinePeriod(machineId & "|7D") = nowDT
-    End If
-
-    ' 30D
-    If due30D Then
+        guardReason = "ran_7D"
+    ElseIf due30D Then
         tTo = nowDT: tFrom = DateAdd("d", -30, tTo)
         AggregatePeriod cn, rtCat, machineId, "30D", tFrom, tTo
         g_lastRunByMachinePeriod(machineId & "|30D") = nowDT
+        guardReason = "ran_30D"
     End If
 
 GuardExit:

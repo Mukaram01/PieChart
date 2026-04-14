@@ -25,7 +25,10 @@ Const DEFAULT_PROVIDER       = "MSOLEDBSQL"
 Const FALLBACK_PROVIDER      = "SQLNCLI11"
 Const SQL_INSTANCE           = ".\WinCC"
 Const INITIAL_CATALOG        = "master"
-Const SQL_TIMEOUT_SECONDS    = 600
+Const SQL_TIMEOUT_SECONDS    = 45
+Const MAX_RETRY_ATTEMPTS     = 2
+Const RETRY_BACKOFF_MS       = 250
+Const RETRY_BACKOFF_TIMEOUT_MS = 1250
 
 Const THROTTLE_1D_MINUTES    = 10
 Const THROTTLE_7D_MINUTES    = 15
@@ -185,13 +188,21 @@ Private Function ElapsedMs(ByVal timerStart)
     ElapsedMs = CLng((timerEnd - timerStart) * 1000)
 End Function
 
+Private Function IsTimeoutLikeError(ByVal errDesc)
+    Dim lowered
+    lowered = LCase(S(errDesc))
+    IsTimeoutLikeError = (InStr(lowered, "timeout") > 0) Or _
+                         (InStr(lowered, "time out") > 0) Or _
+                         (InStr(lowered, "expired") > 0)
+End Function
+
 ' ─────────────────────────────────────────────────────────────────────
-' cp_TagStatisticEx (3 retries, null-safe)
+' cp_TagStatisticEx (short retry, null-safe)
 ' ─────────────────────────────────────────────────────────────────────
 Private Function ExecCpTagStatisticEx(ByVal cn, ByVal runtimeCatalog, ByVal tagFullName, ByVal tFrom, ByVal tTo, ByVal aggList, ByVal machineId, ByVal periodKey, ByVal statusName)
     Dim i, cmd, rs, sSql, safeTag, fieldValue
     Dim startTimer, startedAt, completedAt, elapsedMsValue
-    Dim returnedRows, valueText, infoMsg
+    Dim returnedRows, valueText, infoMsg, errDesc, backoffMs
 
     startedAt = Now
     startTimer = Timer
@@ -200,7 +211,7 @@ Private Function ExecCpTagStatisticEx(ByVal cn, ByVal runtimeCatalog, ByVal tagF
 
     safeTag = Replace(tagFullName, "'", "''")
 
-    For i = 1 To 3
+    For i = 1 To MAX_RETRY_ATTEMPTS
         On Error Resume Next
 
         Set cmd = CreateObject("ADODB.Command")
@@ -260,10 +271,15 @@ Private Function ExecCpTagStatisticEx(ByVal cn, ByVal runtimeCatalog, ByVal tagF
             LogMsg LOG_LEVEL_INFO, "cp_TagStatisticEx", infoMsg
             Exit Function
         Else
-            LogMsg LOG_LEVEL_WARN, "cp_TagStatisticEx", "Attempt " & i & " failed: " & S(Err.Description)
+            errDesc = S(Err.Description)
+            LogMsg LOG_LEVEL_WARN, "cp_TagStatisticEx", "Attempt " & i & " failed: " & errDesc
             Err.Clear
             On Error GoTo 0
-            SleepMs 500
+            If i < MAX_RETRY_ATTEMPTS Then
+                backoffMs = RETRY_BACKOFF_MS
+                If IsTimeoutLikeError(errDesc) Then backoffMs = RETRY_BACKOFF_TIMEOUT_MS
+                SleepMs backoffMs
+            End If
         End If
     Next
 
@@ -434,18 +450,28 @@ End Function
 ' Main Entry Point
 ' ─────────────────────────────────────────────────────────────────────
 Public Sub MainStatusAggregation(ByVal machineId)
-    If Not IsMaster() Then Exit Sub
-
     Dim cn, rtCat, nowDT
     Dim tFrom, tTo
     Dim key, lastRun
     Dim due1D, due7D, due30D
+    Dim startedAt, completedAt, startTimer, totalElapsedMs
+    Dim guardReason
+
+    startedAt = Now
+    startTimer = Timer
+    guardReason = "completed"
+
+    If Not IsMaster() Then
+        guardReason = "skip_not_master"
+        GoTo GuardExit
+    End If
 
     InitGlobals
 
     If Not G_MACHINES.Exists(machineId) Then
         LogMsg LOG_LEVEL_WARN, "MainStatusAggregation", "Unknown machineId: " & S(machineId)
-        Exit Sub
+        guardReason = "skip_unknown_machine"
+        GoTo GuardExit
     End If
 
     nowDT = Now()
@@ -467,17 +493,21 @@ Public Sub MainStatusAggregation(ByVal machineId)
     due30D = ShouldRun(lastRun, THROTTLE_30D_MINUTES)
 
     ' Important: avoid SQL connection work when nothing is due.
-    If Not (due1D Or due7D Or due30D) Then Exit Sub
+    If Not (due1D Or due7D Or due30D) Then
+        guardReason = "skip_throttle"
+        GoTo GuardExit
+    End If
 
     Set cn = OpenConnection()
     If cn Is Nothing Then
         LogMsg LOG_LEVEL_ERROR, "MainStatusAggregation", "ERROR: cannot open SQL connection"
-        Exit Sub
+        guardReason = "fail_open_connection"
+        GoTo GuardExit
     End If
     If cn.State <> adStateOpen Then
         LogMsg LOG_LEVEL_ERROR, "MainStatusAggregation", "ERROR: cannot open SQL connection"
-        CloseConn cn
-        Exit Sub
+        guardReason = "fail_connection_state"
+        GoTo GuardExit
     End If
 
     rtCat = GetRuntimeCatalog()
@@ -503,5 +533,15 @@ Public Sub MainStatusAggregation(ByVal machineId)
         g_lastRunByMachinePeriod(machineId & "|30D") = nowDT
     End If
 
+GuardExit:
     CloseConn cn
+
+    completedAt = Now
+    totalElapsedMs = ElapsedMs(startTimer)
+    LogMsg LOG_LEVEL_WARN, "MainStatusAggregation", _
+           "runtime_guard machine=" & machineId & _
+           " started=" & TS3(startedAt) & _
+           " ended=" & TS3(completedAt) & _
+           " elapsed_ms=" & totalElapsedMs & _
+           " reason=" & guardReason
 End Sub

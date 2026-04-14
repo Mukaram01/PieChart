@@ -52,6 +52,7 @@ Const CURRENT_LOG_LEVEL      = 4   ' DEBUG
 ' Runtime state
 ' ─────────────────────────────────────────────────────────────────────
 Dim g_lastRunByMachinePeriod
+Dim g_machineLocks
 Dim G_MACHINES
 Dim g_inited
 
@@ -76,6 +77,7 @@ Private Sub InitGlobals()
     If g_inited Then Exit Sub
 
     Set g_lastRunByMachinePeriod = CreateObject("Scripting.Dictionary")
+    Set g_machineLocks = CreateObject("Scripting.Dictionary")
 
     Set G_MACHINES = CreateObject("Scripting.Dictionary")
     ' MachineId → Tag-logging prefix (left of backslash)
@@ -455,18 +457,26 @@ Public Sub MainStatusAggregation(ByVal machineId)
     Dim key, lastRun
     Dim due1D, due7D, due30D
     Dim startedAt, completedAt, startTimer, totalElapsedMs
-    Dim guardReason
+    Dim guardReason, lockAcquired
 
     startedAt = Now
     startTimer = Timer
     guardReason = "completed"
+    lockAcquired = False
+
+    InitGlobals
+
+    If Not TryAcquireMachineLock(machineId) Then
+        LogMsg LOG_LEVEL_WARN, "MainStatusAggregation", "Lock already active; skipping machineId: " & S(machineId)
+        guardReason = "skip_lock_held"
+        GoTo GuardExit
+    End If
+    lockAcquired = True
 
     If Not IsMaster() Then
         guardReason = "skip_not_master"
         GoTo GuardExit
     End If
-
-    InitGlobals
 
     If Not G_MACHINES.Exists(machineId) Then
         LogMsg LOG_LEVEL_WARN, "MainStatusAggregation", "Unknown machineId: " & S(machineId)
@@ -535,6 +545,7 @@ Public Sub MainStatusAggregation(ByVal machineId)
 
 GuardExit:
     CloseConn cn
+    If lockAcquired Then ReleaseMachineLock machineId
 
     completedAt = Now
     totalElapsedMs = ElapsedMs(startTimer)
@@ -544,4 +555,19 @@ GuardExit:
            " ended=" & TS3(completedAt) & _
            " elapsed_ms=" & totalElapsedMs & _
            " reason=" & guardReason
+End Sub
+
+Private Function TryAcquireMachineLock(ByVal machineId)
+    If g_machineLocks.Exists(machineId) Then
+        TryAcquireMachineLock = False
+    Else
+        g_machineLocks.Add machineId, True
+        TryAcquireMachineLock = True
+    End If
+End Function
+
+Private Sub ReleaseMachineLock(ByVal machineId)
+    If g_machineLocks.Exists(machineId) Then
+        g_machineLocks.Remove machineId
+    End If
 End Sub

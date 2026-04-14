@@ -158,7 +158,13 @@ End Function
 
 Private Sub CloseConn(ByVal cn)
     On Error Resume Next
-    If Not cn Is Nothing Then If cn.State = adStateOpen Then cn.Close
+    If IsObject(cn) Then
+        If Not (cn Is Nothing) Then
+            If cn.State = adStateOpen Then cn.Close
+        End If
+    Else
+        LogMsg LOG_LEVEL_DEBUG, "CloseConn", "Skip close: non-object connection handle"
+    End If
     Set cn = Nothing
     On Error GoTo 0
 End Sub

@@ -338,22 +338,39 @@ Private Function BuildCountTagFullName(ByVal machineId, ByVal statusName)
     BuildCountTagFullName = basePrefix & "\" & baseCore & "_Count"
 End Function
 
-Private Function BuildCpTagStatisticExLiteral(ByVal runtimeCatalog, ByVal tagFullName, ByVal tFrom, ByVal tTo)
+Private Function BuildCpTagStatisticExLiteral(ByVal runtimeCatalog, ByVal tagFullName, ByVal tFrom, ByVal tTo, ByVal aggExpr)
     Dim safeCatalog, safeTag
     safeCatalog = Replace(runtimeCatalog, "'", "''")
     safeTag = Replace(tagFullName, "'", "''")
     BuildCpTagStatisticExLiteral = "cp_TagStatisticEx '" & safeCatalog & "'," & _
                                    "'TAG:R,''" & safeTag & "'',''" & TS3(tFrom) & "'',''" & TS3(tTo) & "'''," & _
-                                   "'AVG(RealValue)'"
+                                   "'" & aggExpr & "'"
 End Function
 
-Private Function GetStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal periodKey, ByVal t1, ByVal t2)
+Private Function CopyStatusFractions(ByVal srcDict)
+    Dim dst
+    Set dst = CreateObject("Scripting.Dictionary")
+    dst.Add "Aborted", srcDict("Aborted")
+    dst.Add "Halted", srcDict("Halted")
+    dst.Add "Running", srcDict("Running")
+    dst.Add "Waiting", srcDict("Waiting")
+    dst.Add "Interrupted", srcDict("Interrupted")
+    Set CopyStatusFractions = dst
+End Function
+
+Private Function SumStatusFractions(ByVal d)
+    SumStatusFractions = CDbl(d("Aborted")) + CDbl(d("Halted")) + CDbl(d("Running")) + CDbl(d("Waiting")) + CDbl(d("Interrupted"))
+End Function
+
+Private Function ExecuteStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal periodKey, ByVal t1, ByVal t2, ByVal aggExpr, ByRef hasNumericCount)
     Dim cmd, rs, sqlText, startedAt, completedAt, startTimer, elapsedMsValue, infoMsg
     Dim statuses, aliases, idx, statusName, tagFull, cpCall
-    Dim outDict, aliasKey, fieldValue
+    Dim outDict, fieldValue
+    Dim valA, valH, valR, valW, valI
 
     startedAt = Now
     startTimer = Timer
+    hasNumericCount = 0
 
     Set outDict = CreateObject("Scripting.Dictionary")
     outDict.Add "Aborted", 0
@@ -369,7 +386,7 @@ Private Function GetStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal m
     For idx = 0 To UBound(statuses)
         statusName = CStr(statuses(idx))
         tagFull = BuildCountTagFullName(machineId, statusName)
-        cpCall = BuildCpTagStatisticExLiteral(runtimeCatalog, tagFull, t1, t2)
+        cpCall = BuildCpTagStatisticExLiteral(runtimeCatalog, tagFull, t1, t2, aggExpr)
         sqlText = sqlText & "INSERT INTO @Status (frac) EXEC " & cpCall & ";" & vbCrLf
         sqlText = sqlText & "UPDATE @Status SET status_alias='" & CStr(aliases(idx)) & "' WHERE status_alias IS NULL;" & vbCrLf
     Next
@@ -397,11 +414,11 @@ Private Function GetStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal m
         If Not (rs Is Nothing) Then
             If Not rs.EOF Then
                 If rs.Fields.Count >= 5 Then
-                    fieldValue = rs.Fields("a").Value: If IsNumeric(fieldValue) Then outDict("Aborted") = CDbl(fieldValue)
-                    fieldValue = rs.Fields("h").Value: If IsNumeric(fieldValue) Then outDict("Halted") = CDbl(fieldValue)
-                    fieldValue = rs.Fields("r").Value: If IsNumeric(fieldValue) Then outDict("Running") = CDbl(fieldValue)
-                    fieldValue = rs.Fields("w").Value: If IsNumeric(fieldValue) Then outDict("Waiting") = CDbl(fieldValue)
-                    fieldValue = rs.Fields("i").Value: If IsNumeric(fieldValue) Then outDict("Interrupted") = CDbl(fieldValue)
+                    fieldValue = rs.Fields("a").Value: If IsNumeric(fieldValue) Then outDict("Aborted") = CDbl(fieldValue): hasNumericCount = hasNumericCount + 1
+                    fieldValue = rs.Fields("h").Value: If IsNumeric(fieldValue) Then outDict("Halted") = CDbl(fieldValue): hasNumericCount = hasNumericCount + 1
+                    fieldValue = rs.Fields("r").Value: If IsNumeric(fieldValue) Then outDict("Running") = CDbl(fieldValue): hasNumericCount = hasNumericCount + 1
+                    fieldValue = rs.Fields("w").Value: If IsNumeric(fieldValue) Then outDict("Waiting") = CDbl(fieldValue): hasNumericCount = hasNumericCount + 1
+                    fieldValue = rs.Fields("i").Value: If IsNumeric(fieldValue) Then outDict("Interrupted") = CDbl(fieldValue): hasNumericCount = hasNumericCount + 1
                 End If
             End If
             rs.Close
@@ -417,21 +434,71 @@ Private Function GetStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal m
 
     completedAt = Now
     elapsedMsValue = ElapsedMs(startTimer)
+    valA = outDict("Aborted")
+    valH = outDict("Halted")
+    valR = outDict("Running")
+    valW = outDict("Waiting")
+    valI = outDict("Interrupted")
     infoMsg = "machine=" & machineId & _
               " window=" & periodKey & _
+              " agg=" & aggExpr & _
               " sql_from=" & TS3(t1) & _
               " sql_to=" & TS3(t2) & _
               " started=" & TS3(startedAt) & _
               " ended=" & TS3(completedAt) & _
               " elapsed_ms=" & elapsedMsValue & _
-              " a=" & outDict("Aborted") & _
-              " h=" & outDict("Halted") & _
-              " r=" & outDict("Running") & _
-              " w=" & outDict("Waiting") & _
-              " i=" & outDict("Interrupted")
+              " numeric=" & hasNumericCount & _
+              " a=" & valA & _
+              " h=" & valH & _
+              " r=" & valR & _
+              " w=" & valW & _
+              " i=" & valI
     LogMsg LOG_LEVEL_INFO, "GetStatusFractionsBatch", infoMsg
 
-    Set GetStatusFractionsBatch = outDict
+    Set ExecuteStatusFractionsBatch = outDict
+End Function
+
+Private Function GetStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal periodKey, ByVal t1, ByVal t2)
+    Dim aggs, idx, aggExpr
+    Dim currentDict, bestDict
+    Dim numericCount, bestNumericCount
+    Dim currentSum, bestSum
+    Dim selectedAgg
+
+    aggs = Array("AVG(RealValue)", "AVG(Value)", "AVG(ValueScaled)")
+    bestNumericCount = -1
+    bestSum = -1
+    selectedAgg = ""
+
+    For idx = 0 To UBound(aggs)
+        aggExpr = CStr(aggs(idx))
+        Set currentDict = ExecuteStatusFractionsBatch(cn, runtimeCatalog, machineId, periodKey, t1, t2, aggExpr, numericCount)
+        currentSum = SumStatusFractions(currentDict)
+
+        If (bestDict Is Nothing) Then
+            Set bestDict = CopyStatusFractions(currentDict)
+            bestNumericCount = numericCount
+            bestSum = currentSum
+            selectedAgg = aggExpr
+        ElseIf (numericCount > bestNumericCount) Or _
+               (numericCount = bestNumericCount And currentSum > bestSum And bestSum <= 0) Then
+            Set bestDict = CopyStatusFractions(currentDict)
+            bestNumericCount = numericCount
+            bestSum = currentSum
+            selectedAgg = aggExpr
+        End If
+
+        If numericCount = 5 And currentSum > 0 Then Exit For
+    Next
+
+    LogMsg LOG_LEVEL_INFO, "GetStatusFractionsBatch", _
+           "selected_agg machine=" & machineId & _
+           " window=" & periodKey & _
+           " agg=" & selectedAgg & _
+           " numeric=" & bestNumericCount & _
+           " sum=" & bestSum
+
+    Set GetStatusFractionsBatch = bestDict
 End Function
 
 Private Function GetCountFraction(ByVal statusFractions, ByVal statusName)

@@ -329,21 +329,121 @@ Private Function TryAvgFraction(ByVal cn, ByVal runtimeCatalog, ByVal tagFull, B
 End Function
 
 ' ─────────────────────────────────────────────────────────────────────
-' READ ONLY *_Count (your requirement)
+' READ ONLY *_Count (single SQL roundtrip for all 5 statuses)
 ' ─────────────────────────────────────────────────────────────────────
-Private Function GetCountFraction(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal statusName, ByVal periodKey, ByVal t1, ByVal t2)
-    Dim basePrefix, baseCore, tagFull, v
-
+Private Function BuildCountTagFullName(ByVal machineId, ByVal statusName)
+    Dim basePrefix, baseCore
     basePrefix = G_MACHINES(machineId)
     baseCore   = machineId & "_ProgramStatus_" & statusName
+    BuildCountTagFullName = basePrefix & "\" & baseCore & "_Count"
+End Function
 
-    tagFull = basePrefix & "\" & baseCore & "_Count"
-    v = TryAvgFraction(cn, runtimeCatalog, tagFull, t1, t2, machineId, periodKey, statusName)
+Private Function BuildCpTagStatisticExLiteral(ByVal runtimeCatalog, ByVal tagFullName, ByVal tFrom, ByVal tTo)
+    Dim safeCatalog, safeTag
+    safeCatalog = Replace(runtimeCatalog, "'", "''")
+    safeTag = Replace(tagFullName, "'", "''")
+    BuildCpTagStatisticExLiteral = "cp_TagStatisticEx '" & safeCatalog & "'," & _
+                                   "'TAG:R,''" & safeTag & "'',''" & TS3(tFrom) & "'',''" & TS3(tTo) & "'''," & _
+                                   "'AVG(RealValue)'"
+End Function
 
-    If IsNumeric(v) Then
-        GetCountFraction = CDbl(v)
+Private Function GetStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal periodKey, ByVal t1, ByVal t2)
+    Dim cmd, rs, sqlText, startedAt, completedAt, startTimer, elapsedMsValue, infoMsg
+    Dim statuses, aliases, idx, statusName, tagFull, cpCall
+    Dim outDict, aliasKey, fieldValue
+
+    startedAt = Now
+    startTimer = Timer
+
+    Set outDict = CreateObject("Scripting.Dictionary")
+    outDict.Add "Aborted", 0
+    outDict.Add "Halted", 0
+    outDict.Add "Running", 0
+    outDict.Add "Waiting", 0
+    outDict.Add "Interrupted", 0
+
+    statuses = Array("Aborted", "Halted", "Running", "Waiting", "Interrupted")
+    aliases  = Array("a", "h", "r", "w", "i")
+
+    sqlText = "DECLARE @Status TABLE (status_alias NVARCHAR(1), frac FLOAT);" & vbCrLf
+    For idx = 0 To UBound(statuses)
+        statusName = CStr(statuses(idx))
+        tagFull = BuildCountTagFullName(machineId, statusName)
+        cpCall = BuildCpTagStatisticExLiteral(runtimeCatalog, tagFull, t1, t2)
+        sqlText = sqlText & "INSERT INTO @Status (frac) EXEC " & cpCall & ";" & vbCrLf
+        sqlText = sqlText & "UPDATE @Status SET status_alias='" & CStr(aliases(idx)) & "' WHERE status_alias IS NULL;" & vbCrLf
+    Next
+    sqlText = sqlText & "SELECT " & _
+              "MAX(CASE WHEN status_alias='a' THEN frac END) AS a," & _
+              "MAX(CASE WHEN status_alias='h' THEN frac END) AS h," & _
+              "MAX(CASE WHEN status_alias='r' THEN frac END) AS r," & _
+              "MAX(CASE WHEN status_alias='w' THEN frac END) AS w," & _
+              "MAX(CASE WHEN status_alias='i' THEN frac END) AS i " & _
+              "FROM @Status;"
+
+    On Error Resume Next
+    Set cmd = CreateObject("ADODB.Command")
+    Set cmd.ActiveConnection = cn
+    cmd.CommandTimeout = SQL_TIMEOUT_SECONDS
+    cmd.CommandType = adCmdText
+    cmd.CommandText = sqlText
+
+    If CURRENT_LOG_LEVEL >= LOG_LEVEL_DEBUG Then
+        LogMsg LOG_LEVEL_DEBUG, "GetStatusFractionsBatch", "SQL=[" & sqlText & "]"
+    End If
+
+    Set rs = cmd.Execute
+    If Err.Number = 0 Then
+        If Not (rs Is Nothing) Then
+            If Not rs.EOF Then
+                If rs.Fields.Count >= 5 Then
+                    fieldValue = rs.Fields("a").Value: If IsNumeric(fieldValue) Then outDict("Aborted") = CDbl(fieldValue)
+                    fieldValue = rs.Fields("h").Value: If IsNumeric(fieldValue) Then outDict("Halted") = CDbl(fieldValue)
+                    fieldValue = rs.Fields("r").Value: If IsNumeric(fieldValue) Then outDict("Running") = CDbl(fieldValue)
+                    fieldValue = rs.Fields("w").Value: If IsNumeric(fieldValue) Then outDict("Waiting") = CDbl(fieldValue)
+                    fieldValue = rs.Fields("i").Value: If IsNumeric(fieldValue) Then outDict("Interrupted") = CDbl(fieldValue)
+                End If
+            End If
+            rs.Close
+        End If
     Else
-        ' treat missing as 0 (do NOT abort)
+        LogMsg LOG_LEVEL_WARN, "GetStatusFractionsBatch", "Batch query failed; status fractions defaulted to 0. err=" & S(Err.Description)
+        Err.Clear
+    End If
+    On Error GoTo 0
+
+    Set rs = Nothing
+    Set cmd = Nothing
+
+    completedAt = Now
+    elapsedMsValue = ElapsedMs(startTimer)
+    infoMsg = "machine=" & machineId & _
+              " window=" & periodKey & _
+              " sql_from=" & TS3(t1) & _
+              " sql_to=" & TS3(t2) & _
+              " started=" & TS3(startedAt) & _
+              " ended=" & TS3(completedAt) & _
+              " elapsed_ms=" & elapsedMsValue & _
+              " a=" & outDict("Aborted") & _
+              " h=" & outDict("Halted") & _
+              " r=" & outDict("Running") & _
+              " w=" & outDict("Waiting") & _
+              " i=" & outDict("Interrupted")
+    LogMsg LOG_LEVEL_INFO, "GetStatusFractionsBatch", infoMsg
+
+    Set GetStatusFractionsBatch = outDict
+End Function
+
+Private Function GetCountFraction(ByVal statusFractions, ByVal statusName)
+    If (statusFractions Is Nothing) Then
+        GetCountFraction = 0
+    ElseIf statusFractions.Exists(statusName) Then
+        If IsNumeric(statusFractions(statusName)) Then
+            GetCountFraction = CDbl(statusFractions(statusName))
+        Else
+            GetCountFraction = 0
+        End If
+    Else
         GetCountFraction = 0
     End If
 End Function
@@ -352,16 +452,18 @@ End Function
 ' Combine 5 → 3 (your rule), normalize if overlap makes sum > 1
 ' ─────────────────────────────────────────────────────────────────────
 Private Sub GetCombinedFractions(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal periodKey, ByVal t1, ByVal t2, ByRef fRun, ByRef fHalt, ByRef fAbort)
-    Dim a, h, r, w, i, total
+    Dim a, h, r, w, i, total, statusFractions
 
     ' Initialise outputs so callers always receive well-defined values
     fRun = 0 : fHalt = 0 : fAbort = 0
 
-    a = GetCountFraction(cn, runtimeCatalog, machineId, "Aborted",     periodKey, t1, t2)
-    h = GetCountFraction(cn, runtimeCatalog, machineId, "Halted",      periodKey, t1, t2)
-    r = GetCountFraction(cn, runtimeCatalog, machineId, "Running",     periodKey, t1, t2)
-    w = GetCountFraction(cn, runtimeCatalog, machineId, "Waiting",     periodKey, t1, t2)
-    i = GetCountFraction(cn, runtimeCatalog, machineId, "Interrupted", periodKey, t1, t2)
+    Set statusFractions = GetStatusFractionsBatch(cn, runtimeCatalog, machineId, periodKey, t1, t2)
+
+    a = GetCountFraction(statusFractions, "Aborted")
+    h = GetCountFraction(statusFractions, "Halted")
+    r = GetCountFraction(statusFractions, "Running")
+    w = GetCountFraction(statusFractions, "Waiting")
+    i = GetCountFraction(statusFractions, "Interrupted")
 
     fRun   = r
     fHalt  = h + i

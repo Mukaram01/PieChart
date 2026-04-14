@@ -30,9 +30,9 @@ Const MAX_RETRY_ATTEMPTS     = 2
 Const RETRY_BACKOFF_MS       = 250
 Const RETRY_BACKOFF_TIMEOUT_MS = 1250
 
-Const THROTTLE_1D_MINUTES    = 10
-Const THROTTLE_7D_MINUTES    = 15
-Const THROTTLE_30D_MINUTES   = 57
+Const THROTTLE_1D_MINUTES    = 30    ' every 30 minutes
+Const THROTTLE_7D_MINUTES    = 360   ' every 6 hours
+Const THROTTLE_30D_MINUTES   = 1440  ' every 24 hours
 
 Const adCmdText              = 1
 Const adStateOpen            = 1
@@ -559,91 +559,100 @@ Public Sub MainStatusAggregation(ByVal machineId)
     Dim key, lastRun
     Dim due1D, due7D, due30D
     Dim startedAt, completedAt, startTimer, totalElapsedMs
-    Dim guardReason, lockAcquired
+    Dim guardReason, lockAcquired, canRun
 
     startedAt = Now
     startTimer = Timer
     guardReason = "completed"
     lockAcquired = False
+    canRun = True
 
     InitGlobals
 
     If Not TryAcquireMachineLock(machineId) Then
         LogMsg LOG_LEVEL_WARN, "MainStatusAggregation", "Lock already active; skipping machineId: " & S(machineId)
         guardReason = "skip_lock_held"
-        GoTo GuardExit
+        canRun = False
     End If
-    lockAcquired = True
+    If canRun Then lockAcquired = True
 
-    If Not IsMaster() Then
-        guardReason = "skip_not_master"
-        GoTo GuardExit
-    End If
-
-    If Not G_MACHINES.Exists(machineId) Then
-        LogMsg LOG_LEVEL_WARN, "MainStatusAggregation", "Unknown machineId: " & S(machineId)
-        guardReason = "skip_unknown_machine"
-        GoTo GuardExit
+    If canRun Then
+        If Not IsMaster() Then
+            guardReason = "skip_not_master"
+            canRun = False
+        End If
     End If
 
-    nowDT = Now()
-    due1D = False : due7D = False : due30D = False
-
-    key = machineId & "|1D"
-    lastRun = Empty
-    If g_lastRunByMachinePeriod.Exists(key) Then lastRun = g_lastRunByMachinePeriod(key)
-    due1D = ShouldRun(lastRun, THROTTLE_1D_MINUTES)
-
-    key = machineId & "|7D"
-    lastRun = Empty
-    If g_lastRunByMachinePeriod.Exists(key) Then lastRun = g_lastRunByMachinePeriod(key)
-    due7D = ShouldRun(lastRun, THROTTLE_7D_MINUTES)
-
-    key = machineId & "|30D"
-    lastRun = Empty
-    If g_lastRunByMachinePeriod.Exists(key) Then lastRun = g_lastRunByMachinePeriod(key)
-    due30D = ShouldRun(lastRun, THROTTLE_30D_MINUTES)
-
-    ' Important: avoid SQL connection work when nothing is due.
-    If Not (due1D Or due7D Or due30D) Then
-        guardReason = "skip_throttle"
-        GoTo GuardExit
+    If canRun Then
+        If Not G_MACHINES.Exists(machineId) Then
+            LogMsg LOG_LEVEL_WARN, "MainStatusAggregation", "Unknown machineId: " & S(machineId)
+            guardReason = "skip_unknown_machine"
+            canRun = False
+        End If
     End If
 
-    Set cn = OpenConnection()
-    If cn Is Nothing Then
-        LogMsg LOG_LEVEL_ERROR, "MainStatusAggregation", "ERROR: cannot open SQL connection"
-        guardReason = "fail_open_connection"
-        GoTo GuardExit
-    End If
-    If cn.State <> adStateOpen Then
-        LogMsg LOG_LEVEL_ERROR, "MainStatusAggregation", "ERROR: cannot open SQL connection"
-        guardReason = "fail_connection_state"
-        GoTo GuardExit
+    If canRun Then
+        nowDT = Now()
+        due1D = False : due7D = False : due30D = False
+
+        key = machineId & "|1D"
+        lastRun = Empty
+        If g_lastRunByMachinePeriod.Exists(key) Then lastRun = g_lastRunByMachinePeriod(key)
+        due1D = ShouldRun(lastRun, THROTTLE_1D_MINUTES)
+
+        key = machineId & "|7D"
+        lastRun = Empty
+        If g_lastRunByMachinePeriod.Exists(key) Then lastRun = g_lastRunByMachinePeriod(key)
+        due7D = ShouldRun(lastRun, THROTTLE_7D_MINUTES)
+
+        key = machineId & "|30D"
+        lastRun = Empty
+        If g_lastRunByMachinePeriod.Exists(key) Then lastRun = g_lastRunByMachinePeriod(key)
+        due30D = ShouldRun(lastRun, THROTTLE_30D_MINUTES)
+
+        ' Important: avoid SQL connection work when nothing is due.
+        If Not (due1D Or due7D Or due30D) Then
+            guardReason = "skip_throttle"
+            canRun = False
+        End If
     End If
 
-    rtCat = GetRuntimeCatalog()
+    If canRun Then
+        Set cn = OpenConnection()
+        If cn Is Nothing Then
+            LogMsg LOG_LEVEL_ERROR, "MainStatusAggregation", "ERROR: cannot open SQL connection"
+            guardReason = "fail_open_connection"
+            canRun = False
+        ElseIf cn.State <> adStateOpen Then
+            LogMsg LOG_LEVEL_ERROR, "MainStatusAggregation", "ERROR: cannot open SQL connection"
+            guardReason = "fail_connection_state"
+            canRun = False
+        End If
+    End If
+
+    If canRun Then rtCat = GetRuntimeCatalog()
 
     ' Execute at most one period per invocation, with fixed priority:
     ' 1D -> 7D -> 30D
-    If due1D Then
-        tTo = nowDT: tFrom = DateAdd("d", -1, tTo)
-        AggregatePeriod cn, rtCat, machineId, "1D", tFrom, tTo
-        g_lastRunByMachinePeriod(machineId & "|1D") = nowDT
-        guardReason = "ran_1D"
-    ElseIf due7D Then
-        tTo = nowDT: tFrom = DateAdd("d", -7, tTo)
-        AggregatePeriod cn, rtCat, machineId, "7D", tFrom, tTo
-        g_lastRunByMachinePeriod(machineId & "|7D") = nowDT
-        guardReason = "ran_7D"
-    ElseIf due30D Then
-        tTo = nowDT: tFrom = DateAdd("d", -30, tTo)
-        AggregatePeriod cn, rtCat, machineId, "30D", tFrom, tTo
-        g_lastRunByMachinePeriod(machineId & "|30D") = nowDT
-        guardReason = "ran_30D"
+    If canRun Then
+        If due1D Then
+            tTo = nowDT: tFrom = DateAdd("d", -1, tTo)
+            AggregatePeriod cn, rtCat, machineId, "1D", tFrom, tTo
+            g_lastRunByMachinePeriod(machineId & "|1D") = nowDT
+            guardReason = "ran_1D"
+        ElseIf due7D Then
+            tTo = nowDT: tFrom = DateAdd("d", -7, tTo)
+            AggregatePeriod cn, rtCat, machineId, "7D", tFrom, tTo
+            g_lastRunByMachinePeriod(machineId & "|7D") = nowDT
+            guardReason = "ran_7D"
+        ElseIf due30D Then
+            tTo = nowDT: tFrom = DateAdd("d", -30, tTo)
+            AggregatePeriod cn, rtCat, machineId, "30D", tFrom, tTo
+            g_lastRunByMachinePeriod(machineId & "|30D") = nowDT
+            guardReason = "ran_30D"
+        End If
     End If
-
-GuardExit:
+    
     CloseConn cn
     If lockAcquired Then ReleaseMachineLock machineId
 

@@ -100,6 +100,11 @@ Private Sub InitGlobals()
     G_MACHINES.Add "MNA_0085", "Droop_Rein_1_MNA_0085_LM33H"
     G_MACHINES.Add "MNA_0087", "Droop_Rein_4_MNA_0087_LM33F"
 
+    ' MLG Mill Turns
+    G_MACHINES.Add "MNA_0235", "WFL_M120_MNA_0235"
+    G_MACHINES.Add "MNA_0237", "WFL_M50_MNA_0237"
+    G_MACHINES.Add "MNA_0411", "Mazak_MNA_0411"
+
     g_inited = True
 End Sub
 

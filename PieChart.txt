@@ -46,7 +46,7 @@ Const LOG_LEVEL_INFO         = 3
 Const LOG_LEVEL_DEBUG        = 4
 
 ' IMPORTANT: must be literal in WinCC VBScript
-Const CURRENT_LOG_LEVEL      = 4   ' DEBUG
+Const CURRENT_LOG_LEVEL      = 3   ' INFO (suppress per-tag debug noise)
 Const WRITE_VERIFY_TOLERANCE = 0.01
 
 ' ─────────────────────────────────────────────────────────────────────
@@ -118,7 +118,7 @@ Private Sub LogMsg(ByVal level, ByVal src, ByVal msg)
     On Error Resume Next
     HMIRuntime.Trace _
         FormatDateTime(Now(), vbShortDate) & " " & _
-        FormatDateTime(Now(), vbLongTime) & " [" & src & "] " & S(msg) & vbCrLf
+        FormatDateTime(Now(), vbLongTime) & " [PieChart/" & src & "] " & S(msg) & vbCrLf
     On Error GoTo 0
 End Sub
 

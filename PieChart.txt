@@ -370,7 +370,8 @@ End Function
 Private Function ExecuteStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal periodKey, ByVal t1, ByVal t2, ByVal aggExpr, ByRef hasNumericCount)
     Dim cmd, rs, sqlText, startedAt, completedAt, startTimer, elapsedMsValue, infoMsg
     Dim statuses, aliases, idx, statusName, tagFull, cpCall
-    Dim outDict, fieldValue
+    Dim outDict, fieldValue, diagRows, diagNumeric
+    Dim aliasKey, statusLabel, insertedRowsValue, isNumericValue, insertedFlag, numericFlag
     Dim valA, valH, valR, valW, valI
 
     startedAt = Now
@@ -387,21 +388,40 @@ Private Function ExecuteStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByV
     statuses = Array("Aborted", "Halted", "Running", "Waiting", "Interrupted")
     aliases  = Array("a", "h", "r", "w", "i")
 
+    Set diagRows = CreateObject("Scripting.Dictionary")
+    Set diagNumeric = CreateObject("Scripting.Dictionary")
+
     sqlText = "DECLARE @Status TABLE (status_alias NVARCHAR(1), frac FLOAT);" & vbCrLf
+    sqlText = sqlText & "DECLARE @StatusDiag TABLE (status_alias NVARCHAR(1), inserted_rows INT, is_numeric INT);" & vbCrLf
     For idx = 0 To UBound(statuses)
         statusName = CStr(statuses(idx))
         tagFull = BuildCountTagFullName(machineId, statusName)
         cpCall = BuildCpTagStatisticExLiteral(runtimeCatalog, tagFull, t1, t2, aggExpr)
         sqlText = sqlText & "INSERT INTO @Status (frac) EXEC " & cpCall & ";" & vbCrLf
+        sqlText = sqlText & "INSERT INTO @StatusDiag (status_alias, inserted_rows, is_numeric) VALUES ('" & CStr(aliases(idx)) & "', @@ROWCOUNT, 0);" & vbCrLf
         sqlText = sqlText & "UPDATE @Status SET status_alias='" & CStr(aliases(idx)) & "' WHERE status_alias IS NULL;" & vbCrLf
+        sqlText = sqlText & "UPDATE d SET is_numeric = CASE " & _
+                 "WHEN d.inserted_rows > 0 AND EXISTS (SELECT 1 FROM @Status s WHERE s.status_alias=d.status_alias AND TRY_CONVERT(FLOAT, s.frac) IS NOT NULL) " & _
+                 "THEN 1 ELSE 0 END " & _
+                 "FROM @StatusDiag d WHERE d.status_alias='" & CStr(aliases(idx)) & "';" & vbCrLf
     Next
     sqlText = sqlText & "SELECT " & _
               "MAX(CASE WHEN status_alias='a' THEN frac END) AS a," & _
               "MAX(CASE WHEN status_alias='h' THEN frac END) AS h," & _
               "MAX(CASE WHEN status_alias='r' THEN frac END) AS r," & _
               "MAX(CASE WHEN status_alias='w' THEN frac END) AS w," & _
-              "MAX(CASE WHEN status_alias='i' THEN frac END) AS i " & _
-              "FROM @Status;"
+              "MAX(CASE WHEN status_alias='i' THEN frac END) AS i," & _
+              "MAX(CASE WHEN status_alias='a' THEN inserted_rows END) AS a_rows," & _
+              "MAX(CASE WHEN status_alias='h' THEN inserted_rows END) AS h_rows," & _
+              "MAX(CASE WHEN status_alias='r' THEN inserted_rows END) AS r_rows," & _
+              "MAX(CASE WHEN status_alias='w' THEN inserted_rows END) AS w_rows," & _
+              "MAX(CASE WHEN status_alias='i' THEN inserted_rows END) AS i_rows," & _
+              "MAX(CASE WHEN status_alias='a' THEN is_numeric END) AS a_num," & _
+              "MAX(CASE WHEN status_alias='h' THEN is_numeric END) AS h_num," & _
+              "MAX(CASE WHEN status_alias='r' THEN is_numeric END) AS r_num," & _
+              "MAX(CASE WHEN status_alias='w' THEN is_numeric END) AS w_num," & _
+              "MAX(CASE WHEN status_alias='i' THEN is_numeric END) AS i_num " & _
+              "FROM @StatusDiag d LEFT JOIN @Status s ON s.status_alias=d.status_alias;"
 
     On Error Resume Next
     Set cmd = CreateObject("ADODB.Command")
@@ -424,6 +444,23 @@ Private Function ExecuteStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByV
                     fieldValue = rs.Fields("r").Value: If IsNumeric(fieldValue) Then outDict("Running") = CDbl(fieldValue): hasNumericCount = hasNumericCount + 1
                     fieldValue = rs.Fields("w").Value: If IsNumeric(fieldValue) Then outDict("Waiting") = CDbl(fieldValue): hasNumericCount = hasNumericCount + 1
                     fieldValue = rs.Fields("i").Value: If IsNumeric(fieldValue) Then outDict("Interrupted") = CDbl(fieldValue): hasNumericCount = hasNumericCount + 1
+
+                    diagRows("a") = 0: diagRows("h") = 0: diagRows("r") = 0: diagRows("w") = 0: diagRows("i") = 0
+                    diagNumeric("a") = 0: diagNumeric("h") = 0: diagNumeric("r") = 0: diagNumeric("w") = 0: diagNumeric("i") = 0
+
+                    If rs.Fields.Count >= 15 Then
+                        insertedRowsValue = rs.Fields("a_rows").Value: If IsNumeric(insertedRowsValue) Then diagRows("a") = CLng(insertedRowsValue)
+                        insertedRowsValue = rs.Fields("h_rows").Value: If IsNumeric(insertedRowsValue) Then diagRows("h") = CLng(insertedRowsValue)
+                        insertedRowsValue = rs.Fields("r_rows").Value: If IsNumeric(insertedRowsValue) Then diagRows("r") = CLng(insertedRowsValue)
+                        insertedRowsValue = rs.Fields("w_rows").Value: If IsNumeric(insertedRowsValue) Then diagRows("w") = CLng(insertedRowsValue)
+                        insertedRowsValue = rs.Fields("i_rows").Value: If IsNumeric(insertedRowsValue) Then diagRows("i") = CLng(insertedRowsValue)
+
+                        isNumericValue = rs.Fields("a_num").Value: If IsNumeric(isNumericValue) Then diagNumeric("a") = CLng(isNumericValue)
+                        isNumericValue = rs.Fields("h_num").Value: If IsNumeric(isNumericValue) Then diagNumeric("h") = CLng(isNumericValue)
+                        isNumericValue = rs.Fields("r_num").Value: If IsNumeric(isNumericValue) Then diagNumeric("r") = CLng(isNumericValue)
+                        isNumericValue = rs.Fields("w_num").Value: If IsNumeric(isNumericValue) Then diagNumeric("w") = CLng(isNumericValue)
+                        isNumericValue = rs.Fields("i_num").Value: If IsNumeric(isNumericValue) Then diagNumeric("i") = CLng(isNumericValue)
+                    End If
                 End If
             End If
             rs.Close
@@ -436,6 +473,31 @@ Private Function ExecuteStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByV
 
     Set rs = Nothing
     Set cmd = Nothing
+
+    For idx = 0 To UBound(statuses)
+        aliasKey = CStr(aliases(idx))
+        statusLabel = CStr(statuses(idx))
+        insertedRowsValue = 0
+        isNumericValue = 0
+        insertedFlag = 0
+        numericFlag = 0
+
+        If diagRows.Exists(aliasKey) Then insertedRowsValue = CLng(diagRows(aliasKey))
+        If diagNumeric.Exists(aliasKey) Then isNumericValue = CLng(diagNumeric(aliasKey))
+        If insertedRowsValue > 0 Then insertedFlag = 1
+        If isNumericValue <> 0 Then numericFlag = 1
+
+        tagFull = BuildCountTagFullName(machineId, statusLabel)
+        LogMsg LOG_LEVEL_INFO, "GetStatusFractionsBatch", _
+               "status_diag machine=" & machineId & _
+               " window=" & periodKey & _
+               " agg=" & aggExpr & _
+               " status=" & statusLabel & _
+               " tag_full=" & tagFull & _
+               " inserted=" & insertedFlag & _
+               " inserted_rows=" & insertedRowsValue & _
+               " is_numeric=" & numericFlag
+    Next
 
     completedAt = Now
     elapsedMsValue = ElapsedMs(startTimer)
@@ -468,17 +530,23 @@ Private Function GetStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal m
     Dim currentDict, bestDict
     Dim numericCount, bestNumericCount
     Dim currentSum, bestSum
-    Dim selectedAgg
+    Dim selectedAgg, aggTrialSummary, currentTrial
 
     aggs = Array("AVG(RealValue)", "AVG(Value)", "AVG(ValueScaled)")
     bestNumericCount = -1
     bestSum = -1
     selectedAgg = ""
+    aggTrialSummary = ""
 
     For idx = 0 To UBound(aggs)
         aggExpr = CStr(aggs(idx))
         Set currentDict = ExecuteStatusFractionsBatch(cn, runtimeCatalog, machineId, periodKey, t1, t2, aggExpr, numericCount)
         currentSum = SumStatusFractions(currentDict)
+        currentTrial = aggExpr & "{numeric=" & numericCount & ",sum=" & currentSum & "}"
+        If Len(aggTrialSummary) > 0 Then
+            aggTrialSummary = aggTrialSummary & "; "
+        End If
+        aggTrialSummary = aggTrialSummary & currentTrial
 
         If (bestDict Is Nothing) Then
             Set bestDict = CopyStatusFractions(currentDict)
@@ -497,8 +565,26 @@ Private Function GetStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal m
     Next
 
     LogMsg LOG_LEVEL_INFO, "GetStatusFractionsBatch", _
+           "agg_trials machine=" & machineId & _
+           " window=" & periodKey & _
+           " catalog=" & runtimeCatalog & _
+           " sql_from=" & TS3(t1) & _
+           " sql_to=" & TS3(t2) & _
+           " trials=[" & aggTrialSummary & "]"
+
+    If bestNumericCount = 0 Then
+        LogMsg LOG_LEVEL_WARN, "GetStatusFractionsBatch", _
+               "all_aggs_non_numeric machine=" & machineId & _
+               " catalog=" & runtimeCatalog & _
+               " window=" & periodKey & _
+               " sql_from=" & TS3(t1) & _
+               " sql_to=" & TS3(t2)
+    End If
+
+    LogMsg LOG_LEVEL_INFO, "GetStatusFractionsBatch", _
            "selected_agg machine=" & machineId & _
            " window=" & periodKey & _
+           " catalog=" & runtimeCatalog & _
            " agg=" & selectedAgg & _
            " numeric=" & bestNumericCount & _
            " sum=" & bestSum

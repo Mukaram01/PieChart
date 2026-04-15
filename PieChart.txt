@@ -29,6 +29,13 @@ Const SQL_TIMEOUT_SECONDS    = 45
 Const MAX_RETRY_ATTEMPTS     = 2
 Const RETRY_BACKOFF_MS       = 250
 Const RETRY_BACKOFF_TIMEOUT_MS = 1250
+Const WINDOW_EXEC_WARN_THRESHOLD_MS = 15000
+
+' Project-specific batch aggregation configuration (ordered by preference).
+' Use "|" to separate expressions. Keep first expression as known-good for
+' your archive schema and list fallbacks after it.
+Const PROJECT_BATCH_AGG_LIST_DEFAULT = "AVG(RealValue)|AVG(Value)|AVG(ValueScaled)"
+Const PROJECT_BATCH_AGG_LIST_WINCC   = "AVG(Value)|AVG(RealValue)|AVG(ValueScaled)"
 
 Const THROTTLE_1D_MINUTES    = 30    ' every 30 minutes
 Const THROTTLE_7D_MINUTES    = 360   ' every 6 hours
@@ -367,16 +374,25 @@ Private Function SumStatusFractions(ByVal d)
     SumStatusFractions = CDbl(d("Aborted")) + CDbl(d("Halted")) + CDbl(d("Running")) + CDbl(d("Waiting")) + CDbl(d("Interrupted"))
 End Function
 
-Private Function ExecuteStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal periodKey, ByVal t1, ByVal t2, ByVal aggExpr, ByRef hasNumericCount)
+Private Function GetAggExprList(ByVal runtimeCatalog)
+    Dim cfg
+    cfg = PROJECT_BATCH_AGG_LIST_DEFAULT
+    If UCase(S(runtimeCatalog)) = "WINCC" Then cfg = PROJECT_BATCH_AGG_LIST_WINCC
+    GetAggExprList = Split(cfg, "|")
+End Function
+
+Private Function ExecuteStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal periodKey, ByVal t1, ByVal t2, ByVal aggExpr, ByRef hasNumericCount, ByRef insertedStatusCount, ByRef allNullNoNumeric)
     Dim cmd, rs, sqlText, startedAt, completedAt, startTimer, elapsedMsValue, infoMsg
     Dim statuses, aliases, idx, statusName, tagFull, cpCall
-    Dim outDict, fieldValue, diagRows, diagNumeric
-    Dim aliasKey, statusLabel, insertedRowsValue, isNumericValue, insertedFlag, numericFlag
+    Dim outDict, fieldValue, diagRows, diagNumeric, diagElapsedMs
+    Dim aliasKey, statusLabel, insertedRowsValue, isNumericValue, insertedFlag, numericFlag, statusElapsedMs
     Dim valA, valH, valR, valW, valI
 
     startedAt = Now
     startTimer = Timer
     hasNumericCount = 0
+    insertedStatusCount = 0
+    allNullNoNumeric = 0
 
     Set outDict = CreateObject("Scripting.Dictionary")
     outDict.Add "Aborted", 0
@@ -390,15 +406,18 @@ Private Function ExecuteStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByV
 
     Set diagRows = CreateObject("Scripting.Dictionary")
     Set diagNumeric = CreateObject("Scripting.Dictionary")
+    Set diagElapsedMs = CreateObject("Scripting.Dictionary")
 
     sqlText = "DECLARE @Status TABLE (status_alias NVARCHAR(1), frac FLOAT);" & vbCrLf
-    sqlText = sqlText & "DECLARE @StatusDiag TABLE (status_alias NVARCHAR(1), inserted_rows INT, is_numeric INT);" & vbCrLf
+    sqlText = sqlText & "DECLARE @StatusDiag TABLE (status_alias NVARCHAR(1), inserted_rows INT, is_numeric INT, elapsed_ms INT);" & vbCrLf
+    sqlText = sqlText & "DECLARE @cpStart DATETIME2(3);" & vbCrLf
     For idx = 0 To UBound(statuses)
         statusName = CStr(statuses(idx))
         tagFull = BuildCountTagFullName(machineId, statusName)
         cpCall = BuildCpTagStatisticExLiteral(runtimeCatalog, tagFull, t1, t2, aggExpr)
+        sqlText = sqlText & "SET @cpStart = SYSDATETIME();" & vbCrLf
         sqlText = sqlText & "INSERT INTO @Status (frac) EXEC " & cpCall & ";" & vbCrLf
-        sqlText = sqlText & "INSERT INTO @StatusDiag (status_alias, inserted_rows, is_numeric) VALUES ('" & CStr(aliases(idx)) & "', @@ROWCOUNT, 0);" & vbCrLf
+        sqlText = sqlText & "INSERT INTO @StatusDiag (status_alias, inserted_rows, is_numeric, elapsed_ms) VALUES ('" & CStr(aliases(idx)) & "', @@ROWCOUNT, 0, DATEDIFF(MILLISECOND, @cpStart, SYSDATETIME()));" & vbCrLf
         sqlText = sqlText & "UPDATE @Status SET status_alias='" & CStr(aliases(idx)) & "' WHERE status_alias IS NULL;" & vbCrLf
         sqlText = sqlText & "UPDATE d SET is_numeric = CASE " & _
                  "WHEN d.inserted_rows > 0 AND EXISTS (SELECT 1 FROM @Status s WHERE s.status_alias=d.status_alias AND TRY_CONVERT(FLOAT, s.frac) IS NOT NULL) " & _
@@ -420,7 +439,12 @@ Private Function ExecuteStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByV
               "MAX(CASE WHEN status_alias='h' THEN is_numeric END) AS h_num," & _
               "MAX(CASE WHEN status_alias='r' THEN is_numeric END) AS r_num," & _
               "MAX(CASE WHEN status_alias='w' THEN is_numeric END) AS w_num," & _
-              "MAX(CASE WHEN status_alias='i' THEN is_numeric END) AS i_num " & _
+              "MAX(CASE WHEN status_alias='i' THEN is_numeric END) AS i_num," & _
+              "MAX(CASE WHEN status_alias='a' THEN elapsed_ms END) AS a_ms," & _
+              "MAX(CASE WHEN status_alias='h' THEN elapsed_ms END) AS h_ms," & _
+              "MAX(CASE WHEN status_alias='r' THEN elapsed_ms END) AS r_ms," & _
+              "MAX(CASE WHEN status_alias='w' THEN elapsed_ms END) AS w_ms," & _
+              "MAX(CASE WHEN status_alias='i' THEN elapsed_ms END) AS i_ms " & _
               "FROM @StatusDiag d LEFT JOIN @Status s ON s.status_alias=d.status_alias;"
 
     On Error Resume Next
@@ -447,8 +471,9 @@ Private Function ExecuteStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByV
 
                     diagRows("a") = 0: diagRows("h") = 0: diagRows("r") = 0: diagRows("w") = 0: diagRows("i") = 0
                     diagNumeric("a") = 0: diagNumeric("h") = 0: diagNumeric("r") = 0: diagNumeric("w") = 0: diagNumeric("i") = 0
+                    diagElapsedMs("a") = 0: diagElapsedMs("h") = 0: diagElapsedMs("r") = 0: diagElapsedMs("w") = 0: diagElapsedMs("i") = 0
 
-                    If rs.Fields.Count >= 15 Then
+                    If rs.Fields.Count >= 20 Then
                         insertedRowsValue = rs.Fields("a_rows").Value: If IsNumeric(insertedRowsValue) Then diagRows("a") = CLng(insertedRowsValue)
                         insertedRowsValue = rs.Fields("h_rows").Value: If IsNumeric(insertedRowsValue) Then diagRows("h") = CLng(insertedRowsValue)
                         insertedRowsValue = rs.Fields("r_rows").Value: If IsNumeric(insertedRowsValue) Then diagRows("r") = CLng(insertedRowsValue)
@@ -460,6 +485,12 @@ Private Function ExecuteStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByV
                         isNumericValue = rs.Fields("r_num").Value: If IsNumeric(isNumericValue) Then diagNumeric("r") = CLng(isNumericValue)
                         isNumericValue = rs.Fields("w_num").Value: If IsNumeric(isNumericValue) Then diagNumeric("w") = CLng(isNumericValue)
                         isNumericValue = rs.Fields("i_num").Value: If IsNumeric(isNumericValue) Then diagNumeric("i") = CLng(isNumericValue)
+
+                        statusElapsedMs = rs.Fields("a_ms").Value: If IsNumeric(statusElapsedMs) Then diagElapsedMs("a") = CLng(statusElapsedMs)
+                        statusElapsedMs = rs.Fields("h_ms").Value: If IsNumeric(statusElapsedMs) Then diagElapsedMs("h") = CLng(statusElapsedMs)
+                        statusElapsedMs = rs.Fields("r_ms").Value: If IsNumeric(statusElapsedMs) Then diagElapsedMs("r") = CLng(statusElapsedMs)
+                        statusElapsedMs = rs.Fields("w_ms").Value: If IsNumeric(statusElapsedMs) Then diagElapsedMs("w") = CLng(statusElapsedMs)
+                        statusElapsedMs = rs.Fields("i_ms").Value: If IsNumeric(statusElapsedMs) Then diagElapsedMs("i") = CLng(statusElapsedMs)
                     End If
                 End If
             End If
@@ -481,11 +512,14 @@ Private Function ExecuteStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByV
         isNumericValue = 0
         insertedFlag = 0
         numericFlag = 0
+        statusElapsedMs = 0
 
         If diagRows.Exists(aliasKey) Then insertedRowsValue = CLng(diagRows(aliasKey))
         If diagNumeric.Exists(aliasKey) Then isNumericValue = CLng(diagNumeric(aliasKey))
+        If diagElapsedMs.Exists(aliasKey) Then statusElapsedMs = CLng(diagElapsedMs(aliasKey))
         If insertedRowsValue > 0 Then insertedFlag = 1
         If isNumericValue <> 0 Then numericFlag = 1
+        If insertedFlag = 1 Then insertedStatusCount = insertedStatusCount + 1
 
         tagFull = BuildCountTagFullName(machineId, statusLabel)
         LogMsg LOG_LEVEL_INFO, "GetStatusFractionsBatch", _
@@ -496,8 +530,10 @@ Private Function ExecuteStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByV
                " tag_full=" & tagFull & _
                " inserted=" & insertedFlag & _
                " inserted_rows=" & insertedRowsValue & _
-               " is_numeric=" & numericFlag
+               " is_numeric=" & numericFlag & _
+               " elapsed_ms=" & statusElapsedMs
     Next
+    If hasNumericCount = 0 And insertedStatusCount = 5 Then allNullNoNumeric = 1
 
     completedAt = Now
     elapsedMsValue = ElapsedMs(startTimer)
@@ -528,21 +564,22 @@ End Function
 Private Function GetStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal periodKey, ByVal t1, ByVal t2)
     Dim aggs, idx, aggExpr
     Dim currentDict, bestDict
-    Dim numericCount, bestNumericCount
+    Dim numericCount, bestNumericCount, insertedStatusCount, allNullNoNumeric
     Dim currentSum, bestSum
-    Dim selectedAgg, aggTrialSummary, currentTrial
+    Dim selectedAgg, aggTrialSummary, currentTrial, fastFailApplied
 
-    aggs = Array("AVG(RealValue)", "AVG(Value)", "AVG(ValueScaled)")
+    aggs = GetAggExprList(runtimeCatalog)
     bestNumericCount = -1
     bestSum = -1
     selectedAgg = ""
     aggTrialSummary = ""
+    fastFailApplied = 0
 
     For idx = 0 To UBound(aggs)
         aggExpr = CStr(aggs(idx))
-        Set currentDict = ExecuteStatusFractionsBatch(cn, runtimeCatalog, machineId, periodKey, t1, t2, aggExpr, numericCount)
+        Set currentDict = ExecuteStatusFractionsBatch(cn, runtimeCatalog, machineId, periodKey, t1, t2, aggExpr, numericCount, insertedStatusCount, allNullNoNumeric)
         currentSum = SumStatusFractions(currentDict)
-        currentTrial = aggExpr & "{numeric=" & numericCount & ",sum=" & currentSum & "}"
+        currentTrial = aggExpr & "{numeric=" & numericCount & ",inserted=" & insertedStatusCount & ",sum=" & currentSum & "}"
         If Len(aggTrialSummary) > 0 Then
             aggTrialSummary = aggTrialSummary & "; "
         End If
@@ -561,6 +598,17 @@ Private Function GetStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal m
             selectedAgg = aggExpr
         End If
 
+        If idx = 0 And allNullNoNumeric = 1 Then
+            fastFailApplied = 1
+            LogMsg LOG_LEVEL_WARN, "GetStatusFractionsBatch", _
+                   "fast_fail_unsupported_first_agg machine=" & machineId & _
+                   " window=" & periodKey & _
+                   " catalog=" & runtimeCatalog & _
+                   " agg=" & aggExpr & _
+                   " reason=all_null_no_numeric"
+            Exit For
+        End If
+
         If numericCount = 5 And currentSum > 0 Then Exit For
     Next
 
@@ -570,7 +618,8 @@ Private Function GetStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal m
            " catalog=" & runtimeCatalog & _
            " sql_from=" & TS3(t1) & _
            " sql_to=" & TS3(t2) & _
-           " trials=[" & aggTrialSummary & "]"
+           " trials=[" & aggTrialSummary & "]" & _
+           " fast_fail=" & fastFailApplied
 
     If bestNumericCount = 0 Then
         LogMsg LOG_LEVEL_WARN, "GetStatusFractionsBatch", _
@@ -748,6 +797,14 @@ Private Function ShouldRun(ByVal lastRun, ByVal throttleMin)
     ShouldRun = (DateDiff("n", lastRun, Now()) >= throttleMin)
 End Function
 
+Private Function RunWindowWithGuard(ByVal cn, ByVal rtCat, ByVal machineId, ByVal periodKey, ByVal tFrom, ByVal tTo, ByRef windowElapsedMs)
+    Dim windowTimer
+    windowTimer = Timer
+    AggregatePeriod cn, rtCat, machineId, periodKey, tFrom, tTo
+    windowElapsedMs = ElapsedMs(windowTimer)
+    RunWindowWithGuard = (windowElapsedMs > WINDOW_EXEC_WARN_THRESHOLD_MS)
+End Function
+
 ' ─────────────────────────────────────────────────────────────────────
 ' Main Entry Point
 ' ─────────────────────────────────────────────────────────────────────
@@ -758,6 +815,7 @@ Public Sub MainStatusAggregation(ByVal machineId)
     Dim due1D, due7D, due30D
     Dim startedAt, completedAt, startTimer, totalElapsedMs
     Dim guardReason, lockAcquired, canRun
+    Dim skipLowerPriority, windowElapsedMs
 
     ' WinCC VBScript does not support label-based handlers (On Error GoTo FAIL).
     On Error Resume Next
@@ -767,6 +825,7 @@ Public Sub MainStatusAggregation(ByVal machineId)
     guardReason = "completed"
     lockAcquired = False
     canRun = True
+    skipLowerPriority = False
     Set cn = Nothing
 
     InitGlobals
@@ -840,24 +899,51 @@ Public Sub MainStatusAggregation(ByVal machineId)
                " runtime_catalog=" & rtCat
     End If
 
-    ' Execute at most one period per invocation, with fixed priority:
+    ' Execute due periods by priority:
     ' 1D -> 7D -> 30D
+    ' If any period exceeds threshold, skip lower-priority windows for responsiveness.
     If canRun Then
         If due1D Then
             tTo = nowDT: tFrom = DateAdd("d", -1, tTo)
-            AggregatePeriod cn, rtCat, machineId, "1D", tFrom, tTo
+            skipLowerPriority = RunWindowWithGuard(cn, rtCat, machineId, "1D", tFrom, tTo, windowElapsedMs)
+            If skipLowerPriority Then
+                LogMsg LOG_LEVEL_WARN, "MainStatusAggregation", _
+                       "window_slow machine=" & machineId & _
+                       " period=1D elapsed_ms=" & windowElapsedMs & _
+                       " threshold_ms=" & WINDOW_EXEC_WARN_THRESHOLD_MS
+            End If
             g_lastRunByMachinePeriod(machineId & "|1D") = nowDT
             guardReason = "ran_1D"
-        ElseIf due7D Then
+        End If
+
+        If due7D And (Not skipLowerPriority) Then
             tTo = nowDT: tFrom = DateAdd("d", -7, tTo)
-            AggregatePeriod cn, rtCat, machineId, "7D", tFrom, tTo
+            skipLowerPriority = RunWindowWithGuard(cn, rtCat, machineId, "7D", tFrom, tTo, windowElapsedMs)
+            If skipLowerPriority Then
+                LogMsg LOG_LEVEL_WARN, "MainStatusAggregation", _
+                       "window_slow machine=" & machineId & _
+                       " period=7D elapsed_ms=" & windowElapsedMs & _
+                       " threshold_ms=" & WINDOW_EXEC_WARN_THRESHOLD_MS
+            End If
             g_lastRunByMachinePeriod(machineId & "|7D") = nowDT
             guardReason = "ran_7D"
-        ElseIf due30D Then
+        End If
+
+        If due30D And (Not skipLowerPriority) Then
             tTo = nowDT: tFrom = DateAdd("d", -30, tTo)
-            AggregatePeriod cn, rtCat, machineId, "30D", tFrom, tTo
+            skipLowerPriority = RunWindowWithGuard(cn, rtCat, machineId, "30D", tFrom, tTo, windowElapsedMs)
+            If skipLowerPriority Then
+                LogMsg LOG_LEVEL_WARN, "MainStatusAggregation", _
+                       "window_slow machine=" & machineId & _
+                       " period=30D elapsed_ms=" & windowElapsedMs & _
+                       " threshold_ms=" & WINDOW_EXEC_WARN_THRESHOLD_MS
+            End If
             g_lastRunByMachinePeriod(machineId & "|30D") = nowDT
             guardReason = "ran_30D"
+        End If
+
+        If skipLowerPriority Then
+            guardReason = "warn_slow_window_skip_lower_priority"
         End If
     End If
 

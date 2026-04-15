@@ -665,7 +665,8 @@ Public Sub MainStatusAggregation(ByVal machineId)
     Dim startedAt, completedAt, startTimer, totalElapsedMs
     Dim guardReason, lockAcquired, canRun
 
-    On Error GoTo FAIL
+    ' WinCC VBScript does not support label-based handlers (On Error GoTo FAIL).
+    On Error Resume Next
 
     startedAt = Now
     startTimer = Timer
@@ -767,9 +768,17 @@ Public Sub MainStatusAggregation(ByVal machineId)
     End If
 
 CLEANUP:
-    On Error Resume Next
     If IsObject(cn) Then CloseConn cn
     If lockAcquired Then ReleaseMachineLock machineId
+
+    If Err.Number <> 0 Then
+        guardReason = "fail_runtime_error"
+        LogMsg LOG_LEVEL_ERROR, "MainStatusAggregation", _
+               "Runtime error number=" & CStr(Err.Number) & _
+               " description=" & S(Err.Description)
+        Err.Clear
+    End If
+
     On Error GoTo 0
 
     completedAt = Now
@@ -781,13 +790,6 @@ CLEANUP:
            " elapsed_ms=" & totalElapsedMs & _
            " reason=" & guardReason
     Exit Sub
-
-FAIL:
-    guardReason = "fail_runtime_error"
-    LogMsg LOG_LEVEL_ERROR, "MainStatusAggregation", _
-           "Runtime error number=" & CStr(Err.Number) & _
-           " description=" & S(Err.Description)
-    Resume CLEANUP
 End Sub
 
 Private Function TryAcquireMachineLock(ByVal machineId)

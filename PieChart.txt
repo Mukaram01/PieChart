@@ -162,8 +162,6 @@ Private Sub CloseConn(ByVal cn)
         If Not (cn Is Nothing) Then
             If cn.State = adStateOpen Then cn.Close
         End If
-    Else
-        LogMsg LOG_LEVEL_DEBUG, "CloseConn", "Skip close: non-object connection handle"
     End If
     Set cn = Nothing
     On Error GoTo 0
@@ -641,6 +639,7 @@ Public Sub MainStatusAggregation(ByVal machineId)
     guardReason = "completed"
     lockAcquired = False
     canRun = True
+    Set cn = Nothing
 
     InitGlobals
 
@@ -706,6 +705,12 @@ Public Sub MainStatusAggregation(ByVal machineId)
     End If
 
     If canRun Then rtCat = GetRuntimeCatalog()
+    If canRun Then
+        LogMsg LOG_LEVEL_INFO, "MainStatusAggregation", _
+               "aggregation_start machine=" & machineId & _
+               " cn_state=" & CStr(cn.State) & _
+               " runtime_catalog=" & rtCat
+    End If
 
     ' Execute at most one period per invocation, with fixed priority:
     ' 1D -> 7D -> 30D
@@ -730,7 +735,7 @@ Public Sub MainStatusAggregation(ByVal machineId)
 
 CLEANUP:
     On Error Resume Next
-    CloseConn cn
+    If IsObject(cn) Then CloseConn cn
     If lockAcquired Then ReleaseMachineLock machineId
     On Error GoTo 0
 

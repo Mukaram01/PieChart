@@ -566,8 +566,14 @@ Private Function OutTagName(ByVal machineId, ByVal periodKey, ByVal statusDispNa
     End If
 End Function
 
+Private Function IsPieChartOutputTag(ByVal tag)
+    IsPieChartOutputTag = (InStr(1, S(tag), "_Percentage_PieChart", vbTextCompare) > 0)
+End Function
+
 Private Sub WriteTag(ByVal tag, ByVal val)
-    Dim readBack, requestedVal, delta
+    Dim readBack, requestedVal, delta, isPieChartTag
+
+    isPieChartTag = IsPieChartOutputTag(tag)
 
     On Error Resume Next
     HMIRuntime.Tags(tag).Write val
@@ -578,9 +584,11 @@ Private Sub WriteTag(ByVal tag, ByVal val)
         Exit Sub
     End If
 
-    LogMsg LOG_LEVEL_DEBUG, "HMITag", "write_ok tag=" & S(tag) & " value=" & S(val)
+    If CURRENT_LOG_LEVEL >= LOG_LEVEL_DEBUG And isPieChartTag Then
+        LogMsg LOG_LEVEL_DEBUG, "HMITag", "write_ok tag=" & S(tag) & " value=" & S(val)
+    End If
 
-    If CURRENT_LOG_LEVEL >= LOG_LEVEL_DEBUG Then
+    If CURRENT_LOG_LEVEL >= LOG_LEVEL_DEBUG And isPieChartTag Then
         readBack = HMIRuntime.Tags(tag).Read
         If Err.Number <> 0 Then
             LogMsg LOG_LEVEL_WARN, "HMITag", "Read-back failed: " & S(tag) & " -> " & S(Err.Description)

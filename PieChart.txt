@@ -47,6 +47,7 @@ Const LOG_LEVEL_DEBUG        = 4
 
 ' IMPORTANT: must be literal in WinCC VBScript
 Const CURRENT_LOG_LEVEL      = 4   ' DEBUG
+Const WRITE_VERIFY_TOLERANCE = 0.01
 
 ' ─────────────────────────────────────────────────────────────────────
 ' Runtime state
@@ -566,11 +567,33 @@ Private Function OutTagName(ByVal machineId, ByVal periodKey, ByVal statusDispNa
 End Function
 
 Private Sub WriteTag(ByVal tag, ByVal val)
+    Dim readBack, requestedVal, delta
+
     On Error Resume Next
     HMIRuntime.Tags(tag).Write val
     If Err.Number <> 0 Then
         LogMsg LOG_LEVEL_WARN, "HMITag", "Write failed: " & S(tag) & " -> " & S(Err.Description)
         Err.Clear
+        On Error GoTo 0
+        Exit Sub
+    End If
+
+    LogMsg LOG_LEVEL_DEBUG, "HMITag", "write_ok tag=" & S(tag) & " value=" & S(val)
+
+    If CURRENT_LOG_LEVEL >= LOG_LEVEL_DEBUG Then
+        readBack = HMIRuntime.Tags(tag).Read
+        If Err.Number <> 0 Then
+            LogMsg LOG_LEVEL_WARN, "HMITag", "Read-back failed: " & S(tag) & " -> " & S(Err.Description)
+            Err.Clear
+        ElseIf IsNumeric(readBack) And IsNumeric(val) Then
+            requestedVal = CDbl(val)
+            delta = Abs(CDbl(readBack) - requestedVal)
+            If delta > WRITE_VERIFY_TOLERANCE Then
+                LogMsg LOG_LEVEL_WARN, "HMITag", "write_mismatch tag=" & S(tag) & " wrote=" & requestedVal & " read=" & CDbl(readBack) & " delta=" & delta
+            End If
+        Else
+            LogMsg LOG_LEVEL_DEBUG, "HMITag", "write_verify_non_numeric tag=" & S(tag) & " wrote=" & S(val) & " read=" & S(readBack)
+        End If
     End If
     On Error GoTo 0
 End Sub
@@ -582,6 +605,7 @@ Private Sub AggregatePeriod(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByV
     Dim fRun, fHalt, fAbort
     Dim pctRun, pctHalt, pctAbort
     Dim tagPct, tagPie, pieVal
+    Dim totalPct
 
     LogMsg LOG_LEVEL_INFO, "Aggregate", machineId & " " & periodKey & "  " & TS3(startDt) & " -> " & TS3(endDt)
 
@@ -590,6 +614,15 @@ Private Sub AggregatePeriod(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByV
     pctRun   = Round(CDbl(fRun)   * 100, 2)
     pctHalt  = Round(CDbl(fHalt)  * 100, 2)
     pctAbort = Round(CDbl(fAbort) * 100, 2)
+    totalPct = Round(pctRun + pctHalt + pctAbort, 2)
+
+    LogMsg LOG_LEVEL_INFO, "Aggregate", _
+           "computed machine=" & machineId & _
+           " period=" & periodKey & _
+           " pctRun=" & pctRun & _
+           " pctHalt=" & pctHalt & _
+           " pctAbort=" & pctAbort & _
+           " totalPct=" & totalPct
 
     ' main % (can be 0)
     tagPct = OutTagName(machineId, periodKey, "Running", False): WriteTag tagPct, pctRun
@@ -600,8 +633,6 @@ Private Sub AggregatePeriod(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByV
     ' Only apply the minimum-1 floor when there is actual activity; if the
     ' machine was completely idle all three raw percentages are 0 and forcing
     ' each to 1 would create a false 33/33/33 split on the chart.
-    Dim totalPct
-    totalPct = pctRun + pctHalt + pctAbort
 
     pieVal = pctRun:   If pieVal < 1 And totalPct > 0 Then pieVal = 1
     tagPie = OutTagName(machineId, periodKey, "Running", True): WriteTag tagPie, pieVal
@@ -611,6 +642,8 @@ Private Sub AggregatePeriod(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByV
 
     pieVal = pctAbort: If pieVal < 1 And totalPct > 0 Then pieVal = 1
     tagPie = OutTagName(machineId, periodKey, "Aborted", True): WriteTag tagPie, pieVal
+
+    LogMsg LOG_LEVEL_INFO, "Aggregate", "writes_completed machine=" & machineId & " period=" & periodKey
 End Sub
 
 Private Function ShouldRun(ByVal lastRun, ByVal throttleMin)

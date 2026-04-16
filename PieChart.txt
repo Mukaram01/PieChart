@@ -571,14 +571,16 @@ Private Function GetStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal m
     Dim currentDict, bestDict
     Dim numericCount, bestNumericCount, insertedStatusCount, allNullNoNumeric
     Dim currentSum, bestSum
-    Dim selectedAgg, aggTrialSummary, currentTrial, fastFailApplied
+    Dim selectedAgg, selectedIdx, aggTrialSummary, currentTrial, fastFailApplied, fallbackUsed
 
     aggs = GetAggExprList(runtimeCatalog)
     bestNumericCount = -1
     bestSum = -1
     selectedAgg = ""
+    selectedIdx = -1
     aggTrialSummary = ""
     fastFailApplied = 0
+    fallbackUsed = 0
 
     For idx = 0 To UBound(aggs)
         aggExpr = CStr(aggs(idx))
@@ -595,12 +597,14 @@ Private Function GetStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal m
             bestNumericCount = numericCount
             bestSum = currentSum
             selectedAgg = aggExpr
+            selectedIdx = idx
         ElseIf (numericCount > bestNumericCount) Or _
                (numericCount = bestNumericCount And currentSum > bestSum And bestSum <= 0) Then
             Set bestDict = CopyStatusFractions(currentDict)
             bestNumericCount = numericCount
             bestSum = currentSum
             selectedAgg = aggExpr
+            selectedIdx = idx
         End If
 
         If idx = 0 And allNullNoNumeric = 1 Then
@@ -610,12 +614,13 @@ Private Function GetStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal m
                    " window=" & periodKey & _
                    " catalog=" & runtimeCatalog & _
                    " agg=" & aggExpr & _
-                   " reason=all_null_no_numeric"
-            Exit For
+                   " reason=all_null_no_numeric; continuing_fallback_scan=1"
         End If
 
         If numericCount = 5 And currentSum > 0 Then Exit For
     Next
+
+    If selectedIdx > 0 Then fallbackUsed = 1
 
     LogMsg LOG_LEVEL_INFO, "GetStatusFractionsBatch", _
            "agg_trials machine=" & machineId & _
@@ -640,6 +645,8 @@ Private Function GetStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal m
            " window=" & periodKey & _
            " catalog=" & runtimeCatalog & _
            " agg=" & selectedAgg & _
+           " idx=" & selectedIdx & _
+           " fallback_used=" & fallbackUsed & _
            " numeric=" & bestNumericCount & _
            " sum=" & bestSum
 

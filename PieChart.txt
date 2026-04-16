@@ -53,7 +53,7 @@ Const LOG_LEVEL_INFO         = 3
 Const LOG_LEVEL_DEBUG        = 4
 
 ' IMPORTANT: must be literal in WinCC VBScript
-Const CURRENT_LOG_LEVEL      = 3   ' INFO (suppress per-tag debug noise)
+Const CURRENT_LOG_LEVEL      = 4   ' TEMP for incident diagnosis (revert to 3 after fix confirmation)
 Const WRITE_VERIFY_TOLERANCE = 0.01
 
 ' ─────────────────────────────────────────────────────────────────────
@@ -571,7 +571,7 @@ Private Function GetStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal m
     Dim currentDict, bestDict
     Dim numericCount, bestNumericCount, insertedStatusCount, allNullNoNumeric
     Dim currentSum, bestSum
-    Dim selectedAgg, selectedIdx, aggTrialSummary, currentTrial, fastFailApplied, fallbackUsed
+    Dim selectedAgg, selectedIdx, aggTrialSummary, currentTrial, fastFailApplied, fallbackUsed, zeroInsertedWarnLogged
 
     aggs = GetAggExprList(runtimeCatalog)
     bestNumericCount = -1
@@ -581,6 +581,7 @@ Private Function GetStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal m
     aggTrialSummary = ""
     fastFailApplied = 0
     fallbackUsed = 0
+    zeroInsertedWarnLogged = 0
 
     For idx = 0 To UBound(aggs)
         aggExpr = CStr(aggs(idx))
@@ -591,6 +592,20 @@ Private Function GetStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal m
             aggTrialSummary = aggTrialSummary & "; "
         End If
         aggTrialSummary = aggTrialSummary & currentTrial
+
+        If zeroInsertedWarnLogged = 0 Then
+            If insertedStatusCount > 0 And currentSum = 0 Then
+                LogMsg LOG_LEVEL_WARN, "GetStatusFractionsBatch", _
+                       "zero_sum_with_inserted_rows machine=" & machineId & _
+                       " window=" & periodKey & _
+                       " catalog=" & runtimeCatalog & _
+                       " agg=" & aggExpr & _
+                       " inserted_statuses=" & insertedStatusCount & _
+                       " numeric=" & numericCount & _
+                       " sum=" & currentSum
+                zeroInsertedWarnLogged = 1
+            End If
+        End If
 
         If (bestDict Is Nothing) Then
             Set bestDict = CopyStatusFractions(currentDict)

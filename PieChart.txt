@@ -845,16 +845,16 @@ End Function
 ' ─────────────────────────────────────────────────────────────────────
 ' Combine 5 → 3 (your rule), normalize if overlap makes sum > 1
 ' ─────────────────────────────────────────────────────────────────────
-Private Sub GetCombinedFractions(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal periodKey, ByVal t1, ByVal t2, ByRef fRun, ByRef fHalt, ByRef fAbort, ByRef outputOk)
+Private Sub GetCombinedFractions(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal periodKey, ByVal t1, ByVal t2, ByRef fRun, ByRef fHalt, ByRef fAbort, ByRef inputValid)
     Dim a, h, r, w, i, total, statusFractions
 
     ' Initialise outputs so callers always receive well-defined values
     fRun = 0 : fHalt = 0 : fAbort = 0
-    outputOk = False
+    inputValid = False
 
     Set statusFractions = GetStatusFractionsBatch(cn, runtimeCatalog, machineId, periodKey, t1, t2)
     If statusFractions Is Nothing Then Exit Sub
-    outputOk = True
+    inputValid = True
 
     a = GetCountFraction(statusFractions, "Aborted")
     h = GetCountFraction(statusFractions, "Halted")
@@ -939,55 +939,81 @@ Private Sub AggregatePeriod(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByV
     Dim pctRun, pctHalt, pctAbort
     Dim tagPct, tagPie, pieVal
     Dim totalPct
-    Dim outputOk
+    Dim inputValid
+    Dim usedFallbackPie
 
     LogMsg LOG_LEVEL_INFO, "Aggregate", machineId & " " & periodKey & "  " & TS3(startDt) & " -> " & TS3(endDt)
 
-    Call GetCombinedFractions(cn, runtimeCatalog, machineId, periodKey, startDt, endDt, fRun, fHalt, fAbort, outputOk)
-    If Not outputOk Then
+    usedFallbackPie = False
+
+    Call GetCombinedFractions(cn, runtimeCatalog, machineId, periodKey, startDt, endDt, fRun, fHalt, fAbort, inputValid)
+    If Not inputValid Then
         LogMsg LOG_LEVEL_WARN, "Aggregate", _
                "aggregate_input_invalid machineId=" & machineId & _
                " periodKey=" & periodKey & _
                " runtimeCatalog=" & runtimeCatalog & _
                " aggExpr=none_selected"
-        LogMsg LOG_LEVEL_WARN, "Aggregate", _
-               "output_suppressed_due_query_failure machine=" & machineId & _
-               " period=" & periodKey & _
-               " runtimeCatalog=" & runtimeCatalog
-        Exit Sub
-    End If
 
-    pctRun   = Round(CDbl(fRun)   * 100, 2)
-    pctHalt  = Round(CDbl(fHalt)  * 100, 2)
-    pctAbort = Round(CDbl(fAbort) * 100, 2)
-    totalPct = Round(pctRun + pctHalt + pctAbort, 2)
+        ' Invalid/no-data path: keep main percentage tags at 0 but force a
+        ' deterministic pie split so UI can distinguish this from true idle.
+        pctRun = 0: pctHalt = 0: pctAbort = 0
+        totalPct = 0
+        usedFallbackPie = True
+    Else
+        pctRun   = Round(CDbl(fRun)   * 100, 2)
+        pctHalt  = Round(CDbl(fHalt)  * 100, 2)
+        pctAbort = Round(CDbl(fAbort) * 100, 2)
+        totalPct = Round(pctRun + pctHalt + pctAbort, 2)
+    End If
 
     LogMsg LOG_LEVEL_INFO, "Aggregate", _
            "computed machine=" & machineId & _
            " period=" & periodKey & _
+           " input_valid=" & CStr(inputValid) & _
            " pctRun=" & pctRun & _
            " pctHalt=" & pctHalt & _
            " pctAbort=" & pctAbort & _
-           " totalPct=" & totalPct
+           " totalPct=" & totalPct & _
+           " fallback_render_path=" & CStr(usedFallbackPie)
 
     ' main % (can be 0)
     tagPct = OutTagName(machineId, periodKey, "Running", False): WriteTag tagPct, pctRun
     tagPct = OutTagName(machineId, periodKey, "Halted",  False): WriteTag tagPct, pctHalt
     tagPct = OutTagName(machineId, periodKey, "Aborted", False): WriteTag tagPct, pctAbort
 
-    ' pie chart (min 1 for display, DOES NOT affect main %)
-    ' Only apply the minimum-1 floor when there is actual activity; if the
-    ' machine was completely idle all three raw percentages are 0 and forcing
-    ' each to 1 would create a false 33/33/33 split on the chart.
+    ' pie chart output strategy:
+    ' 1) invalid/no-data input -> deterministic fallback split for rendering.
+    ' 2) valid input -> preserve current true-idle behavior: all pie outputs
+    '    remain 0 when totalPct=0 (operationally required for idle windows).
+    If usedFallbackPie Then
+        tagPie = OutTagName(machineId, periodKey, "Running", True): WriteTag tagPie, 34
+        tagPie = OutTagName(machineId, periodKey, "Halted",  True): WriteTag tagPie, 33
+        tagPie = OutTagName(machineId, periodKey, "Aborted", True): WriteTag tagPie, 33
+        LogMsg LOG_LEVEL_WARN, "Aggregate", _
+               "pie_fallback_applied machine=" & machineId & _
+               " period=" & periodKey & _
+               " input_valid=" & CStr(inputValid) & _
+               " totalPct=" & totalPct & _
+               " fallback_render_path=True"
+    Else
+        pieVal = pctRun:   If pieVal < 1 And totalPct > 0 Then pieVal = 1
+        tagPie = OutTagName(machineId, periodKey, "Running", True): WriteTag tagPie, pieVal
 
-    pieVal = pctRun:   If pieVal < 1 And totalPct > 0 Then pieVal = 1
-    tagPie = OutTagName(machineId, periodKey, "Running", True): WriteTag tagPie, pieVal
+        pieVal = pctHalt:  If pieVal < 1 And totalPct > 0 Then pieVal = 1
+        tagPie = OutTagName(machineId, periodKey, "Halted", True): WriteTag tagPie, pieVal
 
-    pieVal = pctHalt:  If pieVal < 1 And totalPct > 0 Then pieVal = 1
-    tagPie = OutTagName(machineId, periodKey, "Halted", True): WriteTag tagPie, pieVal
+        pieVal = pctAbort: If pieVal < 1 And totalPct > 0 Then pieVal = 1
+        tagPie = OutTagName(machineId, periodKey, "Aborted", True): WriteTag tagPie, pieVal
 
-    pieVal = pctAbort: If pieVal < 1 And totalPct > 0 Then pieVal = 1
-    tagPie = OutTagName(machineId, periodKey, "Aborted", True): WriteTag tagPie, pieVal
+        If totalPct = 0 Then
+            LogMsg LOG_LEVEL_INFO, "Aggregate", _
+                   "pie_idle_window_preserved machine=" & machineId & _
+                   " period=" & periodKey & _
+                   " input_valid=" & CStr(inputValid) & _
+                   " totalPct=" & totalPct & _
+                   " fallback_render_path=False"
+        End If
+    End If
 
     LogMsg LOG_LEVEL_INFO, "Aggregate", "writes_completed machine=" & machineId & " period=" & periodKey
 End Sub

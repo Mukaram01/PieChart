@@ -1366,45 +1366,65 @@ Public Sub MainStatusAggregation(ByVal machineId)
     If canRun Then
         If due1D Then
             tTo = nowDT: tFrom = DateAdd("d", -1, tTo)
+            Err.Clear
             skipLowerPriority = RunWindowWithGuard(cn, rtCat, machineId, "1D", tFrom, tTo, windowElapsedMs)
-            If skipLowerPriority Then
-                LogMsg LOG_LEVEL_WARN, "MainStatusAggregation", _
-                       "window_slow machine=" & machineId & _
-                       " period=1D elapsed_ms=" & windowElapsedMs & _
-                       " threshold_ms=" & WINDOW_EXEC_WARN_THRESHOLD_MS
+            If Err.Number <> 0 Then
+                LogMsg LOG_LEVEL_ERROR, "MainStatusAggregation", _
+                       "window_error machine=" & machineId & _
+                       " period=1D err=" & S(Err.Description)
+                Err.Clear
+            Else
+                If skipLowerPriority Then
+                    LogMsg LOG_LEVEL_WARN, "MainStatusAggregation", _
+                           "window_slow machine=" & machineId & _
+                           " period=1D elapsed_ms=" & windowElapsedMs & _
+                           " threshold_ms=" & WINDOW_EXEC_WARN_THRESHOLD_MS
+                End If
+                g_lastRunByMachinePeriod(machineId & "|1D") = nowDT
+                guardReason = "ran_1D"
             End If
-            g_lastRunByMachinePeriod(machineId & "|1D") = nowDT
-            guardReason = "ran_1D"
         End If
 
         If due7D And (Not skipLowerPriority) Then
             tTo = nowDT: tFrom = DateAdd("d", -7, tTo)
+            Err.Clear
             skipLowerPriority = RunWindowWithGuard(cn, rtCat, machineId, "7D", tFrom, tTo, windowElapsedMs)
-            If skipLowerPriority Then
-                LogMsg LOG_LEVEL_WARN, "MainStatusAggregation", _
-                       "window_slow machine=" & machineId & _
-                       " period=7D elapsed_ms=" & windowElapsedMs & _
-                       " threshold_ms=" & WINDOW_EXEC_WARN_THRESHOLD_MS
+            If Err.Number <> 0 Then
+                LogMsg LOG_LEVEL_ERROR, "MainStatusAggregation", _
+                       "window_error machine=" & machineId & _
+                       " period=7D err=" & S(Err.Description)
+                Err.Clear
+            Else
+                If skipLowerPriority Then
+                    LogMsg LOG_LEVEL_WARN, "MainStatusAggregation", _
+                           "window_slow machine=" & machineId & _
+                           " period=7D elapsed_ms=" & windowElapsedMs & _
+                           " threshold_ms=" & WINDOW_EXEC_WARN_THRESHOLD_MS
+                End If
+                g_lastRunByMachinePeriod(machineId & "|7D") = nowDT
+                guardReason = "ran_7D"
             End If
-            g_lastRunByMachinePeriod(machineId & "|7D") = nowDT
-            guardReason = "ran_7D"
         End If
 
         If due30D And (Not skipLowerPriority) Then
             tTo = nowDT: tFrom = DateAdd("d", -30, tTo)
+            Err.Clear
             skipLowerPriority = RunWindowWithGuard(cn, rtCat, machineId, "30D", tFrom, tTo, windowElapsedMs)
-            If skipLowerPriority Then
-                LogMsg LOG_LEVEL_WARN, "MainStatusAggregation", _
-                       "window_slow machine=" & machineId & _
-                       " period=30D elapsed_ms=" & windowElapsedMs & _
-                       " threshold_ms=" & WINDOW_EXEC_WARN_THRESHOLD_MS
+            If Err.Number <> 0 Then
+                LogMsg LOG_LEVEL_ERROR, "MainStatusAggregation", _
+                       "window_error machine=" & machineId & _
+                       " period=30D err=" & S(Err.Description)
+                Err.Clear
+            Else
+                If skipLowerPriority Then
+                    LogMsg LOG_LEVEL_WARN, "MainStatusAggregation", _
+                           "window_slow machine=" & machineId & _
+                           " period=30D elapsed_ms=" & windowElapsedMs & _
+                           " threshold_ms=" & WINDOW_EXEC_WARN_THRESHOLD_MS
+                End If
+                g_lastRunByMachinePeriod(machineId & "|30D") = nowDT
+                guardReason = "ran_30D"
             End If
-            g_lastRunByMachinePeriod(machineId & "|30D") = nowDT
-            guardReason = "ran_30D"
-        End If
-
-        If skipLowerPriority Then
-            guardReason = "warn_slow_window_skip_lower_priority"
         End If
     End If
 

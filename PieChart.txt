@@ -41,6 +41,12 @@ Const THROTTLE_1D_MINUTES    = 30    ' every 30 minutes
 Const THROTTLE_7D_MINUTES    = 360   ' every 6 hours
 Const THROTTLE_30D_MINUTES   = 1440  ' every 24 hours
 
+' Source tag full-name pattern pieces (configurable)
+Const COUNT_TAG_PREFIX_JOINER          = "\"
+Const COUNT_TAG_CORE_TEMPLATE          = "{MACHINE_ID}_ProgramStatus_{STATUS_NAME}"
+Const COUNT_TAG_SUFFIX                 = "_Count"
+Const STARTUP_VALIDATE_LOOKBACK_MINUTES = 15
+
 Const adCmdText              = 1
 Const adStateOpen            = 1
 
@@ -61,6 +67,8 @@ Const WRITE_VERIFY_TOLERANCE = 0.01
 ' ─────────────────────────────────────────────────────────────────────
 Dim g_lastRunByMachinePeriod
 Dim g_machineLocks
+Dim g_machineValidationOk
+Dim g_machineValidationDone
 Dim G_MACHINES
 Dim g_inited
 
@@ -86,6 +94,8 @@ Private Sub InitGlobals()
 
     Set g_lastRunByMachinePeriod = CreateObject("Scripting.Dictionary")
     Set g_machineLocks = CreateObject("Scripting.Dictionary")
+    Set g_machineValidationOk = CreateObject("Scripting.Dictionary")
+    Set g_machineValidationDone = CreateObject("Scripting.Dictionary")
 
     Set G_MACHINES = CreateObject("Scripting.Dictionary")
     ' MachineId → Tag-logging prefix (left of backslash)
@@ -351,8 +361,116 @@ End Function
 Private Function BuildCountTagFullName(ByVal machineId, ByVal statusName)
     Dim basePrefix, baseCore
     basePrefix = G_MACHINES(machineId)
-    baseCore   = machineId & "_ProgramStatus_" & statusName
-    BuildCountTagFullName = basePrefix & "\" & baseCore & "_Count"
+    baseCore = COUNT_TAG_CORE_TEMPLATE
+    baseCore = Replace(baseCore, "{MACHINE_ID}", machineId)
+    baseCore = Replace(baseCore, "{STATUS_NAME}", statusName)
+    BuildCountTagFullName = basePrefix & COUNT_TAG_PREFIX_JOINER & baseCore & COUNT_TAG_SUFFIX
+End Function
+
+Private Function ProbeCountTagArchive(ByVal cn, ByVal runtimeCatalog, ByVal tagFullName, ByVal tFrom, ByVal tTo, ByVal aggExpr, ByRef insertedRows, ByRef hasNumeric, ByRef elapsedMsValue, ByRef errDesc)
+    Dim cmd, rs, sqlText, cpCall, startTimer, tmp
+
+    insertedRows = 0
+    hasNumeric = 0
+    elapsedMsValue = 0
+    errDesc = ""
+    ProbeCountTagArchive = False
+
+    cpCall = BuildCpTagStatisticExLiteral(runtimeCatalog, tagFullName, tFrom, tTo, aggExpr)
+    sqlText = "DECLARE @Probe TABLE (frac SQL_VARIANT);" & vbCrLf & _
+              "INSERT INTO @Probe (frac) EXEC " & cpCall & ";" & vbCrLf & _
+              "SELECT COUNT(1) AS inserted_rows, " & _
+              "MAX(CASE WHEN TRY_CONVERT(FLOAT, frac) IS NOT NULL THEN 1 ELSE 0 END) AS has_numeric " & _
+              "FROM @Probe;"
+
+    startTimer = Timer
+
+    On Error Resume Next
+    Set cmd = CreateObject("ADODB.Command")
+    Set cmd.ActiveConnection = cn
+    cmd.CommandTimeout = SQL_TIMEOUT_SECONDS
+    cmd.CommandType = adCmdText
+    cmd.CommandText = sqlText
+
+    Set rs = cmd.Execute
+    elapsedMsValue = ElapsedMs(startTimer)
+    If Err.Number <> 0 Then
+        errDesc = S(Err.Description)
+        Err.Clear
+    ElseIf Not (rs Is Nothing) Then
+        If Not rs.EOF Then
+            tmp = rs.Fields("inserted_rows").Value
+            If IsNumeric(tmp) Then insertedRows = CLng(tmp)
+            tmp = rs.Fields("has_numeric").Value
+            If IsNumeric(tmp) Then hasNumeric = CLng(tmp)
+            ProbeCountTagArchive = True
+        End If
+        rs.Close
+    End If
+    On Error GoTo 0
+
+    Set rs = Nothing
+    Set cmd = Nothing
+End Function
+
+Private Function ValidateMachineCountTags(ByVal cn, ByVal runtimeCatalog, ByVal machineId)
+    Dim statuses, idx, statusName, tagFull, aggExpr, aggs
+    Dim tFrom, tTo, insertedRows, hasNumeric, elapsedMsValue, errDesc
+    Dim probeOk, hasArchiveData, validStatusCount
+
+    If g_machineValidationDone.Exists(machineId) Then
+        ValidateMachineCountTags = CBool(g_machineValidationOk(machineId))
+        Exit Function
+    End If
+
+    statuses = Array("Aborted", "Halted", "Running", "Waiting", "Interrupted")
+    aggs = GetAggExprList(runtimeCatalog)
+    aggExpr = CStr(aggs(0))
+    tTo = Now()
+    tFrom = DateAdd("n", -STARTUP_VALIDATE_LOOKBACK_MINUTES, tTo)
+    validStatusCount = 0
+
+    For idx = 0 To UBound(statuses)
+        statusName = CStr(statuses(idx))
+        tagFull = BuildCountTagFullName(machineId, statusName)
+        probeOk = ProbeCountTagArchive(cn, runtimeCatalog, tagFull, tFrom, tTo, aggExpr, insertedRows, hasNumeric, elapsedMsValue, errDesc)
+        hasArchiveData = (probeOk And insertedRows > 0)
+        If hasArchiveData Then validStatusCount = validStatusCount + 1
+
+        If probeOk Then
+            LogMsg LOG_LEVEL_INFO, "StartupValidate", _
+                   "machine=" & machineId & _
+                   " status=" & statusName & _
+                   " tag_full=" & tagFull & _
+                   " data_exists=" & CStr(hasArchiveData) & _
+                   " inserted_rows=" & insertedRows & _
+                   " has_numeric=" & hasNumeric & _
+                   " lookback_min=" & STARTUP_VALIDATE_LOOKBACK_MINUTES & _
+                   " elapsed_ms=" & elapsedMsValue
+        Else
+            LogMsg LOG_LEVEL_WARN, "StartupValidate", _
+                   "machine=" & machineId & _
+                   " status=" & statusName & _
+                   " tag_full=" & tagFull & _
+                   " data_exists=False" & _
+                   " probe_failed=1" & _
+                   " err=" & errDesc
+        End If
+    Next
+
+    g_machineValidationDone(machineId) = True
+    If validStatusCount > 0 Then
+        g_machineValidationOk(machineId) = True
+        ValidateMachineCountTags = True
+    Else
+        g_machineValidationOk(machineId) = False
+        ValidateMachineCountTags = False
+        LogMsg LOG_LEVEL_WARN, "StartupValidate", _
+               "HIGH_PRIORITY machine=" & machineId & _
+               " message=all_status_validations_failed; output_writes_will_be_skipped_to_prevent_misleading_zeros" & _
+               " lookback_min=" & STARTUP_VALIDATE_LOOKBACK_MINUTES & _
+               " agg=" & aggExpr
+    End If
 End Function
 
 Private Function BuildCpTagStatisticExLiteral(ByVal runtimeCatalog, ByVal tagFullName, ByVal tFrom, ByVal tTo, ByVal aggExpr)
@@ -977,6 +1095,12 @@ Public Sub MainStatusAggregation(ByVal machineId)
     End If
 
     If canRun Then rtCat = GetRuntimeCatalog()
+    If canRun Then
+        If Not ValidateMachineCountTags(cn, rtCat, machineId) Then
+            guardReason = "skip_startup_validation_failed"
+            canRun = False
+        End If
+    End If
     If canRun Then
         LogMsg LOG_LEVEL_INFO, "MainStatusAggregation", _
                "aggregation_start machine=" & machineId & _

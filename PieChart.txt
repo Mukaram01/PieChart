@@ -77,6 +77,8 @@ Dim g_machineValidationOk
 Dim g_machineValidationDone
 Dim g_machineValidationState
 Dim g_machineValidationReason
+Dim g_batchResultCache
+Dim g_statusTagFullNameCache
 Dim G_MACHINES
 Dim g_inited
 
@@ -106,6 +108,8 @@ Private Sub InitGlobals()
     Set g_machineValidationDone = CreateObject("Scripting.Dictionary")
     Set g_machineValidationState = CreateObject("Scripting.Dictionary")
     Set g_machineValidationReason = CreateObject("Scripting.Dictionary")
+    Set g_batchResultCache = CreateObject("Scripting.Dictionary")
+    Set g_statusTagFullNameCache = CreateObject("Scripting.Dictionary")
 
     Set G_MACHINES = CreateObject("Scripting.Dictionary")
     ' MachineId → Tag-logging prefix (left of backslash)
@@ -554,6 +558,29 @@ Private Function BuildCpTagStatisticExLiteral(ByVal runtimeCatalog, ByVal tagFul
                                    "'" & aggExpr & "'"
 End Function
 
+Private Function BuildBatchCacheKey(ByVal runtimeCatalog, ByVal machineId, ByVal periodKey, ByVal t1, ByVal t2, ByVal aggExpr)
+    BuildBatchCacheKey = runtimeCatalog & "|" & machineId & "|" & periodKey & "|" & TS3(t1) & "|" & TS3(t2) & "|" & aggExpr
+End Function
+
+Private Function BuildStatusTagMap(ByVal machineId, ByVal periodKey, ByVal t1, ByVal t2)
+    Dim cacheKey, d
+    cacheKey = machineId & "|" & periodKey & "|" & TS3(t1) & "|" & TS3(t2)
+
+    If g_statusTagFullNameCache.Exists(cacheKey) Then
+        Set BuildStatusTagMap = g_statusTagFullNameCache(cacheKey)
+        Exit Function
+    End If
+
+    Set d = CreateObject("Scripting.Dictionary")
+    d.Add "Aborted", BuildCountTagFullName(machineId, "Aborted")
+    d.Add "Halted", BuildCountTagFullName(machineId, "Halted")
+    d.Add "Running", BuildCountTagFullName(machineId, "Running")
+    d.Add "Waiting", BuildCountTagFullName(machineId, "Waiting")
+    d.Add "Interrupted", BuildCountTagFullName(machineId, "Interrupted")
+    g_statusTagFullNameCache(cacheKey) = d
+    Set BuildStatusTagMap = d
+End Function
+
 Private Function CopyStatusFractions(ByVal srcDict)
     Dim dst
     Set dst = CreateObject("Scripting.Dictionary")
@@ -576,12 +603,49 @@ Private Function GetAggExprList(ByVal runtimeCatalog)
     GetAggExprList = Split(cfg, "|")
 End Function
 
-Private Function ExecuteStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal periodKey, ByVal t1, ByVal t2, ByVal aggExpr, ByRef hasNumericCount, ByRef insertedStatusCount, ByRef allNullNoNumeric, ByRef batchOk)
+Private Function ExecuteStatusFractionsSingleFallback(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal periodKey, ByVal t1, ByVal t2, ByVal tagMap, ByRef numericCount)
+    Dim outDict, statuses, idx, statusName, tagFull, v, infoMsg
+    Set outDict = CreateObject("Scripting.Dictionary")
+    outDict.Add "Aborted", 0
+    outDict.Add "Halted", 0
+    outDict.Add "Running", 0
+    outDict.Add "Waiting", 0
+    outDict.Add "Interrupted", 0
+    numericCount = 0
+
+    statuses = Array("Aborted", "Halted", "Running", "Waiting", "Interrupted")
+    For idx = 0 To UBound(statuses)
+        statusName = CStr(statuses(idx))
+        tagFull = CStr(tagMap(statusName))
+        v = TryAvgFraction(cn, runtimeCatalog, tagFull, t1, t2, machineId, periodKey, statusName)
+        If IsNumeric(v) Then
+            outDict(statusName) = CDbl(v)
+            numericCount = numericCount + 1
+        End If
+    Next
+
+    infoMsg = "single_fallback machine=" & machineId & _
+              " window=" & periodKey & _
+              " catalog=" & runtimeCatalog & _
+              " sql_from=" & TS3(t1) & _
+              " sql_to=" & TS3(t2) & _
+              " numeric=" & numericCount
+    LogMsg LOG_LEVEL_INFO, "GetStatusFractionsBatch", infoMsg
+
+    If numericCount > 0 Then
+        Set ExecuteStatusFractionsSingleFallback = outDict
+    Else
+        Set ExecuteStatusFractionsSingleFallback = Nothing
+    End If
+End Function
+
+Private Function ExecuteStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal periodKey, ByVal t1, ByVal t2, ByVal aggExpr, ByVal tagMap, ByRef hasNumericCount, ByRef insertedStatusCount, ByRef allNullNoNumeric, ByRef batchOk)
     Dim cmd, rs, sqlText, startedAt, completedAt, startTimer, elapsedMsValue, infoMsg
     Dim statuses, aliases, idx, statusName, tagFull, cpCall
     Dim outDict, fieldValue, diagRows, diagNumeric, diagElapsedMs
     Dim aliasKey, statusLabel, insertedRowsValue, isNumericValue, insertedFlag, numericFlag, statusElapsedMs
     Dim valA, valH, valR, valW, valI
+    Dim cacheKey, cacheEntry
 
     startedAt = Now
     startTimer = Timer
@@ -604,12 +668,38 @@ Private Function ExecuteStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByV
     Set diagNumeric = CreateObject("Scripting.Dictionary")
     Set diagElapsedMs = CreateObject("Scripting.Dictionary")
 
+    cacheKey = BuildBatchCacheKey(runtimeCatalog, machineId, periodKey, t1, t2, aggExpr)
+    If g_batchResultCache.Exists(cacheKey) Then
+        Set cacheEntry = g_batchResultCache(cacheKey)
+        hasNumericCount = CLng(cacheEntry("hasNumericCount"))
+        insertedStatusCount = CLng(cacheEntry("insertedStatusCount"))
+        allNullNoNumeric = CLng(cacheEntry("allNullNoNumeric"))
+        batchOk = CLng(cacheEntry("batchOk"))
+        If cacheEntry.Exists("hasOutDict") And CLng(cacheEntry("hasOutDict")) = 1 Then
+            Set outDict = CreateObject("Scripting.Dictionary")
+            outDict.Add "Aborted", CDbl(cacheEntry("Aborted"))
+            outDict.Add "Halted", CDbl(cacheEntry("Halted"))
+            outDict.Add "Running", CDbl(cacheEntry("Running"))
+            outDict.Add "Waiting", CDbl(cacheEntry("Waiting"))
+            outDict.Add "Interrupted", CDbl(cacheEntry("Interrupted"))
+            Set ExecuteStatusFractionsBatch = outDict
+        Else
+            Set ExecuteStatusFractionsBatch = Nothing
+        End If
+        LogMsg LOG_LEVEL_DEBUG, "GetStatusFractionsBatch", _
+               "batch_cache_hit machine=" & machineId & _
+               " window=" & periodKey & _
+               " agg=" & aggExpr & _
+               " batch_ok=" & batchOk
+        Exit Function
+    End If
+
     sqlText = "DECLARE @Status TABLE (status_alias NVARCHAR(1), frac FLOAT);" & vbCrLf
     sqlText = sqlText & "DECLARE @StatusDiag TABLE (status_alias NVARCHAR(1), inserted_rows INT, is_numeric INT, elapsed_ms INT);" & vbCrLf
     sqlText = sqlText & "DECLARE @cpStart DATETIME2(3);" & vbCrLf
     For idx = 0 To UBound(statuses)
         statusName = CStr(statuses(idx))
-        tagFull = BuildCountTagFullName(machineId, statusName)
+        tagFull = CStr(tagMap(statusName))
         cpCall = BuildCpTagStatisticExLiteral(runtimeCatalog, tagFull, t1, t2, aggExpr)
         sqlText = sqlText & "SET @cpStart = SYSDATETIME();" & vbCrLf
         sqlText = sqlText & "INSERT INTO @Status (frac) EXEC " & cpCall & ";" & vbCrLf
@@ -718,7 +808,7 @@ Private Function ExecuteStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByV
         If isNumericValue <> 0 Then numericFlag = 1
         If insertedFlag = 1 Then insertedStatusCount = insertedStatusCount + 1
 
-        tagFull = BuildCountTagFullName(machineId, statusLabel)
+        tagFull = CStr(tagMap(statusLabel))
         LogMsg LOG_LEVEL_INFO, "GetStatusFractionsBatch", _
                "status_diag machine=" & machineId & _
                " window=" & periodKey & _
@@ -769,6 +859,23 @@ Private Function ExecuteStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByV
                " reason=no_usable_result_row"
         Set ExecuteStatusFractionsBatch = Nothing
     End If
+
+    Set cacheEntry = CreateObject("Scripting.Dictionary")
+    cacheEntry.Add "hasNumericCount", hasNumericCount
+    cacheEntry.Add "insertedStatusCount", insertedStatusCount
+    cacheEntry.Add "allNullNoNumeric", allNullNoNumeric
+    cacheEntry.Add "batchOk", batchOk
+    If ExecuteStatusFractionsBatch Is Nothing Then
+        cacheEntry.Add "hasOutDict", 0
+    Else
+        cacheEntry.Add "hasOutDict", 1
+        cacheEntry.Add "Aborted", CDbl(ExecuteStatusFractionsBatch("Aborted"))
+        cacheEntry.Add "Halted", CDbl(ExecuteStatusFractionsBatch("Halted"))
+        cacheEntry.Add "Running", CDbl(ExecuteStatusFractionsBatch("Running"))
+        cacheEntry.Add "Waiting", CDbl(ExecuteStatusFractionsBatch("Waiting"))
+        cacheEntry.Add "Interrupted", CDbl(ExecuteStatusFractionsBatch("Interrupted"))
+    End If
+    g_batchResultCache(cacheKey) = cacheEntry
 End Function
 
 Private Function GetStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal periodKey, ByVal t1, ByVal t2)
@@ -778,8 +885,10 @@ Private Function GetStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal m
     Dim currentSum, bestSum
     Dim selectedAgg, selectedIdx, aggTrialSummary, currentTrial, fastFailApplied, fallbackUsed, zeroInsertedWarnLogged
     Dim queryFailureCount
+    Dim tagMap, allowFallbackAggs, selectedPath
 
     aggs = GetAggExprList(runtimeCatalog)
+    Set tagMap = BuildStatusTagMap(machineId, periodKey, t1, t2)
     bestNumericCount = -1
     bestSum = -1
     selectedAgg = ""
@@ -789,13 +898,30 @@ Private Function GetStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal m
     fallbackUsed = 0
     zeroInsertedWarnLogged = 0
     queryFailureCount = 0
+    allowFallbackAggs = 0
+    selectedPath = "no_data"
 
     For idx = 0 To UBound(aggs)
+        If idx > 0 And allowFallbackAggs = 0 And queryFailureCount = 0 Then Exit For
+
         aggExpr = CStr(aggs(idx))
-        Set currentDict = ExecuteStatusFractionsBatch(cn, runtimeCatalog, machineId, periodKey, t1, t2, aggExpr, numericCount, insertedStatusCount, allNullNoNumeric, batchOk)
+        Set currentDict = ExecuteStatusFractionsBatch(cn, runtimeCatalog, machineId, periodKey, t1, t2, aggExpr, tagMap, numericCount, insertedStatusCount, allNullNoNumeric, batchOk)
         If batchOk = 1 And Not (currentDict Is Nothing) Then
             currentSum = SumStatusFractions(currentDict)
             currentTrial = aggExpr & "{ok=1,numeric=" & numericCount & ",inserted=" & insertedStatusCount & ",sum=" & currentSum & "}"
+            If idx = 0 Then
+                If numericCount > 0 Then
+                    Set bestDict = CopyStatusFractions(currentDict)
+                    bestNumericCount = numericCount
+                    bestSum = currentSum
+                    selectedAgg = aggExpr
+                    selectedIdx = idx
+                    selectedPath = "batch"
+                    Exit For
+                Else
+                    allowFallbackAggs = 1
+                End If
+            End If
         Else
             currentSum = 0
             currentTrial = aggExpr & "{ok=0,query_failure=1}"
@@ -804,9 +930,9 @@ Private Function GetStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal m
                    "agg_query_failed machine=" & machineId & _
                    " window=" & periodKey & _
                    " catalog=" & runtimeCatalog & _
-                   " agg=" & aggExpr & _
-                   " sql_from=" & TS3(t1) & _
-                   " sql_to=" & TS3(t2)
+               " agg=" & aggExpr & _
+               " sql_from=" & TS3(t1) & _
+               " sql_to=" & TS3(t2)
         End If
         If Len(aggTrialSummary) > 0 Then
             aggTrialSummary = aggTrialSummary & "; "
@@ -833,6 +959,7 @@ Private Function GetStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal m
             bestSum = currentSum
             selectedAgg = aggExpr
             selectedIdx = idx
+            selectedPath = "batch"
         ElseIf batchOk = 1 And ((numericCount > bestNumericCount) Or _
                (numericCount = bestNumericCount And currentSum > bestSum And bestSum <= 0)) Then
             Set bestDict = CopyStatusFractions(currentDict)
@@ -840,6 +967,7 @@ Private Function GetStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal m
             bestSum = currentSum
             selectedAgg = aggExpr
             selectedIdx = idx
+            selectedPath = "batch"
         End If
 
         If batchOk = 1 And idx = 0 And allNullNoNumeric = 1 Then
@@ -850,6 +978,7 @@ Private Function GetStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal m
                    " catalog=" & runtimeCatalog & _
                    " agg=" & aggExpr & _
                    " reason=all_null_no_numeric; continuing_fallback_scan=1"
+            allowFallbackAggs = 1
         End If
 
         If batchOk = 1 And numericCount = 5 And currentSum > 0 Then Exit For
@@ -864,7 +993,8 @@ Private Function GetStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal m
            " sql_from=" & TS3(t1) & _
            " sql_to=" & TS3(t2) & _
            " trials=[" & aggTrialSummary & "]" & _
-           " fast_fail=" & fastFailApplied
+           " fast_fail=" & fastFailApplied & _
+           " data_path=" & selectedPath
 
     If Not (bestDict Is Nothing) And bestNumericCount = 0 Then
         LogMsg LOG_LEVEL_WARN, "GetStatusFractionsBatch", _
@@ -875,6 +1005,18 @@ Private Function GetStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal m
                " sql_to=" & TS3(t2)
     End If
 
+    If bestDict Is Nothing And queryFailureCount = (UBound(aggs) + 1) Then
+        Set bestDict = ExecuteStatusFractionsSingleFallback(cn, runtimeCatalog, machineId, periodKey, t1, t2, tagMap, numericCount)
+        If Not (bestDict Is Nothing) Then
+            bestNumericCount = numericCount
+            bestSum = SumStatusFractions(bestDict)
+            selectedAgg = "single_status_path"
+            selectedIdx = -1
+            fallbackUsed = 1
+            selectedPath = "fallback_single"
+        End If
+    End If
+
     If bestDict Is Nothing Then
         LogMsg LOG_LEVEL_WARN, "GetStatusFractionsBatch", _
                "output_suppressed_due_query_failure machine=" & machineId & _
@@ -882,7 +1024,8 @@ Private Function GetStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal m
                " catalog=" & runtimeCatalog & _
                " sql_from=" & TS3(t1) & _
                " sql_to=" & TS3(t2) & _
-               " failed_trials=" & queryFailureCount
+               " failed_trials=" & queryFailureCount & _
+               " data_path=no_data"
         Set GetStatusFractionsBatch = Nothing
         Exit Function
     End If
@@ -895,7 +1038,8 @@ Private Function GetStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal m
            " idx=" & selectedIdx & _
            " fallback_used=" & fallbackUsed & _
            " numeric=" & bestNumericCount & _
-           " sum=" & bestSum
+           " sum=" & bestSum & _
+           " data_path=" & selectedPath
 
     Set GetStatusFractionsBatch = bestDict
 End Function

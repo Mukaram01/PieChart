@@ -875,7 +875,7 @@ Private Function ExecuteStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByV
         cacheEntry.Add "Waiting", CDbl(ExecuteStatusFractionsBatch("Waiting"))
         cacheEntry.Add "Interrupted", CDbl(ExecuteStatusFractionsBatch("Interrupted"))
     End If
-    g_batchResultCache(cacheKey) = cacheEntry
+    Set g_batchResultCache(cacheKey) = cacheEntry
 End Function
 
 Private Function GetStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal periodKey, ByVal t1, ByVal t2)

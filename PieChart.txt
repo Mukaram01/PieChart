@@ -577,7 +577,7 @@ Private Function BuildStatusTagMap(ByVal machineId, ByVal periodKey, ByVal t1, B
     d.Add "Running", BuildCountTagFullName(machineId, "Running")
     d.Add "Waiting", BuildCountTagFullName(machineId, "Waiting")
     d.Add "Interrupted", BuildCountTagFullName(machineId, "Interrupted")
-    g_statusTagFullNameCache(cacheKey) = d
+    Set g_statusTagFullNameCache(cacheKey) = d
     Set BuildStatusTagMap = d
 End Function
 

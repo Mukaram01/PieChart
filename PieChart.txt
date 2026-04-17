@@ -386,7 +386,7 @@ Private Function GetAggExprList(ByVal runtimeCatalog)
     GetAggExprList = Split(cfg, "|")
 End Function
 
-Private Function ExecuteStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal periodKey, ByVal t1, ByVal t2, ByVal aggExpr, ByRef hasNumericCount, ByRef insertedStatusCount, ByRef allNullNoNumeric)
+Private Function ExecuteStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal periodKey, ByVal t1, ByVal t2, ByVal aggExpr, ByRef hasNumericCount, ByRef insertedStatusCount, ByRef allNullNoNumeric, ByRef batchOk)
     Dim cmd, rs, sqlText, startedAt, completedAt, startTimer, elapsedMsValue, infoMsg
     Dim statuses, aliases, idx, statusName, tagFull, cpCall
     Dim outDict, fieldValue, diagRows, diagNumeric, diagElapsedMs
@@ -398,6 +398,7 @@ Private Function ExecuteStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByV
     hasNumericCount = 0
     insertedStatusCount = 0
     allNullNoNumeric = 0
+    batchOk = 0
 
     Set outDict = CreateObject("Scripting.Dictionary")
     outDict.Add "Aborted", 0
@@ -497,12 +498,13 @@ Private Function ExecuteStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByV
                         statusElapsedMs = rs.Fields("w_ms").Value: If IsNumeric(statusElapsedMs) Then diagElapsedMs("w") = CLng(statusElapsedMs)
                         statusElapsedMs = rs.Fields("i_ms").Value: If IsNumeric(statusElapsedMs) Then diagElapsedMs("i") = CLng(statusElapsedMs)
                     End If
+                    batchOk = 1
                 End If
             End If
             rs.Close
         End If
     Else
-        LogMsg LOG_LEVEL_WARN, "GetStatusFractionsBatch", "Batch query failed; status fractions defaulted to 0. err=" & S(Err.Description)
+        LogMsg LOG_LEVEL_WARN, "GetStatusFractionsBatch", "Batch query failed; no fractions returned. machine=" & machineId & " window=" & periodKey & " agg=" & aggExpr & " err=" & S(Err.Description)
         Err.Clear
     End If
     On Error GoTo 0
@@ -542,36 +544,50 @@ Private Function ExecuteStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByV
 
     completedAt = Now
     elapsedMsValue = ElapsedMs(startTimer)
-    valA = outDict("Aborted")
-    valH = outDict("Halted")
-    valR = outDict("Running")
-    valW = outDict("Waiting")
-    valI = outDict("Interrupted")
-    infoMsg = "machine=" & machineId & _
-              " window=" & periodKey & _
-              " agg=" & aggExpr & _
-              " sql_from=" & TS3(t1) & _
-              " sql_to=" & TS3(t2) & _
-              " started=" & TS3(startedAt) & _
-              " ended=" & TS3(completedAt) & _
-              " elapsed_ms=" & elapsedMsValue & _
-              " numeric=" & hasNumericCount & _
-              " a=" & valA & _
-              " h=" & valH & _
-              " r=" & valR & _
-              " w=" & valW & _
-              " i=" & valI
-    LogMsg LOG_LEVEL_INFO, "GetStatusFractionsBatch", infoMsg
-
-    Set ExecuteStatusFractionsBatch = outDict
+    If batchOk = 1 Then
+        valA = outDict("Aborted")
+        valH = outDict("Halted")
+        valR = outDict("Running")
+        valW = outDict("Waiting")
+        valI = outDict("Interrupted")
+        infoMsg = "machine=" & machineId & _
+                  " window=" & periodKey & _
+                  " agg=" & aggExpr & _
+                  " sql_from=" & TS3(t1) & _
+                  " sql_to=" & TS3(t2) & _
+                  " started=" & TS3(startedAt) & _
+                  " ended=" & TS3(completedAt) & _
+                  " elapsed_ms=" & elapsedMsValue & _
+                  " numeric=" & hasNumericCount & _
+                  " a=" & valA & _
+                  " h=" & valH & _
+                  " r=" & valR & _
+                  " w=" & valW & _
+                  " i=" & valI
+        LogMsg LOG_LEVEL_INFO, "GetStatusFractionsBatch", infoMsg
+        Set ExecuteStatusFractionsBatch = outDict
+    Else
+        LogMsg LOG_LEVEL_WARN, "GetStatusFractionsBatch", _
+               "batch_result_invalid machine=" & machineId & _
+               " window=" & periodKey & _
+               " agg=" & aggExpr & _
+               " sql_from=" & TS3(t1) & _
+               " sql_to=" & TS3(t2) & _
+               " started=" & TS3(startedAt) & _
+               " ended=" & TS3(completedAt) & _
+               " elapsed_ms=" & elapsedMsValue & _
+               " reason=no_usable_result_row"
+        Set ExecuteStatusFractionsBatch = Nothing
+    End If
 End Function
 
 Private Function GetStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal periodKey, ByVal t1, ByVal t2)
     Dim aggs, idx, aggExpr
     Dim currentDict, bestDict
-    Dim numericCount, bestNumericCount, insertedStatusCount, allNullNoNumeric
+    Dim numericCount, bestNumericCount, insertedStatusCount, allNullNoNumeric, batchOk
     Dim currentSum, bestSum
     Dim selectedAgg, selectedIdx, aggTrialSummary, currentTrial, fastFailApplied, fallbackUsed, zeroInsertedWarnLogged
+    Dim queryFailureCount
 
     aggs = GetAggExprList(runtimeCatalog)
     bestNumericCount = -1
@@ -582,18 +598,32 @@ Private Function GetStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal m
     fastFailApplied = 0
     fallbackUsed = 0
     zeroInsertedWarnLogged = 0
+    queryFailureCount = 0
 
     For idx = 0 To UBound(aggs)
         aggExpr = CStr(aggs(idx))
-        Set currentDict = ExecuteStatusFractionsBatch(cn, runtimeCatalog, machineId, periodKey, t1, t2, aggExpr, numericCount, insertedStatusCount, allNullNoNumeric)
-        currentSum = SumStatusFractions(currentDict)
-        currentTrial = aggExpr & "{numeric=" & numericCount & ",inserted=" & insertedStatusCount & ",sum=" & currentSum & "}"
+        Set currentDict = ExecuteStatusFractionsBatch(cn, runtimeCatalog, machineId, periodKey, t1, t2, aggExpr, numericCount, insertedStatusCount, allNullNoNumeric, batchOk)
+        If batchOk = 1 And Not (currentDict Is Nothing) Then
+            currentSum = SumStatusFractions(currentDict)
+            currentTrial = aggExpr & "{ok=1,numeric=" & numericCount & ",inserted=" & insertedStatusCount & ",sum=" & currentSum & "}"
+        Else
+            currentSum = 0
+            currentTrial = aggExpr & "{ok=0,query_failure=1}"
+            queryFailureCount = queryFailureCount + 1
+            LogMsg LOG_LEVEL_WARN, "GetStatusFractionsBatch", _
+                   "agg_query_failed machine=" & machineId & _
+                   " window=" & periodKey & _
+                   " catalog=" & runtimeCatalog & _
+                   " agg=" & aggExpr & _
+                   " sql_from=" & TS3(t1) & _
+                   " sql_to=" & TS3(t2)
+        End If
         If Len(aggTrialSummary) > 0 Then
             aggTrialSummary = aggTrialSummary & "; "
         End If
         aggTrialSummary = aggTrialSummary & currentTrial
 
-        If zeroInsertedWarnLogged = 0 Then
+        If batchOk = 1 And zeroInsertedWarnLogged = 0 Then
             If insertedStatusCount > 0 And currentSum = 0 Then
                 LogMsg LOG_LEVEL_WARN, "GetStatusFractionsBatch", _
                        "zero_sum_with_inserted_rows machine=" & machineId & _
@@ -607,14 +637,14 @@ Private Function GetStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal m
             End If
         End If
 
-        If (bestDict Is Nothing) Then
+        If batchOk = 1 And (bestDict Is Nothing) Then
             Set bestDict = CopyStatusFractions(currentDict)
             bestNumericCount = numericCount
             bestSum = currentSum
             selectedAgg = aggExpr
             selectedIdx = idx
-        ElseIf (numericCount > bestNumericCount) Or _
-               (numericCount = bestNumericCount And currentSum > bestSum And bestSum <= 0) Then
+        ElseIf batchOk = 1 And ((numericCount > bestNumericCount) Or _
+               (numericCount = bestNumericCount And currentSum > bestSum And bestSum <= 0)) Then
             Set bestDict = CopyStatusFractions(currentDict)
             bestNumericCount = numericCount
             bestSum = currentSum
@@ -622,7 +652,7 @@ Private Function GetStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal m
             selectedIdx = idx
         End If
 
-        If idx = 0 And allNullNoNumeric = 1 Then
+        If batchOk = 1 And idx = 0 And allNullNoNumeric = 1 Then
             fastFailApplied = 1
             LogMsg LOG_LEVEL_WARN, "GetStatusFractionsBatch", _
                    "fast_fail_unsupported_first_agg machine=" & machineId & _
@@ -632,7 +662,7 @@ Private Function GetStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal m
                    " reason=all_null_no_numeric; continuing_fallback_scan=1"
         End If
 
-        If numericCount = 5 And currentSum > 0 Then Exit For
+        If batchOk = 1 And numericCount = 5 And currentSum > 0 Then Exit For
     Next
 
     If selectedIdx > 0 Then fallbackUsed = 1
@@ -646,13 +676,25 @@ Private Function GetStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal m
            " trials=[" & aggTrialSummary & "]" & _
            " fast_fail=" & fastFailApplied
 
-    If bestNumericCount = 0 Then
+    If Not (bestDict Is Nothing) And bestNumericCount = 0 Then
         LogMsg LOG_LEVEL_WARN, "GetStatusFractionsBatch", _
                "all_aggs_non_numeric machine=" & machineId & _
                " catalog=" & runtimeCatalog & _
                " window=" & periodKey & _
                " sql_from=" & TS3(t1) & _
                " sql_to=" & TS3(t2)
+    End If
+
+    If bestDict Is Nothing Then
+        LogMsg LOG_LEVEL_WARN, "GetStatusFractionsBatch", _
+               "output_suppressed_due_query_failure machine=" & machineId & _
+               " window=" & periodKey & _
+               " catalog=" & runtimeCatalog & _
+               " sql_from=" & TS3(t1) & _
+               " sql_to=" & TS3(t2) & _
+               " failed_trials=" & queryFailureCount
+        Set GetStatusFractionsBatch = Nothing
+        Exit Function
     End If
 
     LogMsg LOG_LEVEL_INFO, "GetStatusFractionsBatch", _
@@ -685,13 +727,16 @@ End Function
 ' ─────────────────────────────────────────────────────────────────────
 ' Combine 5 → 3 (your rule), normalize if overlap makes sum > 1
 ' ─────────────────────────────────────────────────────────────────────
-Private Sub GetCombinedFractions(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal periodKey, ByVal t1, ByVal t2, ByRef fRun, ByRef fHalt, ByRef fAbort)
+Private Sub GetCombinedFractions(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal periodKey, ByVal t1, ByVal t2, ByRef fRun, ByRef fHalt, ByRef fAbort, ByRef outputOk)
     Dim a, h, r, w, i, total, statusFractions
 
     ' Initialise outputs so callers always receive well-defined values
     fRun = 0 : fHalt = 0 : fAbort = 0
+    outputOk = False
 
     Set statusFractions = GetStatusFractionsBatch(cn, runtimeCatalog, machineId, periodKey, t1, t2)
+    If statusFractions Is Nothing Then Exit Sub
+    outputOk = True
 
     a = GetCountFraction(statusFractions, "Aborted")
     h = GetCountFraction(statusFractions, "Halted")
@@ -776,10 +821,23 @@ Private Sub AggregatePeriod(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByV
     Dim pctRun, pctHalt, pctAbort
     Dim tagPct, tagPie, pieVal
     Dim totalPct
+    Dim outputOk
 
     LogMsg LOG_LEVEL_INFO, "Aggregate", machineId & " " & periodKey & "  " & TS3(startDt) & " -> " & TS3(endDt)
 
-    Call GetCombinedFractions(cn, runtimeCatalog, machineId, periodKey, startDt, endDt, fRun, fHalt, fAbort)
+    Call GetCombinedFractions(cn, runtimeCatalog, machineId, periodKey, startDt, endDt, fRun, fHalt, fAbort, outputOk)
+    If Not outputOk Then
+        LogMsg LOG_LEVEL_WARN, "Aggregate", _
+               "aggregate_input_invalid machineId=" & machineId & _
+               " periodKey=" & periodKey & _
+               " runtimeCatalog=" & runtimeCatalog & _
+               " aggExpr=none_selected"
+        LogMsg LOG_LEVEL_WARN, "Aggregate", _
+               "output_suppressed_due_query_failure machine=" & machineId & _
+               " period=" & periodKey & _
+               " runtimeCatalog=" & runtimeCatalog
+        Exit Sub
+    End If
 
     pctRun   = Round(CDbl(fRun)   * 100, 2)
     pctHalt  = Round(CDbl(fHalt)  * 100, 2)

@@ -45,7 +45,13 @@ Const THROTTLE_30D_MINUTES   = 1440  ' every 24 hours
 Const COUNT_TAG_PREFIX_JOINER          = "\"
 Const COUNT_TAG_CORE_TEMPLATE          = "{MACHINE_ID}_ProgramStatus_{STATUS_NAME}"
 Const COUNT_TAG_SUFFIX                 = "_Count"
-Const STARTUP_VALIDATE_LOOKBACK_MINUTES = 15
+Const STARTUP_VALIDATE_LOOKBACK_1D_MINUTES  = 1440
+Const STARTUP_VALIDATE_LOOKBACK_7D_MINUTES  = 10080
+Const STARTUP_VALIDATE_LOOKBACK_30D_MINUTES = 43200
+
+Const VALIDATE_STATE_HARD_FAIL = 0
+Const VALIDATE_STATE_NO_RECENT = 1
+Const VALIDATE_STATE_OK = 2
 
 Const adCmdText              = 1
 Const adStateOpen            = 1
@@ -69,6 +75,8 @@ Dim g_lastRunByMachinePeriod
 Dim g_machineLocks
 Dim g_machineValidationOk
 Dim g_machineValidationDone
+Dim g_machineValidationState
+Dim g_machineValidationReason
 Dim G_MACHINES
 Dim g_inited
 
@@ -96,6 +104,8 @@ Private Sub InitGlobals()
     Set g_machineLocks = CreateObject("Scripting.Dictionary")
     Set g_machineValidationOk = CreateObject("Scripting.Dictionary")
     Set g_machineValidationDone = CreateObject("Scripting.Dictionary")
+    Set g_machineValidationState = CreateObject("Scripting.Dictionary")
+    Set g_machineValidationReason = CreateObject("Scripting.Dictionary")
 
     Set G_MACHINES = CreateObject("Scripting.Dictionary")
     ' MachineId → Tag-logging prefix (left of backslash)
@@ -413,64 +423,126 @@ Private Function ProbeCountTagArchive(ByVal cn, ByVal runtimeCatalog, ByVal tagF
     Set cmd = Nothing
 End Function
 
-Private Function ValidateMachineCountTags(ByVal cn, ByVal runtimeCatalog, ByVal machineId)
+Private Function ResolveStartupValidationLookbackMinutes(ByVal due1D, ByVal due7D, ByVal due30D)
+    ResolveStartupValidationLookbackMinutes = STARTUP_VALIDATE_LOOKBACK_1D_MINUTES
+    If due7D Then
+        If STARTUP_VALIDATE_LOOKBACK_7D_MINUTES > ResolveStartupValidationLookbackMinutes Then
+            ResolveStartupValidationLookbackMinutes = STARTUP_VALIDATE_LOOKBACK_7D_MINUTES
+        End If
+    End If
+    If due30D Then
+        If STARTUP_VALIDATE_LOOKBACK_30D_MINUTES > ResolveStartupValidationLookbackMinutes Then
+            ResolveStartupValidationLookbackMinutes = STARTUP_VALIDATE_LOOKBACK_30D_MINUTES
+        End If
+    End If
+End Function
+
+Private Function ValidateMachineCountTags(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal lookbackMinutes, ByRef validationState, ByRef validationReason)
     Dim statuses, idx, statusName, tagFull, aggExpr, aggs
     Dim tFrom, tTo, insertedRows, hasNumeric, elapsedMsValue, errDesc
-    Dim probeOk, hasArchiveData, validStatusCount
+    Dim probeOk, hasArchiveData, validStatusCount, hardFailCount
+    Dim aggIdx, aggCount, statusProbeSucceeded, statusHadRows, lastErrDesc
 
     If g_machineValidationDone.Exists(machineId) Then
+        validationState = CLng(g_machineValidationState(machineId))
+        validationReason = CStr(g_machineValidationReason(machineId))
         ValidateMachineCountTags = CBool(g_machineValidationOk(machineId))
         Exit Function
     End If
 
     statuses = Array("Aborted", "Halted", "Running", "Waiting", "Interrupted")
     aggs = GetAggExprList(runtimeCatalog)
-    aggExpr = CStr(aggs(0))
+    aggCount = UBound(aggs) + 1
     tTo = Now()
-    tFrom = DateAdd("n", -STARTUP_VALIDATE_LOOKBACK_MINUTES, tTo)
+    tFrom = DateAdd("n", -lookbackMinutes, tTo)
     validStatusCount = 0
+    hardFailCount = 0
 
     For idx = 0 To UBound(statuses)
         statusName = CStr(statuses(idx))
         tagFull = BuildCountTagFullName(machineId, statusName)
-        probeOk = ProbeCountTagArchive(cn, runtimeCatalog, tagFull, tFrom, tTo, aggExpr, insertedRows, hasNumeric, elapsedMsValue, errDesc)
-        hasArchiveData = (probeOk And insertedRows > 0)
+        statusProbeSucceeded = False
+        statusHadRows = False
+        lastErrDesc = ""
+
+        For aggIdx = 0 To UBound(aggs)
+            aggExpr = CStr(aggs(aggIdx))
+            probeOk = ProbeCountTagArchive(cn, runtimeCatalog, tagFull, tFrom, tTo, aggExpr, insertedRows, hasNumeric, elapsedMsValue, errDesc)
+            If probeOk Then
+                statusProbeSucceeded = True
+                hasArchiveData = (insertedRows > 0)
+                If hasArchiveData Then statusHadRows = True
+                LogMsg LOG_LEVEL_INFO, "StartupValidate", _
+                       "machine=" & machineId & _
+                       " status=" & statusName & _
+                       " tag_full=" & tagFull & _
+                       " agg=" & aggExpr & _
+                       " data_exists=" & CStr(hasArchiveData) & _
+                       " inserted_rows=" & insertedRows & _
+                       " has_numeric=" & hasNumeric & _
+                       " lookback_min=" & lookbackMinutes & _
+                       " elapsed_ms=" & elapsedMsValue
+                Exit For
+            Else
+                lastErrDesc = errDesc
+                LogMsg LOG_LEVEL_WARN, "StartupValidate", _
+                       "machine=" & machineId & _
+                       " status=" & statusName & _
+                       " tag_full=" & tagFull & _
+                       " agg=" & aggExpr & _
+                       " data_exists=False" & _
+                       " probe_failed=1" & _
+                       " err=" & errDesc
+            End If
+        Next
+
+        hasArchiveData = statusHadRows
         If hasArchiveData Then validStatusCount = validStatusCount + 1
 
-        If probeOk Then
-            LogMsg LOG_LEVEL_INFO, "StartupValidate", _
-                   "machine=" & machineId & _
-                   " status=" & statusName & _
-                   " tag_full=" & tagFull & _
-                   " data_exists=" & CStr(hasArchiveData) & _
-                   " inserted_rows=" & insertedRows & _
-                   " has_numeric=" & hasNumeric & _
-                   " lookback_min=" & STARTUP_VALIDATE_LOOKBACK_MINUTES & _
-                   " elapsed_ms=" & elapsedMsValue
-        Else
+        If Not statusProbeSucceeded Then
+            hardFailCount = hardFailCount + 1
             LogMsg LOG_LEVEL_WARN, "StartupValidate", _
                    "machine=" & machineId & _
                    " status=" & statusName & _
                    " tag_full=" & tagFull & _
                    " data_exists=False" & _
                    " probe_failed=1" & _
-                   " err=" & errDesc
+                   " err=" & lastErrDesc & _
+                   " fallback_aggs_attempted=" & aggCount
         End If
     Next
 
     g_machineValidationDone(machineId) = True
-    If validStatusCount > 0 Then
-        g_machineValidationOk(machineId) = True
-        ValidateMachineCountTags = True
-    Else
+
+    If hardFailCount > 0 Then
+        validationState = VALIDATE_STATE_HARD_FAIL
+        validationReason = "hard_fail_probe_or_schema_error"
         g_machineValidationOk(machineId) = False
         ValidateMachineCountTags = False
         LogMsg LOG_LEVEL_WARN, "StartupValidate", _
                "HIGH_PRIORITY machine=" & machineId & _
-               " message=all_status_validations_failed; output_writes_will_be_skipped_to_prevent_misleading_zeros" & _
-               " lookback_min=" & STARTUP_VALIDATE_LOOKBACK_MINUTES & _
-               " agg=" & aggExpr
+               " message=startup_validation_hard_failure; output_writes_suppressed" & _
+               " lookback_min=" & lookbackMinutes & _
+               " fallback_aggs_attempted=" & aggCount
+    ElseIf validStatusCount > 0 Then
+        validationState = VALIDATE_STATE_OK
+        validationReason = "valid_recent_rows_detected"
+        g_machineValidationOk(machineId) = True
+        ValidateMachineCountTags = True
+    Else
+        validationState = VALIDATE_STATE_NO_RECENT
+        validationReason = "no_recent_rows_in_lookback"
+        g_machineValidationOk(machineId) = True
+        ValidateMachineCountTags = True
+        LogMsg LOG_LEVEL_WARN, "StartupValidate", _
+               "HIGH_PRIORITY machine=" & machineId & _
+               " message=no_recent_rows_detected; output_writes_allowed_with_warning" & _
+               " lookback_min=" & lookbackMinutes & _
+               " fallback_aggs_attempted=" & aggCount
     End If
+
+    g_machineValidationState(machineId) = validationState
+    g_machineValidationReason(machineId) = validationReason
 End Function
 
 Private Function BuildCpTagStatisticExLiteral(ByVal runtimeCatalog, ByVal tagFullName, ByVal tFrom, ByVal tTo, ByVal aggExpr)
@@ -1045,6 +1117,7 @@ Public Sub MainStatusAggregation(ByVal machineId)
     Dim startedAt, completedAt, startTimer, totalElapsedMs
     Dim guardReason, lockAcquired, canRun
     Dim skipLowerPriority, windowElapsedMs
+    Dim validationState, validationReason, validationLookbackMinutes
 
     ' WinCC VBScript does not support label-based handlers (On Error GoTo FAIL).
     On Error Resume Next
@@ -1122,9 +1195,18 @@ Public Sub MainStatusAggregation(ByVal machineId)
 
     If canRun Then rtCat = GetRuntimeCatalog()
     If canRun Then
-        If Not ValidateMachineCountTags(cn, rtCat, machineId) Then
+        validationLookbackMinutes = ResolveStartupValidationLookbackMinutes(due1D, due7D, due30D)
+        validationState = VALIDATE_STATE_HARD_FAIL
+        validationReason = ""
+        If Not ValidateMachineCountTags(cn, rtCat, machineId, validationLookbackMinutes, validationState, validationReason) Then
             guardReason = "skip_startup_validation_failed"
             canRun = False
+        ElseIf validationState = VALIDATE_STATE_NO_RECENT Then
+            LogMsg LOG_LEVEL_WARN, "MainStatusAggregation", _
+                   "startup_validation_warning machine=" & machineId & _
+                   " reason=" & validationReason & _
+                   " lookback_min=" & validationLookbackMinutes & _
+                   " action=proceed_with_aggregation"
         End If
     End If
     If canRun Then

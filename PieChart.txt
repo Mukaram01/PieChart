@@ -177,14 +177,22 @@ Private Function BuildCountTagFullName(ByVal machineId, ByVal statusName)
     BuildCountTagFullName = G_MACHINES(machineId) & COUNT_TAG_PREFIX_JOINER & core & COUNT_TAG_SUFFIX
 End Function
 
+Private Function BuildBaseTagFullName(ByVal machineId, ByVal statusName)
+    Dim core
+    core = Replace(COUNT_TAG_CORE_TEMPLATE, "{MACHINE_ID}", machineId)
+    core = Replace(core, "{STATUS_NAME}", statusName)
+    BuildBaseTagFullName = G_MACHINES(machineId) & COUNT_TAG_PREFIX_JOINER & core
+End Function
+
 Private Function BuildCpTagStatisticExLiteral(ByVal runtimeCatalog, ByVal tagFullName, ByVal tFrom, ByVal tTo, ByVal aggExpr)
-    Dim safeCatalog, safeTag
+    Dim safeCatalog, safeTag, safeAgg
     safeCatalog = Replace(runtimeCatalog, "'", "''")
     safeTag = Replace(tagFullName, "'", "''")
+    safeAgg = Replace(aggExpr, "'", "''")
 
     BuildCpTagStatisticExLiteral = "cp_TagStatisticEx '" & safeCatalog & "'," & _
                                    "'TAG:R,''" & safeTag & "'',''" & TS3(tFrom) & "'',''" & TS3(tTo) & "'''," & _
-                                   "'" & aggExpr & "'"
+                                   "'" & safeAgg & "'"
 End Function
 
 Private Function ExecAgg(ByVal cn, ByVal runtimeCatalog, ByVal tagFull, ByVal tFrom, ByVal tTo, ByVal aggExpr, ByRef fractionOut, ByRef errOut)
@@ -197,8 +205,7 @@ Private Function ExecAgg(ByVal cn, ByVal runtimeCatalog, ByVal tagFull, ByVal tF
 
     For i = 1 To MAX_RETRIES
         Err.Clear
-        sqlText = "SET NOCOUNT ON; DECLARE @T TABLE(frac FLOAT); INSERT INTO @T(frac) EXEC " & _
-                  BuildCpTagStatisticExLiteral(runtimeCatalog, tagFull, tFrom, tTo, aggExpr) & "; SELECT TOP 1 frac FROM @T;"
+        sqlText = BuildCpTagStatisticExLiteral(runtimeCatalog, tagFull, tFrom, tTo, aggExpr)
 
         Set cmd = CreateObject("ADODB.Command")
         cmd.ActiveConnection = cn
@@ -211,7 +218,7 @@ Private Function ExecAgg(ByVal cn, ByVal runtimeCatalog, ByVal tagFull, ByVal tF
             gotNumeric = False
             If Not (rs Is Nothing) Then
                 If Not rs.EOF Then
-                    If Not IsNull(rs.Fields(0).Value) Then
+                    If rs.Fields.Count > 0 And Not IsNull(rs.Fields(0).Value) Then
                         fractionOut = CDbl(rs.Fields(0).Value)
                         gotNumeric = True
                     End If
@@ -241,25 +248,35 @@ Private Function ExecAgg(ByVal cn, ByVal runtimeCatalog, ByVal tagFull, ByVal tF
 End Function
 
 Private Function ReadCountFraction(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal statusName, ByVal tFrom, ByVal tTo)
-    Dim tagFull, aggs, idx, frac, errText
+    Dim countTag, baseTag, aggs, idx, frac, errText
 
     ReadCountFraction = 0
-    tagFull = BuildCountTagFullName(machineId, statusName)
+    countTag = BuildCountTagFullName(machineId, statusName)
+    baseTag = BuildBaseTagFullName(machineId, statusName)
     aggs = GetAggExprList(runtimeCatalog)
 
     For idx = 0 To UBound(aggs)
-        If ExecAgg(cn, runtimeCatalog, tagFull, tFrom, tTo, CStr(aggs(idx)), frac, errText) Then
+        If ExecAgg(cn, runtimeCatalog, countTag, tFrom, tTo, CStr(aggs(idx)), frac, errText) Then
             ReadCountFraction = frac
             If CURRENT_LOG_LEVEL >= LOG_LEVEL_DEBUG Then
                 LogMsg LOG_LEVEL_DEBUG, "ReadCountFraction", _
-                       "machine=" & machineId & " status=" & statusName & " tag=" & tagFull & " agg=" & CStr(aggs(idx)) & " frac=" & frac
+                       "machine=" & machineId & " status=" & statusName & " tag=" & countTag & " agg=" & CStr(aggs(idx)) & " frac=" & frac
             End If
             Exit Function
         End If
     Next
 
+    For idx = 0 To UBound(aggs)
+        If ExecAgg(cn, runtimeCatalog, baseTag, tFrom, tTo, CStr(aggs(idx)), frac, errText) Then
+            ReadCountFraction = frac
+            LogMsg LOG_LEVEL_INFO, "ReadCountFraction", _
+                   "fallback_to_plain_tag machine=" & machineId & " status=" & statusName & " tag=" & baseTag & " agg=" & CStr(aggs(idx)) & " frac=" & frac
+            Exit Function
+        End If
+    Next
+
     LogMsg LOG_LEVEL_WARN, "ReadCountFraction", _
-           "machine=" & machineId & " status=" & statusName & " tag=" & tagFull & " err=" & errText
+           "machine=" & machineId & " status=" & statusName & " count_tag=" & countTag & " plain_tag=" & baseTag & " err=" & errText
 End Function
 
 Private Function OutTagName(ByVal machineId, ByVal periodKey, ByVal statusDispName, ByVal pieChart)

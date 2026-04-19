@@ -31,6 +31,11 @@ Const RETRY_BACKOFF_MS       = 250
 Const RETRY_BACKOFF_TIMEOUT_MS = 1250
 Const WINDOW_EXEC_WARN_THRESHOLD_MS = 15000
 
+' Toggle zero-total rendering for valid windows (totalPct=0).
+' True  = render deterministic fallback pie (34/33/33).
+' False = preserve legacy all-zero pie output for idle windows (ops can require this).
+Const RENDER_ZERO_TOTAL_AS_FALLBACK_PIE = True
+
 ' Project-specific batch aggregation configuration (ordered by preference).
 ' Use "|" to separate expressions. Keep first expression as known-good for
 ' your archive schema and list fallbacks after it.
@@ -1205,10 +1210,12 @@ Private Sub AggregatePeriod(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByV
     Dim totalPct
     Dim inputValid
     Dim usedFallbackPie
+    Dim zeroTotalRenderMode
 
     LogMsg LOG_LEVEL_INFO, "Aggregate", machineId & " " & periodKey & "  " & TS3(startDt) & " -> " & TS3(endDt)
 
     usedFallbackPie = False
+    zeroTotalRenderMode = "preserve_zero"
 
     Call GetCombinedFractions(cn, runtimeCatalog, machineId, periodKey, startDt, endDt, fRun, fHalt, fAbort, inputValid)
     If Not inputValid Then
@@ -1223,11 +1230,17 @@ Private Sub AggregatePeriod(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByV
         pctRun = 0: pctHalt = 0: pctAbort = 0
         totalPct = 0
         usedFallbackPie = True
+        zeroTotalRenderMode = "fallback"
     Else
         pctRun   = Round(CDbl(fRun)   * 100, 2)
         pctHalt  = Round(CDbl(fHalt)  * 100, 2)
         pctAbort = Round(CDbl(fAbort) * 100, 2)
         totalPct = Round(pctRun + pctHalt + pctAbort, 2)
+
+        If totalPct = 0 And RENDER_ZERO_TOTAL_AS_FALLBACK_PIE Then
+            usedFallbackPie = True
+            zeroTotalRenderMode = "fallback"
+        End If
     End If
 
     LogMsg LOG_LEVEL_INFO, "Aggregate", _
@@ -1238,7 +1251,8 @@ Private Sub AggregatePeriod(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByV
            " pctHalt=" & pctHalt & _
            " pctAbort=" & pctAbort & _
            " totalPct=" & totalPct & _
-           " fallback_render_path=" & CStr(usedFallbackPie)
+           " fallback_render_path=" & CStr(usedFallbackPie) & _
+           " zero_total_render_mode=" & zeroTotalRenderMode
 
     ' main % (can be 0)
     tagPct = OutTagName(machineId, periodKey, "Running", False): WriteTag tagPct, pctRun
@@ -1247,8 +1261,8 @@ Private Sub AggregatePeriod(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByV
 
     ' pie chart output strategy:
     ' 1) invalid/no-data input -> deterministic fallback split for rendering.
-    ' 2) valid input -> preserve current true-idle behavior: all pie outputs
-    '    remain 0 when totalPct=0 (operationally required for idle windows).
+    ' 2) valid input -> zero-total behavior is controlled by
+    '    RENDER_ZERO_TOTAL_AS_FALLBACK_PIE (fallback split vs preserved zeroes).
     If usedFallbackPie Then
         tagPie = OutTagName(machineId, periodKey, "Running", True): WriteTag tagPie, 34
         tagPie = OutTagName(machineId, periodKey, "Halted",  True): WriteTag tagPie, 33
@@ -1258,7 +1272,8 @@ Private Sub AggregatePeriod(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByV
                " period=" & periodKey & _
                " input_valid=" & CStr(inputValid) & _
                " totalPct=" & totalPct & _
-               " fallback_render_path=True"
+               " fallback_render_path=True" & _
+               " zero_total_render_mode=" & zeroTotalRenderMode
     Else
         pieVal = pctRun:   If pieVal < 1 And totalPct > 0 Then pieVal = 1
         tagPie = OutTagName(machineId, periodKey, "Running", True): WriteTag tagPie, pieVal
@@ -1275,9 +1290,15 @@ Private Sub AggregatePeriod(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByV
                    " period=" & periodKey & _
                    " input_valid=" & CStr(inputValid) & _
                    " totalPct=" & totalPct & _
-                   " fallback_render_path=False"
+                   " fallback_render_path=False" & _
+                   " zero_total_render_mode=" & zeroTotalRenderMode
         End If
     End If
+
+    LogMsg LOG_LEVEL_INFO, "Aggregate", _
+           "zero_total_render_mode=" & zeroTotalRenderMode & _
+           " machine=" & machineId & _
+           " period=" & periodKey
 
     LogMsg LOG_LEVEL_INFO, "Aggregate", "writes_completed machine=" & machineId & " period=" & periodKey
 End Sub

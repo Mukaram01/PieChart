@@ -438,6 +438,7 @@ Public Sub MainStatusAggregation(ByVal machineId)
         MarkRun machineId, "30D"
     End If
 
+CLEANUP:
     If Err.Number <> 0 Then
         reason = "runtime_error"
         LogMsg LOG_LEVEL_ERROR, "Main", "machine=" & machineId & " err=" & S(Err.Description)

@@ -52,6 +52,8 @@ Const STARTUP_VALIDATE_LOOKBACK_30D_MINUTES = 43200
 Const VALIDATE_STATE_HARD_FAIL = 0
 Const VALIDATE_STATE_NO_RECENT = 1
 Const VALIDATE_STATE_OK = 2
+Const VALIDATE_RETRY_HARD_FAIL_MINUTES = 2
+Const VALIDATE_RETRY_NORMAL_MINUTES = 180
 
 Const adCmdText              = 1
 Const adStateOpen            = 1
@@ -77,6 +79,7 @@ Dim g_machineValidationOk
 Dim g_machineValidationDone
 Dim g_machineValidationState
 Dim g_machineValidationReason
+Dim g_machineValidationLastTs
 Dim g_batchResultCache
 Dim g_statusTagFullNameCache
 Dim G_MACHINES
@@ -108,6 +111,7 @@ Private Sub InitGlobals()
     Set g_machineValidationDone = CreateObject("Scripting.Dictionary")
     Set g_machineValidationState = CreateObject("Scripting.Dictionary")
     Set g_machineValidationReason = CreateObject("Scripting.Dictionary")
+    Set g_machineValidationLastTs = CreateObject("Scripting.Dictionary")
     Set g_batchResultCache = CreateObject("Scripting.Dictionary")
     Set g_statusTagFullNameCache = CreateObject("Scripting.Dictionary")
 
@@ -441,17 +445,60 @@ Private Function ResolveStartupValidationLookbackMinutes(ByVal due1D, ByVal due7
     End If
 End Function
 
+Private Function ValidationStateName(ByVal validationState)
+    Select Case CLng(validationState)
+        Case VALIDATE_STATE_OK
+            ValidationStateName = "OK"
+        Case VALIDATE_STATE_NO_RECENT
+            ValidationStateName = "NO_RECENT"
+        Case VALIDATE_STATE_HARD_FAIL
+            ValidationStateName = "HARD_FAIL"
+        Case Else
+            ValidationStateName = "UNKNOWN(" & CStr(validationState) & ")"
+    End Select
+End Function
+
 Private Function ValidateMachineCountTags(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal lookbackMinutes, ByRef validationState, ByRef validationReason)
     Dim statuses, idx, statusName, tagFull, aggExpr, aggs
     Dim tFrom, tTo, insertedRows, hasNumeric, elapsedMsValue, errDesc
     Dim probeOk, hasArchiveData, validStatusCount, hardFailCount
     Dim aggIdx, aggCount, statusProbeSucceeded, statusHadRows, lastErrDesc
+    Dim cacheTs, elapsedMins, retryIntervalMins, priorState, priorReason
 
     If g_machineValidationDone.Exists(machineId) Then
-        validationState = CLng(g_machineValidationState(machineId))
-        validationReason = CStr(g_machineValidationReason(machineId))
-        ValidateMachineCountTags = CBool(g_machineValidationOk(machineId))
-        Exit Function
+        priorState = CLng(g_machineValidationState(machineId))
+        priorReason = CStr(g_machineValidationReason(machineId))
+        cacheTs = #1/1/1970#
+        If g_machineValidationLastTs.Exists(machineId) Then
+            cacheTs = CDate(g_machineValidationLastTs(machineId))
+        End If
+        elapsedMins = DateDiff("n", cacheTs, Now())
+
+        If priorState = VALIDATE_STATE_HARD_FAIL Then
+            retryIntervalMins = VALIDATE_RETRY_HARD_FAIL_MINUTES
+        Else
+            retryIntervalMins = VALIDATE_RETRY_NORMAL_MINUTES
+        End If
+
+        If elapsedMins < retryIntervalMins Then
+            validationState = priorState
+            validationReason = priorReason
+            ValidateMachineCountTags = CBool(g_machineValidationOk(machineId))
+            LogMsg LOG_LEVEL_INFO, "StartupValidate", _
+                   "cache_reused=1 machine=" & machineId & _
+                   " prior_state=" & ValidationStateName(priorState) & _
+                   " prior_reason=" & priorReason & _
+                   " age_min=" & elapsedMins & _
+                   " retry_interval_min=" & retryIntervalMins
+            Exit Function
+        End If
+
+        LogMsg LOG_LEVEL_INFO, "StartupValidate", _
+               "cache_reprobe=1 machine=" & machineId & _
+               " prior_state=" & ValidationStateName(priorState) & _
+               " prior_reason=" & priorReason & _
+               " age_min=" & elapsedMins & _
+               " retry_interval_min=" & retryIntervalMins
     End If
 
     statuses = Array("Aborted", "Halted", "Running", "Waiting", "Interrupted")
@@ -547,6 +594,7 @@ Private Function ValidateMachineCountTags(ByVal cn, ByVal runtimeCatalog, ByVal 
 
     g_machineValidationState(machineId) = validationState
     g_machineValidationReason(machineId) = validationReason
+    g_machineValidationLastTs(machineId) = Now()
 End Function
 
 Private Function BuildCpTagStatisticExLiteral(ByVal runtimeCatalog, ByVal tagFullName, ByVal tFrom, ByVal tTo, ByVal aggExpr)

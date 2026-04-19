@@ -371,12 +371,13 @@ Public Sub MainStatusAggregation(ByVal machineId)
     Dim cn, rtCat, nowDT
     Dim startTimer, reason
     Dim due1D, due7D, due30D
-    Dim lockAcquired
+    Dim lockAcquired, canRun
 
     InitGlobals
     startTimer = Timer
     reason = "completed"
     lockAcquired = False
+    canRun = True
 
     LogMsg LOG_LEVEL_INFO, "Main", "start machine=" & machineId
 
@@ -386,49 +387,53 @@ Public Sub MainStatusAggregation(ByVal machineId)
     End If
     lockAcquired = True
 
-    If Not IsMaster() Then
+    If canRun And (Not IsMaster()) Then
         reason = "skip_not_master"
         LogMsg LOG_LEVEL_INFO, "Main", "skip reason=" & reason & " machine=" & machineId
-        GoTo CLEANUP
+        canRun = False
     End If
 
-    If Not G_MACHINES.Exists(machineId) Then
+    If canRun And (Not G_MACHINES.Exists(machineId)) Then
         reason = "skip_unknown_machine"
         LogMsg LOG_LEVEL_WARN, "Main", "skip reason=" & reason & " machine=" & machineId
-        GoTo CLEANUP
+        canRun = False
     End If
 
-    due1D = ShouldRun(machineId, "1D", THROTTLE_1D_MINUTES)
-    due7D = ShouldRun(machineId, "7D", THROTTLE_7D_MINUTES)
-    due30D = ShouldRun(machineId, "30D", THROTTLE_30D_MINUTES)
+    If canRun Then
+        due1D = ShouldRun(machineId, "1D", THROTTLE_1D_MINUTES)
+        due7D = ShouldRun(machineId, "7D", THROTTLE_7D_MINUTES)
+        due30D = ShouldRun(machineId, "30D", THROTTLE_30D_MINUTES)
+    End If
 
-    If Not (due1D Or due7D Or due30D) Then
+    If canRun And (Not (due1D Or due7D Or due30D)) Then
         reason = "skip_throttle"
         LogMsg LOG_LEVEL_INFO, "Main", "skip reason=" & reason & " machine=" & machineId
-        GoTo CLEANUP
+        canRun = False
     End If
 
-    Set cn = OpenConnection()
-    If (cn Is Nothing) Then
+    If canRun Then Set cn = OpenConnection()
+    If canRun And (cn Is Nothing) Then
         reason = "fail_open_connection"
         LogMsg LOG_LEVEL_ERROR, "Main", "fail reason=" & reason & " machine=" & machineId
-        GoTo CLEANUP
+        canRun = False
     End If
 
-    rtCat = GetRuntimeCatalog()
-    nowDT = Now()
+    If canRun Then
+        rtCat = GetRuntimeCatalog()
+        nowDT = Now()
+    End If
 
-    If due1D Then
+    If canRun And due1D Then
         AggregatePeriod cn, rtCat, machineId, "1D", DateAdd("d", -1, nowDT), nowDT
         MarkRun machineId, "1D"
     End If
 
-    If due7D Then
+    If canRun And due7D Then
         AggregatePeriod cn, rtCat, machineId, "7D", DateAdd("d", -7, nowDT), nowDT
         MarkRun machineId, "7D"
     End If
 
-    If due30D Then
+    If canRun And due30D Then
         AggregatePeriod cn, rtCat, machineId, "30D", DateAdd("d", -30, nowDT), nowDT
         MarkRun machineId, "30D"
     End If

@@ -306,6 +306,62 @@ Private Sub WriteTag(ByVal tag, ByVal val)
     On Error GoTo 0
 End Sub
 
+Private Sub NormalizeFractionsToPct(ByVal runFrac, ByVal haltFrac, ByVal abortFrac, ByRef pctRun, ByRef pctHalt, ByRef pctAbort)
+    Dim safeRun, safeHalt, safeAbort, sumFrac
+    Dim rawRun, rawHalt, rawAbort
+    Dim floorRun, floorHalt, floorAbort
+    Dim remRun, remHalt, remAbort
+    Dim remaining
+
+    safeRun = CDbl(runFrac)
+    safeHalt = CDbl(haltFrac)
+    safeAbort = CDbl(abortFrac)
+
+    If safeRun < 0 Then safeRun = 0
+    If safeHalt < 0 Then safeHalt = 0
+    If safeAbort < 0 Then safeAbort = 0
+
+    sumFrac = safeRun + safeHalt + safeAbort
+    If sumFrac <= 0 Then
+        pctRun = 0
+        pctHalt = 0
+        pctAbort = 0
+        Exit Sub
+    End If
+
+    rawRun = (safeRun / sumFrac) * 100
+    rawHalt = (safeHalt / sumFrac) * 100
+    rawAbort = (safeAbort / sumFrac) * 100
+
+    floorRun = Int(rawRun)
+    floorHalt = Int(rawHalt)
+    floorAbort = Int(rawAbort)
+
+    remRun = rawRun - floorRun
+    remHalt = rawHalt - floorHalt
+    remAbort = rawAbort - floorAbort
+
+    remaining = 100 - (floorRun + floorHalt + floorAbort)
+
+    pctRun = floorRun
+    pctHalt = floorHalt
+    pctAbort = floorAbort
+
+    Do While remaining > 0
+        If remRun >= remHalt And remRun >= remAbort Then
+            pctRun = pctRun + 1
+            remRun = -1
+        ElseIf remHalt >= remRun And remHalt >= remAbort Then
+            pctHalt = pctHalt + 1
+            remHalt = -1
+        Else
+            pctAbort = pctAbort + 1
+            remAbort = -1
+        End If
+        remaining = remaining - 1
+    Loop
+End Sub
+
 Private Sub AggregatePeriod(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal periodKey, ByVal tFrom, ByVal tTo)
     Dim runFrac, haltFrac, abortFrac, waitFrac, intFrac
     Dim pctRun, pctHalt, pctAbort, totalPct
@@ -319,13 +375,7 @@ Private Sub AggregatePeriod(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByV
     abortFrac = abortFrac + waitFrac
     haltFrac = haltFrac + intFrac
 
-    pctRun = CLng(runFrac * 100)
-    pctHalt = CLng(haltFrac * 100)
-    pctAbort = CLng(abortFrac * 100)
-
-    If pctRun < 0 Then pctRun = 0
-    If pctHalt < 0 Then pctHalt = 0
-    If pctAbort < 0 Then pctAbort = 0
+    NormalizeFractionsToPct runFrac, haltFrac, abortFrac, pctRun, pctHalt, pctAbort
 
     WriteTag OutTagName(machineId, periodKey, "Running", False), pctRun
     WriteTag OutTagName(machineId, periodKey, "Halted", False),  pctHalt
@@ -337,11 +387,6 @@ Private Sub AggregatePeriod(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByV
         WriteTag OutTagName(machineId, periodKey, "Halted", True), 33
         WriteTag OutTagName(machineId, periodKey, "Aborted", True), 33
     Else
-        If totalPct > 0 Then
-            If pctRun < 1 Then pctRun = 1
-            If pctHalt < 1 Then pctHalt = 1
-            If pctAbort < 1 Then pctAbort = 1
-        End If
         WriteTag OutTagName(machineId, periodKey, "Running", True), pctRun
         WriteTag OutTagName(machineId, periodKey, "Halted", True),  pctHalt
         WriteTag OutTagName(machineId, periodKey, "Aborted", True), pctAbort

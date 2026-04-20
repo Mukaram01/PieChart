@@ -382,24 +382,30 @@ Private Function TryAvgFraction(ByVal cn, ByVal runtimeCatalog, ByVal tagFull, B
 
     If baseTag <> tagFull Then
         v = CpAggregate(cn, runtimeCatalog, baseTag, t1, t2, "AVG(RealValue)", machineId, periodKey, statusName)
-        If IsNumeric(v) Then If v >= 0 And v <= 1 Then
-            LogMsg LOG_LEVEL_INFO, "TryAvgFraction", "fallback_to_plain_tag machine=" & machineId & " window=" & periodKey & " status=" & statusName & " agg=AVG(RealValue)"
-            TryAvgFraction = v
-            Exit Function
+        If IsNumeric(v) Then
+            If v >= 0 And v <= 1 Then
+                LogMsg LOG_LEVEL_INFO, "TryAvgFraction", "fallback_to_plain_tag machine=" & machineId & " window=" & periodKey & " status=" & statusName & " agg=AVG(RealValue)"
+                TryAvgFraction = v
+                Exit Function
+            End If
         End If
 
         v = CpAggregate(cn, runtimeCatalog, baseTag, t1, t2, "AVG(Value)", machineId, periodKey, statusName)
-        If IsNumeric(v) Then If v >= 0 And v <= 1 Then
-            LogMsg LOG_LEVEL_INFO, "TryAvgFraction", "fallback_to_plain_tag machine=" & machineId & " window=" & periodKey & " status=" & statusName & " agg=AVG(Value)"
-            TryAvgFraction = v
-            Exit Function
+        If IsNumeric(v) Then
+            If v >= 0 And v <= 1 Then
+                LogMsg LOG_LEVEL_INFO, "TryAvgFraction", "fallback_to_plain_tag machine=" & machineId & " window=" & periodKey & " status=" & statusName & " agg=AVG(Value)"
+                TryAvgFraction = v
+                Exit Function
+            End If
         End If
 
         v = CpAggregate(cn, runtimeCatalog, baseTag, t1, t2, "AVG(ValueScaled)", machineId, periodKey, statusName)
-        If IsNumeric(v) Then If v >= 0 And v <= 1 Then
-            LogMsg LOG_LEVEL_INFO, "TryAvgFraction", "fallback_to_plain_tag machine=" & machineId & " window=" & periodKey & " status=" & statusName & " agg=AVG(ValueScaled)"
-            TryAvgFraction = v
-            Exit Function
+        If IsNumeric(v) Then
+            If v >= 0 And v <= 1 Then
+                LogMsg LOG_LEVEL_INFO, "TryAvgFraction", "fallback_to_plain_tag machine=" & machineId & " window=" & periodKey & " status=" & statusName & " agg=AVG(ValueScaled)"
+                TryAvgFraction = v
+                Exit Function
+            End If
         End If
     End If
 

@@ -56,6 +56,8 @@ Const STARTUP_VALIDATE_LOOKBACK_1D_MINUTES  = 1440
 Const STARTUP_VALIDATE_LOOKBACK_7D_MINUTES  = 10080
 Const STARTUP_VALIDATE_LOOKBACK_30D_MINUTES = 43200
 Const STARTUP_VALIDATE_LOOKBACK_PROBE_CAP_MINUTES = 10080
+Const STATUS_TAG_CACHE_MAX_ENTRIES = 256
+Const BATCH_RESULT_CACHE_MAX_ENTRIES = 384
 
 Const VALIDATE_STATE_HARD_FAIL = 0
 Const VALIDATE_STATE_NO_RECENT = 1
@@ -686,9 +688,29 @@ Private Function BuildBatchCacheKey(ByVal runtimeCatalog, ByVal machineId, ByVal
     BuildBatchCacheKey = runtimeCatalog & "|" & machineId & "|" & periodKey & "|" & TS3(t1) & "|" & TS3(t2) & "|" & aggExpr
 End Function
 
+Private Sub TrimCacheIfNeeded(ByVal dictObj, ByVal maxEntries, ByVal cacheName)
+    Dim removeCount, keys, idx, keyToRemove
+    If dictObj Is Nothing Then Exit Sub
+    If maxEntries < 1 Then maxEntries = 1
+    If dictObj.Count <= maxEntries Then Exit Sub
+
+    removeCount = dictObj.Count - maxEntries
+    keys = dictObj.Keys
+    For idx = 0 To removeCount - 1
+        keyToRemove = CStr(keys(idx))
+        If dictObj.Exists(keyToRemove) Then dictObj.Remove keyToRemove
+    Next
+
+    LogMsg LOG_LEVEL_WARN, "CacheTrim", _
+           "cache_eviction cache=" & cacheName & _
+           " removed=" & removeCount & _
+           " max_entries=" & maxEntries & _
+           " remaining=" & dictObj.Count
+End Sub
+
 Private Function BuildStatusTagMap(ByVal machineId, ByVal periodKey, ByVal t1, ByVal t2)
     Dim cacheKey, d
-    cacheKey = machineId & "|" & periodKey & "|" & TS3(t1) & "|" & TS3(t2)
+    cacheKey = machineId
 
     If g_statusTagFullNameCache.Exists(cacheKey) Then
         Set BuildStatusTagMap = g_statusTagFullNameCache(cacheKey)
@@ -701,6 +723,7 @@ Private Function BuildStatusTagMap(ByVal machineId, ByVal periodKey, ByVal t1, B
     d.Add "Running", BuildCountTagFullName(machineId, "Running")
     d.Add "Waiting", BuildCountTagFullName(machineId, "Waiting")
     d.Add "Interrupted", BuildCountTagFullName(machineId, "Interrupted")
+    TrimCacheIfNeeded g_statusTagFullNameCache, STATUS_TAG_CACHE_MAX_ENTRIES, "g_statusTagFullNameCache"
     Set g_statusTagFullNameCache(cacheKey) = d
     Set BuildStatusTagMap = d
 End Function
@@ -1005,6 +1028,7 @@ Private Function ExecuteStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByV
         cacheEntry.Add "Waiting", CDbl(ExecuteStatusFractionsBatch("Waiting"))
         cacheEntry.Add "Interrupted", CDbl(ExecuteStatusFractionsBatch("Interrupted"))
     End If
+    TrimCacheIfNeeded g_batchResultCache, BATCH_RESULT_CACHE_MAX_ENTRIES, "g_batchResultCache"
     Set g_batchResultCache(cacheKey) = cacheEntry
 End Function
 

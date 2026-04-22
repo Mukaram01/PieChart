@@ -59,6 +59,7 @@ Const VALIDATE_STATE_NO_RECENT = 1
 Const VALIDATE_STATE_OK = 2
 Const VALIDATE_RETRY_HARD_FAIL_MINUTES = 2
 Const VALIDATE_RETRY_NORMAL_MINUTES = 180
+Const STARTUP_VALIDATION_BLOCK_WRITES_ON_PROBE_FAIL = False
 
 Const adCmdText              = 1
 Const adStateOpen            = 1
@@ -606,14 +607,25 @@ Private Function ValidateMachineCountTags(ByVal cn, ByVal runtimeCatalog, ByVal 
 
     If hardFailCount > 0 Then
         validationState = VALIDATE_STATE_HARD_FAIL
-        validationReason = "hard_fail_probe_or_schema_error"
-        g_machineValidationOk(machineId) = False
-        ValidateMachineCountTags = False
-        LogMsg LOG_LEVEL_WARN, "StartupValidate", _
-               "HIGH_PRIORITY machine=" & machineId & _
-               " message=startup_validation_hard_failure; output_writes_suppressed" & _
-               " lookback_min=" & lookbackMinutes & _
-               " fallback_aggs_attempted=" & aggCount
+        If STARTUP_VALIDATION_BLOCK_WRITES_ON_PROBE_FAIL Then
+            validationReason = "hard_fail_probe_or_schema_error"
+            g_machineValidationOk(machineId) = False
+            ValidateMachineCountTags = False
+            LogMsg LOG_LEVEL_WARN, "StartupValidate", _
+                   "HIGH_PRIORITY machine=" & machineId & _
+                   " message=startup_validation_hard_failure; output_writes_suppressed" & _
+                   " lookback_min=" & lookbackMinutes & _
+                   " fallback_aggs_attempted=" & aggCount
+        Else
+            validationReason = "degraded_probe_fail"
+            g_machineValidationOk(machineId) = True
+            ValidateMachineCountTags = True
+            LogMsg LOG_LEVEL_WARN, "StartupValidate", _
+                   "HIGH_PRIORITY machine=" & machineId & _
+                   " message=startup_validation_hard_failure; output_writes_allowed_with_warning" & _
+                   " lookback_min=" & lookbackMinutes & _
+                   " fallback_aggs_attempted=" & aggCount
+        End If
     ElseIf validStatusCount > 0 Then
         validationState = VALIDATE_STATE_OK
         validationReason = "valid_recent_rows_detected"
@@ -1505,6 +1517,12 @@ Public Sub MainStatusAggregation(ByVal machineId)
         ElseIf validationState = VALIDATE_STATE_NO_RECENT Then
             LogMsg LOG_LEVEL_WARN, "MainStatusAggregation", _
                    "startup_validation_warning machine=" & machineId & _
+                   " reason=" & validationReason & _
+                   " lookback_min=" & validationLookbackMinutes & _
+                   " action=proceed_with_aggregation"
+        ElseIf validationReason = "degraded_probe_fail" Then
+            LogMsg LOG_LEVEL_WARN, "MainStatusAggregation", _
+                   "startup_validation_degraded machine=" & machineId & _
                    " reason=" & validationReason & _
                    " lookback_min=" & validationLookbackMinutes & _
                    " action=proceed_with_aggregation"

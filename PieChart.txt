@@ -26,6 +26,7 @@ Const FALLBACK_PROVIDER      = "SQLNCLI11"
 Const SQL_INSTANCE           = ".\WinCC"
 Const INITIAL_CATALOG        = "master"
 Const SQL_TIMEOUT_SECONDS    = 45
+Const SQL_TIMEOUT_SECONDS_PROBE = 12
 Const MAX_RETRY_ATTEMPTS     = 2
 Const RETRY_BACKOFF_MS       = 250
 Const RETRY_BACKOFF_TIMEOUT_MS = 1250
@@ -41,6 +42,7 @@ Const RENDER_ZERO_TOTAL_AS_FALLBACK_PIE = True
 ' your archive schema and list fallbacks after it.
 Const PROJECT_BATCH_AGG_LIST_DEFAULT = "AVG(RealValue)|AVG(Value)|AVG(ValueScaled)"
 Const PROJECT_BATCH_AGG_LIST_WINCC   = "AVG(Value)|AVG(RealValue)|AVG(ValueScaled)"
+Const PROJECT_BATCH_AGG_LIST_CCSLSGLO = "AVG(Value)|AVG(RealValue)|AVG(ValueScaled)"
 
 Const THROTTLE_1D_MINUTES    = 30    ' every 30 minutes
 Const THROTTLE_7D_MINUTES    = 360   ' every 6 hours
@@ -53,6 +55,7 @@ Const COUNT_TAG_SUFFIX                 = "_Count"
 Const STARTUP_VALIDATE_LOOKBACK_1D_MINUTES  = 1440
 Const STARTUP_VALIDATE_LOOKBACK_7D_MINUTES  = 10080
 Const STARTUP_VALIDATE_LOOKBACK_30D_MINUTES = 43200
+Const STARTUP_VALIDATE_LOOKBACK_PROBE_CAP_MINUTES = 10080
 
 Const VALIDATE_STATE_HARD_FAIL = 0
 Const VALIDATE_STATE_NO_RECENT = 1
@@ -425,13 +428,16 @@ Private Function BuildCountTagFullName(ByVal machineId, ByVal statusName)
     BuildCountTagFullName = basePrefix & COUNT_TAG_PREFIX_JOINER & baseCore & COUNT_TAG_SUFFIX
 End Function
 
-Private Function ProbeCountTagArchive(ByVal cn, ByVal runtimeCatalog, ByVal tagFullName, ByVal tFrom, ByVal tTo, ByVal aggExpr, ByRef insertedRows, ByRef hasNumeric, ByRef elapsedMsValue, ByRef errDesc)
+Private Function ProbeCountTagArchive(ByVal cn, ByVal runtimeCatalog, ByVal tagFullName, ByVal tFrom, ByVal tTo, ByVal aggExpr, ByRef insertedRows, ByRef hasNumeric, ByRef elapsedMsValue, ByRef errDesc, ByRef errNumber, ByRef errSource, ByRef sqlTextOut)
     Dim cmd, rs, sqlText, cpCall, startTimer, tmp
 
     insertedRows = 0
     hasNumeric = 0
     elapsedMsValue = 0
     errDesc = ""
+    errNumber = 0
+    errSource = ""
+    sqlTextOut = ""
     ProbeCountTagArchive = False
 
     cpCall = BuildCpTagStatisticExLiteral(runtimeCatalog, tagFullName, tFrom, tTo, aggExpr)
@@ -446,14 +452,17 @@ Private Function ProbeCountTagArchive(ByVal cn, ByVal runtimeCatalog, ByVal tagF
     On Error Resume Next
     Set cmd = CreateObject("ADODB.Command")
     Set cmd.ActiveConnection = cn
-    cmd.CommandTimeout = SQL_TIMEOUT_SECONDS
+    cmd.CommandTimeout = SQL_TIMEOUT_SECONDS_PROBE
     cmd.CommandType = adCmdText
     cmd.CommandText = sqlText
+    sqlTextOut = sqlText
 
     Set rs = cmd.Execute
     elapsedMsValue = ElapsedMs(startTimer)
     If Err.Number <> 0 Then
         errDesc = S(Err.Description)
+        errNumber = CLng(Err.Number)
+        errSource = S(Err.Source)
         Err.Clear
     ElseIf Not (rs Is Nothing) Then
         If Not rs.EOF Then
@@ -483,6 +492,9 @@ Private Function ResolveStartupValidationLookbackMinutes(ByVal due1D, ByVal due7
             ResolveStartupValidationLookbackMinutes = STARTUP_VALIDATE_LOOKBACK_30D_MINUTES
         End If
     End If
+    If ResolveStartupValidationLookbackMinutes > STARTUP_VALIDATE_LOOKBACK_PROBE_CAP_MINUTES Then
+        ResolveStartupValidationLookbackMinutes = STARTUP_VALIDATE_LOOKBACK_PROBE_CAP_MINUTES
+    End If
 End Function
 
 Private Function ValidationStateName(ByVal validationState)
@@ -503,6 +515,7 @@ Private Function ValidateMachineCountTags(ByVal cn, ByVal runtimeCatalog, ByVal 
     Dim tFrom, tTo, insertedRows, hasNumeric, elapsedMsValue, errDesc
     Dim probeOk, hasArchiveData, validStatusCount, hardFailCount
     Dim aggIdx, aggCount, statusProbeSucceeded, statusHadRows, lastErrDesc
+    Dim errNumber, errSource, sqlTextOut, lastErrNumber, lastErrSource, lastSqlText
     Dim cacheTs, elapsedMins, retryIntervalMins, priorState, priorReason
 
     If g_machineValidationDone.Exists(machineId) Then
@@ -555,10 +568,13 @@ Private Function ValidateMachineCountTags(ByVal cn, ByVal runtimeCatalog, ByVal 
         statusProbeSucceeded = False
         statusHadRows = False
         lastErrDesc = ""
+        lastErrNumber = 0
+        lastErrSource = ""
+        lastSqlText = ""
 
         For aggIdx = 0 To UBound(aggs)
             aggExpr = CStr(aggs(aggIdx))
-            probeOk = ProbeCountTagArchive(cn, runtimeCatalog, tagFull, tFrom, tTo, aggExpr, insertedRows, hasNumeric, elapsedMsValue, errDesc)
+            probeOk = ProbeCountTagArchive(cn, runtimeCatalog, tagFull, tFrom, tTo, aggExpr, insertedRows, hasNumeric, elapsedMsValue, errDesc, errNumber, errSource, sqlTextOut)
             If probeOk Then
                 statusProbeSucceeded = True
                 hasArchiveData = (insertedRows > 0)
@@ -576,6 +592,9 @@ Private Function ValidateMachineCountTags(ByVal cn, ByVal runtimeCatalog, ByVal 
                 Exit For
             Else
                 lastErrDesc = errDesc
+                lastErrNumber = errNumber
+                lastErrSource = errSource
+                lastSqlText = sqlTextOut
                 LogMsg LOG_LEVEL_WARN, "StartupValidate", _
                        "machine=" & machineId & _
                        " status=" & statusName & _
@@ -583,7 +602,10 @@ Private Function ValidateMachineCountTags(ByVal cn, ByVal runtimeCatalog, ByVal 
                        " agg=" & aggExpr & _
                        " data_exists=False" & _
                        " probe_failed=1" & _
-                       " err=" & errDesc
+                       " provider_err_num=" & CStr(errNumber) & _
+                       " provider_err_source=" & errSource & _
+                       " provider_err_desc=" & errDesc & _
+                       " probe_sql=" & sqlTextOut
             End If
         Next
 
@@ -598,7 +620,10 @@ Private Function ValidateMachineCountTags(ByVal cn, ByVal runtimeCatalog, ByVal 
                    " tag_full=" & tagFull & _
                    " data_exists=False" & _
                    " probe_failed=1" & _
-                   " err=" & lastErrDesc & _
+                   " provider_err_num=" & CStr(lastErrNumber) & _
+                   " provider_err_source=" & lastErrSource & _
+                   " provider_err_desc=" & lastErrDesc & _
+                   " probe_sql=" & lastSqlText & _
                    " fallback_aggs_attempted=" & aggCount
         End If
     Next
@@ -696,9 +721,15 @@ Private Function SumStatusFractions(ByVal d)
 End Function
 
 Private Function GetAggExprList(ByVal runtimeCatalog)
-    Dim cfg
+    Dim cfg, normalizedCatalog
     cfg = PROJECT_BATCH_AGG_LIST_DEFAULT
-    If UCase(S(runtimeCatalog)) = "WINCC" Then cfg = PROJECT_BATCH_AGG_LIST_WINCC
+    normalizedCatalog = UCase(S(runtimeCatalog))
+
+    If normalizedCatalog = "WINCC" Then
+        cfg = PROJECT_BATCH_AGG_LIST_WINCC
+    ElseIf Left(normalizedCatalog, 10) = "CC_SLSGLO_" Then
+        cfg = PROJECT_BATCH_AGG_LIST_CCSLSGLO
+    End If
     GetAggExprList = Split(cfg, "|")
 End Function
 

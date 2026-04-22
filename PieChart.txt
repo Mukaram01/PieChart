@@ -1531,8 +1531,8 @@ Public Sub MainStatusAggregation(ByVal machineId)
         If g_lastRunByMachinePeriod.Exists(key) Then lastRun = g_lastRunByMachinePeriod(key)
         due7D = ShouldRun(lastRun, THROTTLE_7D_MINUTES)
 
-        key = machineId & "|30D"
         lastRun = Empty
+        key = machineId & "|30D"
         If g_lastRunByMachinePeriod.Exists(key) Then lastRun = g_lastRunByMachinePeriod(key)
         due30D = ShouldRun(lastRun, THROTTLE_30D_MINUTES)
 

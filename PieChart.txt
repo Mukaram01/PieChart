@@ -1248,19 +1248,44 @@ Private Function ExecuteStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByV
         hasUsableRow = 1
 
         fieldValue = rs.Fields("a").Value
-        If Err.Number <> 0 Then parseFieldFailure = 1 ElseIf IsNumeric(fieldValue) Then outDict("Aborted") = CDbl(fieldValue): hasNumericCount = hasNumericCount + 1
+        If Err.Number <> 0 Then
+            parseFieldFailure = 1
+        ElseIf IsNumeric(fieldValue) Then
+            outDict("Aborted") = CDbl(fieldValue)
+            hasNumericCount = hasNumericCount + 1
+        End If
         Err.Clear
         fieldValue = rs.Fields("h").Value
-        If Err.Number <> 0 Then parseFieldFailure = 1 ElseIf IsNumeric(fieldValue) Then outDict("Halted") = CDbl(fieldValue): hasNumericCount = hasNumericCount + 1
+        If Err.Number <> 0 Then
+            parseFieldFailure = 1
+        ElseIf IsNumeric(fieldValue) Then
+            outDict("Halted") = CDbl(fieldValue)
+            hasNumericCount = hasNumericCount + 1
+        End If
         Err.Clear
         fieldValue = rs.Fields("r").Value
-        If Err.Number <> 0 Then parseFieldFailure = 1 ElseIf IsNumeric(fieldValue) Then outDict("Running") = CDbl(fieldValue): hasNumericCount = hasNumericCount + 1
+        If Err.Number <> 0 Then
+            parseFieldFailure = 1
+        ElseIf IsNumeric(fieldValue) Then
+            outDict("Running") = CDbl(fieldValue)
+            hasNumericCount = hasNumericCount + 1
+        End If
         Err.Clear
         fieldValue = rs.Fields("w").Value
-        If Err.Number <> 0 Then parseFieldFailure = 1 ElseIf IsNumeric(fieldValue) Then outDict("Waiting") = CDbl(fieldValue): hasNumericCount = hasNumericCount + 1
+        If Err.Number <> 0 Then
+            parseFieldFailure = 1
+        ElseIf IsNumeric(fieldValue) Then
+            outDict("Waiting") = CDbl(fieldValue)
+            hasNumericCount = hasNumericCount + 1
+        End If
         Err.Clear
         fieldValue = rs.Fields("i").Value
-        If Err.Number <> 0 Then parseFieldFailure = 1 ElseIf IsNumeric(fieldValue) Then outDict("Interrupted") = CDbl(fieldValue): hasNumericCount = hasNumericCount + 1
+        If Err.Number <> 0 Then
+            parseFieldFailure = 1
+        ElseIf IsNumeric(fieldValue) Then
+            outDict("Interrupted") = CDbl(fieldValue)
+            hasNumericCount = hasNumericCount + 1
+        End If
         Err.Clear
 
         If rs.Fields.Count >= 20 Then

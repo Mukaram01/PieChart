@@ -2262,6 +2262,30 @@ Private Function RunWindowWithGuard(ByVal cn, ByVal rtCat, ByVal machineId, ByVa
     On Error GoTo 0
 End Function
 
+Private Function RunNoRecentWindowShortCircuitWithGuard(ByVal machineId, ByVal periodKey, ByVal reason, ByRef windowElapsedMs)
+    Dim windowTimer
+    windowElapsedMs = 0
+    windowTimer = Timer
+    On Error Resume Next
+    WriteNoRecentFallbackOutputs machineId, periodKey, reason
+    windowElapsedMs = ElapsedMs(windowTimer)
+    If Err.Number <> 0 Then
+        LogMsg LOG_LEVEL_ERROR, "RunNoRecentWindowShortCircuitWithGuard", _
+               "window_guard_error machine=" & machineId & _
+               " period=" & periodKey & _
+               " err=" & S(Err.Description)
+        Err.Clear
+        windowElapsedMs = 0
+    End If
+    LogMsg LOG_LEVEL_INFO, "RunNoRecentWindowShortCircuitWithGuard", _
+           "window_guard_short_circuit machine=" & machineId & _
+           " period=" & periodKey & _
+           " elapsed_ms=" & windowElapsedMs & _
+           " no_recent_short_circuit_applied=1"
+    RunNoRecentWindowShortCircuitWithGuard = (windowElapsedMs > WINDOW_EXEC_WARN_THRESHOLD_MS)
+    On Error GoTo 0
+End Function
+
 ' ─────────────────────────────────────────────────────────────────────
 ' Main Entry Point
 ' ─────────────────────────────────────────────────────────────────────
@@ -2275,6 +2299,7 @@ Public Sub MainStatusAggregation(ByVal machineId)
     Dim skipLowerPriority, windowElapsedMs
     Dim validationState, validationReason, validationLookbackMinutes
     Dim noRecentShortCircuitActive
+    Dim noRecentShortCircuitEligible
 
     ' WinCC VBScript does not support label-based handlers (On Error GoTo FAIL).
     On Error Resume Next
@@ -2286,6 +2311,7 @@ Public Sub MainStatusAggregation(ByVal machineId)
     canRun = True
     skipLowerPriority = False
     noRecentShortCircuitActive = False
+    noRecentShortCircuitEligible = False
     Set cn = Nothing
 
     InitGlobals
@@ -2360,19 +2386,22 @@ Public Sub MainStatusAggregation(ByVal machineId)
             guardReason = "skip_startup_validation_failed"
             canRun = False
         ElseIf validationState = VALIDATE_STATE_NO_RECENT Then
-            If STARTUP_NO_RECENT_SHORT_CIRCUIT Then
-                noRecentShortCircuitActive = True
+            noRecentShortCircuitEligible = True
+            noRecentShortCircuitActive = (STARTUP_NO_RECENT_SHORT_CIRCUIT = True)
+            If noRecentShortCircuitActive Then
                 LogMsg LOG_LEVEL_WARN, "MainStatusAggregation", _
                        "startup_no_recent_rows_short_circuit machine=" & machineId & _
                        " reason=" & validationReason & _
                        " lookback_min=" & validationLookbackMinutes & _
-                       " action=skip_db_window_aggregation_and_write_fallback_outputs"
+                       " action=skip_db_window_aggregation_and_write_fallback_outputs" & _
+                       " no_recent_short_circuit_applied=1"
             Else
                 LogMsg LOG_LEVEL_WARN, "MainStatusAggregation", _
                        "startup_validation_warning machine=" & machineId & _
                        " reason=" & validationReason & _
                        " lookback_min=" & validationLookbackMinutes & _
-                       " action=proceed_with_aggregation"
+                       " action=proceed_with_aggregation" & _
+                       " no_recent_short_circuit_applied=0"
             End If
         ElseIf validationReason = "degraded_probe_fail" Then
             LogMsg LOG_LEVEL_WARN, "MainStatusAggregation", _
@@ -2395,9 +2424,23 @@ Public Sub MainStatusAggregation(ByVal machineId)
     If canRun Then
         If due1D Then
             If noRecentShortCircuitActive Then
-                WriteNoRecentFallbackOutputs machineId, "1D", validationReason
-                g_lastRunByMachinePeriod(machineId & "|1D") = nowDT
-                guardReason = "startup_no_recent_short_circuit_1D"
+                Err.Clear
+                skipLowerPriority = RunNoRecentWindowShortCircuitWithGuard(machineId, "1D", validationReason, windowElapsedMs)
+                If Err.Number <> 0 Then
+                    LogMsg LOG_LEVEL_ERROR, "MainStatusAggregation", _
+                           "window_error machine=" & machineId & _
+                           " period=1D err=" & S(Err.Description)
+                    Err.Clear
+                Else
+                    If skipLowerPriority Then
+                        LogMsg LOG_LEVEL_WARN, "MainStatusAggregation", _
+                               "window_slow machine=" & machineId & _
+                               " period=1D elapsed_ms=" & windowElapsedMs & _
+                               " threshold_ms=" & WINDOW_EXEC_WARN_THRESHOLD_MS
+                    End If
+                    g_lastRunByMachinePeriod(machineId & "|1D") = nowDT
+                    guardReason = "startup_no_recent_short_circuit_1D"
+                End If
             Else
                 tTo = nowDT: tFrom = DateAdd("d", -1, tTo)
                 Err.Clear
@@ -2422,9 +2465,23 @@ Public Sub MainStatusAggregation(ByVal machineId)
 
         If due7D And (Not skipLowerPriority) Then
             If noRecentShortCircuitActive Then
-                WriteNoRecentFallbackOutputs machineId, "7D", validationReason
-                g_lastRunByMachinePeriod(machineId & "|7D") = nowDT
-                guardReason = "startup_no_recent_short_circuit_7D"
+                Err.Clear
+                skipLowerPriority = RunNoRecentWindowShortCircuitWithGuard(machineId, "7D", validationReason, windowElapsedMs)
+                If Err.Number <> 0 Then
+                    LogMsg LOG_LEVEL_ERROR, "MainStatusAggregation", _
+                           "window_error machine=" & machineId & _
+                           " period=7D err=" & S(Err.Description)
+                    Err.Clear
+                Else
+                    If skipLowerPriority Then
+                        LogMsg LOG_LEVEL_WARN, "MainStatusAggregation", _
+                               "window_slow machine=" & machineId & _
+                               " period=7D elapsed_ms=" & windowElapsedMs & _
+                               " threshold_ms=" & WINDOW_EXEC_WARN_THRESHOLD_MS
+                    End If
+                    g_lastRunByMachinePeriod(machineId & "|7D") = nowDT
+                    guardReason = "startup_no_recent_short_circuit_7D"
+                End If
             Else
                 tTo = nowDT: tFrom = DateAdd("d", -7, tTo)
                 Err.Clear
@@ -2449,9 +2506,23 @@ Public Sub MainStatusAggregation(ByVal machineId)
 
         If due30D And (Not skipLowerPriority) Then
             If noRecentShortCircuitActive Then
-                WriteNoRecentFallbackOutputs machineId, "30D", validationReason
-                g_lastRunByMachinePeriod(machineId & "|30D") = nowDT
-                guardReason = "startup_no_recent_short_circuit_30D"
+                Err.Clear
+                skipLowerPriority = RunNoRecentWindowShortCircuitWithGuard(machineId, "30D", validationReason, windowElapsedMs)
+                If Err.Number <> 0 Then
+                    LogMsg LOG_LEVEL_ERROR, "MainStatusAggregation", _
+                           "window_error machine=" & machineId & _
+                           " period=30D err=" & S(Err.Description)
+                    Err.Clear
+                Else
+                    If skipLowerPriority Then
+                        LogMsg LOG_LEVEL_WARN, "MainStatusAggregation", _
+                               "window_slow machine=" & machineId & _
+                               " period=30D elapsed_ms=" & windowElapsedMs & _
+                               " threshold_ms=" & WINDOW_EXEC_WARN_THRESHOLD_MS
+                    End If
+                    g_lastRunByMachinePeriod(machineId & "|30D") = nowDT
+                    guardReason = "startup_no_recent_short_circuit_30D"
+                End If
             Else
                 tTo = nowDT: tFrom = DateAdd("d", -30, tTo)
                 Err.Clear
@@ -2496,7 +2567,9 @@ CLEANUP:
            " started=" & TS3(startedAt) & _
            " ended=" & TS3(completedAt) & _
            " elapsed_ms=" & totalElapsedMs & _
-           " reason=" & guardReason
+           " reason=" & guardReason & _
+           " no_recent_short_circuit_eligible=" & CStr(noRecentShortCircuitEligible) & _
+           " no_recent_short_circuit_applied=" & CStr(noRecentShortCircuitActive)
     Exit Sub
 End Sub
 

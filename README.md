@@ -63,6 +63,9 @@ Validation/retry intent:
 - Tracks validation state (`HARD_FAIL`, `NO_RECENT`, `OK`).
 - Retries hard failures quickly and normal revalidation less frequently.
 - Supports a startup behavior flag to optionally block writes when probe checks fail.
+- Includes a compatibility gate (`STARTUP_NO_RECENT_SHORT_CIRCUIT`) for `NO_RECENT` startup state handling:
+  - `False` (default): keep legacy behavior and continue normal SQL window aggregation (`AggregatePeriod` path).
+  - `True`: early-exit each due window and write deterministic fallback outputs directly (skips per-window DB aggregation reads).
 
 ---
 
@@ -82,6 +85,7 @@ Key constants maintainers should know:
 - `RETRY_BACKOFF_MS`
 - `RETRY_BACKOFF_TIMEOUT_MS`
 - `WINDOW_EXEC_WARN_THRESHOLD_MS`
+- `STARTUP_NO_RECENT_SHORT_CIRCUIT` (startup `NO_RECENT` early-exit gate; default `False` for compatibility)
 
 ### Zero-total rendering behavior
 - `RENDER_ZERO_TOTAL_AS_FALLBACK_PIE`
@@ -156,6 +160,12 @@ Active level is controlled by:
 - Provider switch warnings (`MSOLEDBSQL` → `SQLNCLI11`).
 - Validation state transitions and retry timing.
 - Repeated write or aggregation warnings for a specific machine/period.
+- Startup `NO_RECENT` branch markers:
+  - `startup_validation_warning ... no_recent_short_circuit_applied=0` means legacy aggregation path remains active.
+  - `startup_no_recent_rows_short_circuit ... no_recent_short_circuit_applied=1` means DB aggregation was bypassed and fallback outputs were written.
+- Runtime/window coherence markers during short-circuit mode:
+  - `RunNoRecentWindowShortCircuitWithGuard` logs `window_guard_short_circuit` and elapsed time per due period.
+  - `runtime_guard` now includes `no_recent_short_circuit_eligible` and `no_recent_short_circuit_applied`.
 
 ---
 

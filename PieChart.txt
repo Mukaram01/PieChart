@@ -97,6 +97,7 @@ Dim g_validationBadAggUntil
 Dim g_batchResultCache
 Dim g_statusTagFullNameCache
 Dim g_lastAggUsed
+Dim g_preferredBatchAggByMachineCatalog
 Dim G_MACHINES
 Dim g_inited
 
@@ -130,6 +131,7 @@ Private Sub InitGlobals()
     Set g_validationBadAggUntil = CreateObject("Scripting.Dictionary")
     Set g_batchResultCache = CreateObject("Scripting.Dictionary")
     Set g_statusTagFullNameCache = CreateObject("Scripting.Dictionary")
+    Set g_preferredBatchAggByMachineCatalog = CreateObject("Scripting.Dictionary")
 
     Set G_MACHINES = CreateObject("Scripting.Dictionary")
     ' MachineId → Tag-logging prefix (left of backslash)
@@ -439,7 +441,7 @@ End Function
 Private Function TryAvgFraction(ByVal cn, ByVal runtimeCatalog, ByVal tagFull, ByVal t1, ByVal t2, ByVal machineId, ByVal periodKey, ByVal statusName)
     Dim v, baseTag, aggList
 
-    aggList = Array("AVG(RealValue)", "AVG(Value)", "AVG(ValueScaled)")
+    aggList = GetAggExprListForMachineCatalog(runtimeCatalog, machineId)
 
     v = TryAggListForTag(cn, runtimeCatalog, tagFull, t1, t2, aggList, machineId, periodKey, statusName)
     If IsNumeric(v) Then TryAvgFraction = v : Exit Function
@@ -563,6 +565,7 @@ Private Function ValidateMachineCountTags(ByVal cn, ByVal runtimeCatalog, ByVal 
     Dim errNumber, errSource, sqlTextOut, lastErrNumber, lastErrSource, lastSqlText
     Dim cacheTs, elapsedMins, retryIntervalMins, priorState, priorReason
     Dim attemptedAggCount, cooldownSkipCount, stopReason
+    Dim aggSuccessCount, aggNumericCount, winnerAgg, winnerNumericCount, winnerSuccessCount
 
     If g_machineValidationDone.Exists(machineId) Then
         priorState = CLng(g_machineValidationState(machineId))
@@ -603,6 +606,13 @@ Private Function ValidateMachineCountTags(ByVal cn, ByVal runtimeCatalog, ByVal 
     statuses = Array("Aborted", "Halted", "Running", "Waiting", "Interrupted")
     aggs = GetAggExprList(runtimeCatalog)
     aggCount = UBound(aggs) + 1
+    Set aggSuccessCount = CreateObject("Scripting.Dictionary")
+    Set aggNumericCount = CreateObject("Scripting.Dictionary")
+    For aggIdx = 0 To UBound(aggs)
+        aggExpr = CStr(aggs(aggIdx))
+        aggSuccessCount.Add aggExpr, 0
+        aggNumericCount.Add aggExpr, 0
+    Next
     tTo = Now()
     tFrom = DateAdd("n", -lookbackMinutes, tTo)
     validStatusCount = 0
@@ -635,6 +645,8 @@ Private Function ValidateMachineCountTags(ByVal cn, ByVal runtimeCatalog, ByVal 
                     statusProbeSucceeded = True
                     hasArchiveData = (insertedRows > 0)
                     If hasArchiveData Then statusHadRows = True
+                    aggSuccessCount(aggExpr) = CLng(aggSuccessCount(aggExpr)) + 1
+                    If hasNumeric Then aggNumericCount(aggExpr) = CLng(aggNumericCount(aggExpr)) + 1
                     LogMsg LOG_LEVEL_INFO, "StartupValidate", _
                            "machine=" & machineId & _
                            " status=" & statusName & _
@@ -680,6 +692,28 @@ Private Function ValidateMachineCountTags(ByVal cn, ByVal runtimeCatalog, ByVal 
                    " fallback_stop_reason=" & stopReason
         End If
     Next
+
+    winnerAgg = ""
+    winnerNumericCount = -1
+    winnerSuccessCount = -1
+    For aggIdx = 0 To UBound(aggs)
+        aggExpr = CStr(aggs(aggIdx))
+        If CLng(aggSuccessCount(aggExpr)) > 0 Then
+            If CLng(aggNumericCount(aggExpr)) > winnerNumericCount Then
+                winnerAgg = aggExpr
+                winnerNumericCount = CLng(aggNumericCount(aggExpr))
+                winnerSuccessCount = CLng(aggSuccessCount(aggExpr))
+            ElseIf CLng(aggNumericCount(aggExpr)) = winnerNumericCount Then
+                If CLng(aggSuccessCount(aggExpr)) > winnerSuccessCount Then
+                    winnerAgg = aggExpr
+                    winnerSuccessCount = CLng(aggSuccessCount(aggExpr))
+                End If
+            End If
+        End If
+    Next
+    If Len(winnerAgg) > 0 Then
+        PersistBatchAggWinner machineId, runtimeCatalog, winnerAgg, "startup_validate"
+    End If
 
     g_machineValidationDone(machineId) = True
 
@@ -805,6 +839,71 @@ Private Function GetAggExprList(ByVal runtimeCatalog)
         cfg = PROJECT_BATCH_AGG_LIST_CCSLSGLO
     End If
     GetAggExprList = Split(cfg, "|")
+End Function
+
+Private Function BuildMachineCatalogAggKey(ByVal machineId, ByVal runtimeCatalog)
+    BuildMachineCatalogAggKey = machineId & "|" & UCase(S(runtimeCatalog))
+End Function
+
+Private Function GetPersistedBatchAgg(ByVal machineId, ByVal runtimeCatalog)
+    Dim cacheKey
+    cacheKey = BuildMachineCatalogAggKey(machineId, runtimeCatalog)
+    GetPersistedBatchAgg = ""
+    If g_preferredBatchAggByMachineCatalog.Exists(cacheKey) Then
+        GetPersistedBatchAgg = CStr(g_preferredBatchAggByMachineCatalog(cacheKey))
+    End If
+End Function
+
+Private Sub PersistBatchAggWinner(ByVal machineId, ByVal runtimeCatalog, ByVal aggExpr, ByVal src)
+    Dim cacheKey, priorAgg
+    cacheKey = BuildMachineCatalogAggKey(machineId, runtimeCatalog)
+    priorAgg = ""
+    If g_preferredBatchAggByMachineCatalog.Exists(cacheKey) Then
+        priorAgg = CStr(g_preferredBatchAggByMachineCatalog(cacheKey))
+    End If
+
+    g_preferredBatchAggByMachineCatalog(cacheKey) = aggExpr
+    If priorAgg <> aggExpr Then
+        LogMsg LOG_LEVEL_INFO, "BatchAgg", _
+               "winner_updated machine=" & machineId & _
+               " catalog=" & runtimeCatalog & _
+               " agg=" & aggExpr & _
+               " source=" & src & _
+               " prior=" & priorAgg
+    End If
+End Sub
+
+Private Function GetAggExprListForMachineCatalog(ByVal runtimeCatalog, ByVal machineId)
+    Dim baseAggs, preferredAgg, preferredIdx, idx, orderedAggs
+    baseAggs = GetAggExprList(runtimeCatalog)
+    preferredAgg = GetPersistedBatchAgg(machineId, runtimeCatalog)
+    preferredIdx = -1
+
+    If Len(preferredAgg) > 0 Then
+        For idx = LBound(baseAggs) To UBound(baseAggs)
+            If CStr(baseAggs(idx)) = preferredAgg Then
+                preferredIdx = idx
+                Exit For
+            End If
+        Next
+    End If
+
+    If preferredIdx <= 0 Then
+        GetAggExprListForMachineCatalog = baseAggs
+        Exit Function
+    End If
+
+    ReDim orderedAggs(UBound(baseAggs))
+    orderedAggs(0) = preferredAgg
+    For idx = LBound(baseAggs) To UBound(baseAggs)
+        If idx < preferredIdx Then
+            orderedAggs(idx + 1) = baseAggs(idx)
+        ElseIf idx > preferredIdx Then
+            orderedAggs(idx) = baseAggs(idx)
+        End If
+    Next
+
+    GetAggExprListForMachineCatalog = orderedAggs
 End Function
 
 Private Function ExecuteStatusFractionsSingleFallback(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal periodKey, ByVal t1, ByVal t2, ByVal tagMap, ByRef numericCount)
@@ -1092,8 +1191,10 @@ Private Function GetStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal m
     Dim selectedAgg, selectedIdx, aggTrialSummary, currentTrial, fastFailApplied, fallbackUsed, zeroInsertedWarnLogged
     Dim queryFailureCount
     Dim tagMap, allowFallbackAggs, selectedPath
+    Dim persistedAggAtStart
 
-    aggs = GetAggExprList(runtimeCatalog)
+    aggs = GetAggExprListForMachineCatalog(runtimeCatalog, machineId)
+    persistedAggAtStart = GetPersistedBatchAgg(machineId, runtimeCatalog)
     Set tagMap = BuildStatusTagMap(machineId, periodKey, t1, t2)
     bestNumericCount = -1
     bestSum = -1
@@ -1231,7 +1332,8 @@ SkipBestSelection:
            " sql_to=" & TS3(t2) & _
            " trials=[" & aggTrialSummary & "]" & _
            " fast_fail=" & fastFailApplied & _
-           " data_path=" & selectedPath
+           " data_path=" & selectedPath & _
+           " startup_or_cached_agg=" & persistedAggAtStart
 
     If IsObject(bestDict) Then
         If Not (bestDict Is Nothing) Then
@@ -1287,6 +1389,17 @@ SkipBestSelection:
            " fallback_used=" & fallbackUsed & _
            " numeric=" & bestNumericCount & _
            " sum=" & bestSum & _
+           " data_path=" & selectedPath
+
+    If Len(selectedAgg) > 0 Then
+        PersistBatchAggWinner machineId, runtimeCatalog, selectedAgg, "batch_execute"
+    End If
+
+    LogMsg LOG_LEVEL_INFO, "GetStatusFractionsBatch", _
+           "batch_execution_final_agg machine=" & machineId & _
+           " window=" & periodKey & _
+           " catalog=" & runtimeCatalog & _
+           " agg=" & selectedAgg & _
            " data_path=" & selectedPath
 
     Set GetStatusFractionsBatch = bestDict

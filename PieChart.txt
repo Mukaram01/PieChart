@@ -27,6 +27,8 @@ Const SQL_INSTANCE           = ".\WinCC"
 Const INITIAL_CATALOG        = "master"
 Const SQL_TIMEOUT_SECONDS    = 45
 Const SQL_TIMEOUT_SECONDS_PROBE = 12
+Const SQL_TIMEOUT_SECONDS_STARTUP_VALIDATE = 10
+Const SQL_TIMEOUT_SECONDS_NORMAL_AGG = 45
 Const MAX_RETRY_ATTEMPTS     = 2
 Const RETRY_BACKOFF_MS       = 250
 Const RETRY_BACKOFF_TIMEOUT_MS = 1250
@@ -56,6 +58,11 @@ Const STARTUP_VALIDATE_LOOKBACK_1D_MINUTES  = 1440
 Const STARTUP_VALIDATE_LOOKBACK_7D_MINUTES  = 10080
 Const STARTUP_VALIDATE_LOOKBACK_30D_MINUTES = 43200
 Const STARTUP_VALIDATE_LOOKBACK_PROBE_CAP_MINUTES = 10080
+Const STARTUP_VALIDATE_SHORT_WINDOW_1_MINUTES = 60
+Const STARTUP_VALIDATE_SHORT_WINDOW_2_MINUTES = 1440
+Const STARTUP_VALIDATE_TIMEOUT_CACHE_COOLDOWN_MINUTES = 45
+Const STARTUP_VALIDATE_TIMEOUT_BUDGET_MS = 20000
+Const NORMAL_AGG_TIMEOUT_BUDGET_MS = 35000
 Const STATUS_TAG_CACHE_MAX_ENTRIES = 256
 Const BATCH_RESULT_CACHE_MAX_ENTRIES = 384
 
@@ -98,6 +105,7 @@ Dim g_batchResultCache
 Dim g_statusTagFullNameCache
 Dim g_lastAggUsed
 Dim g_preferredBatchAggByMachineCatalog
+Dim g_startupProbeTimeoutUntil
 Dim G_MACHINES
 Dim g_inited
 
@@ -132,6 +140,7 @@ Private Sub InitGlobals()
     Set g_batchResultCache = CreateObject("Scripting.Dictionary")
     Set g_statusTagFullNameCache = CreateObject("Scripting.Dictionary")
     Set g_preferredBatchAggByMachineCatalog = CreateObject("Scripting.Dictionary")
+    Set g_startupProbeTimeoutUntil = CreateObject("Scripting.Dictionary")
 
     Set G_MACHINES = CreateObject("Scripting.Dictionary")
     ' MachineId → Tag-logging prefix (left of backslash)
@@ -305,6 +314,48 @@ Private Sub MarkValidationBadAggCooldown(ByVal machineId, ByVal statusName, ByVa
     g_validationBadAggUntil(cacheKey) = untilTs
 End Sub
 
+Private Function BuildStartupProbeTimeoutKey(ByVal runtimeCatalog, ByVal machineId, ByVal tagFullName)
+    BuildStartupProbeTimeoutKey = UCase(S(runtimeCatalog)) & "|" & machineId & "|" & tagFullName
+End Function
+
+Private Function IsStartupProbeTimeoutOnCooldown(ByVal runtimeCatalog, ByVal machineId, ByVal tagFullName)
+    Dim cacheKey, untilTs
+    cacheKey = BuildStartupProbeTimeoutKey(runtimeCatalog, machineId, tagFullName)
+    IsStartupProbeTimeoutOnCooldown = False
+    If Not g_startupProbeTimeoutUntil.Exists(cacheKey) Then Exit Function
+
+    untilTs = CDate(g_startupProbeTimeoutUntil(cacheKey))
+    If DateDiff("s", Now(), untilTs) > 0 Then
+        IsStartupProbeTimeoutOnCooldown = True
+    Else
+        g_startupProbeTimeoutUntil.Remove cacheKey
+    End If
+End Function
+
+Private Sub MarkStartupProbeTimeoutCooldown(ByVal runtimeCatalog, ByVal machineId, ByVal tagFullName)
+    Dim cacheKey, untilTs
+    cacheKey = BuildStartupProbeTimeoutKey(runtimeCatalog, machineId, tagFullName)
+    untilTs = DateAdd("n", STARTUP_VALIDATE_TIMEOUT_CACHE_COOLDOWN_MINUTES, Now())
+    g_startupProbeTimeoutUntil(cacheKey) = untilTs
+End Sub
+
+Private Function ResolveStartupValidationLookbackSequence(ByVal lookbackMinutes)
+    Dim seq(), seqCount
+    seqCount = 0
+    ReDim seq(2)
+
+    seq(seqCount) = STARTUP_VALIDATE_SHORT_WINDOW_1_MINUTES: seqCount = seqCount + 1
+    If lookbackMinutes > STARTUP_VALIDATE_SHORT_WINDOW_1_MINUTES Then
+        seq(seqCount) = STARTUP_VALIDATE_SHORT_WINDOW_2_MINUTES: seqCount = seqCount + 1
+    End If
+    If lookbackMinutes > STARTUP_VALIDATE_SHORT_WINDOW_2_MINUTES Then
+        seq(seqCount) = lookbackMinutes: seqCount = seqCount + 1
+    End If
+
+    ReDim Preserve seq(seqCount - 1)
+    ResolveStartupValidationLookbackSequence = seq
+End Function
+
 ' ─────────────────────────────────────────────────────────────────────
 ' cp_TagStatisticEx (short retry, null-safe)
 ' ─────────────────────────────────────────────────────────────────────
@@ -325,7 +376,7 @@ Private Function ExecCpTagStatisticEx(ByVal cn, ByVal runtimeCatalog, ByVal tagF
 
         Set cmd = CreateObject("ADODB.Command")
         Set cmd.ActiveConnection = cn
-        cmd.CommandTimeout = SQL_TIMEOUT_SECONDS
+        cmd.CommandTimeout = SQL_TIMEOUT_SECONDS_NORMAL_AGG
         cmd.CommandType = adCmdText
 
         sSql = "cp_TagStatisticEx '" & runtimeCatalog & "'," & _
@@ -499,7 +550,7 @@ Private Function ProbeCountTagArchive(ByVal cn, ByVal runtimeCatalog, ByVal tagF
     On Error Resume Next
     Set cmd = CreateObject("ADODB.Command")
     Set cmd.ActiveConnection = cn
-    cmd.CommandTimeout = SQL_TIMEOUT_SECONDS_PROBE
+    cmd.CommandTimeout = SQL_TIMEOUT_SECONDS_STARTUP_VALIDATE
     cmd.CommandType = adCmdText
     cmd.CommandText = sqlText
     sqlTextOut = sqlText
@@ -566,6 +617,10 @@ Private Function ValidateMachineCountTags(ByVal cn, ByVal runtimeCatalog, ByVal 
     Dim cacheTs, elapsedMins, retryIntervalMins, priorState, priorReason
     Dim attemptedAggCount, cooldownSkipCount, stopReason
     Dim aggSuccessCount, aggNumericCount, winnerAgg, winnerNumericCount, winnerSuccessCount
+    Dim lookbackSeq, windowIdx, windowMinutes
+    Dim timeoutBudgetStart, timeoutBudgetUsedMs, timeoutBudgetRemainingMs
+    Dim budgetStopTriggered, machineStopReason
+    Dim timeoutCooldownSkipCount, timeoutStopCount, probeAttemptCount
 
     If g_machineValidationDone.Exists(machineId) Then
         priorState = CLng(g_machineValidationState(machineId))
@@ -592,6 +647,12 @@ Private Function ValidateMachineCountTags(ByVal cn, ByVal runtimeCatalog, ByVal 
                    " prior_reason=" & priorReason & _
                    " age_min=" & elapsedMins & _
                    " retry_interval_min=" & retryIntervalMins
+            LogMsg LOG_LEVEL_INFO, "StartupValidate", _
+                   "probe_budget_summary machine=" & machineId & _
+                   " catalog=" & runtimeCatalog & _
+                   " budget_used_ms=0 budget_limit_ms=" & STARTUP_VALIDATE_TIMEOUT_BUDGET_MS & _
+                   " budget_remaining_ms=" & STARTUP_VALIDATE_TIMEOUT_BUDGET_MS & _
+                   " probe_attempts=0 timeout_cooldown_skips=0 timeout_stops=0 hard_fail_count=0 stop_reason=cache_reused"
             Exit Function
         End If
 
@@ -617,6 +678,13 @@ Private Function ValidateMachineCountTags(ByVal cn, ByVal runtimeCatalog, ByVal 
     tFrom = DateAdd("n", -lookbackMinutes, tTo)
     validStatusCount = 0
     hardFailCount = 0
+    timeoutCooldownSkipCount = 0
+    timeoutStopCount = 0
+    probeAttemptCount = 0
+    budgetStopTriggered = False
+    machineStopReason = "completed"
+    timeoutBudgetStart = Timer
+    lookbackSeq = ResolveStartupValidationLookbackSequence(lookbackMinutes)
 
     For idx = 0 To UBound(statuses)
         statusName = CStr(statuses(idx))
@@ -631,46 +699,82 @@ Private Function ValidateMachineCountTags(ByVal cn, ByVal runtimeCatalog, ByVal 
         cooldownSkipCount = 0
         stopReason = "all_aggs_failed"
 
-        For aggIdx = 0 To UBound(aggs)
-            aggExpr = CStr(aggs(aggIdx))
-            If IsValidationBadAggOnCooldown(machineId, statusName, aggExpr) Then
-                cooldownSkipCount = cooldownSkipCount + 1
-                If cooldownSkipCount = aggCount Then
-                    stopReason = "all_aggs_on_cooldown"
-                End If
-            Else
-                attemptedAggCount = attemptedAggCount + 1
-                probeOk = ProbeCountTagArchive(cn, runtimeCatalog, tagFull, tFrom, tTo, aggExpr, insertedRows, hasNumeric, elapsedMsValue, errDesc, errNumber, errSource, sqlTextOut)
-                If probeOk Then
-                    statusProbeSucceeded = True
-                    hasArchiveData = (insertedRows > 0)
-                    If hasArchiveData Then statusHadRows = True
-                    aggSuccessCount(aggExpr) = CLng(aggSuccessCount(aggExpr)) + 1
-                    If hasNumeric Then aggNumericCount(aggExpr) = CLng(aggNumericCount(aggExpr)) + 1
-                    LogMsg LOG_LEVEL_INFO, "StartupValidate", _
-                           "machine=" & machineId & _
-                           " status=" & statusName & _
-                           " tag_full=" & tagFull & _
-                           " agg=" & aggExpr & _
-                           " data_exists=" & CStr(hasArchiveData) & _
-                           " inserted_rows=" & insertedRows & _
-                           " has_numeric=" & hasNumeric & _
-                           " lookback_min=" & lookbackMinutes & _
-                           " elapsed_ms=" & elapsedMsValue
-                    Exit For
-                Else
-                    MarkValidationBadAggCooldown machineId, statusName, aggExpr
-                    lastErrDesc = errDesc
-                    lastErrNumber = errNumber
-                    lastErrSource = errSource
-                    lastSqlText = sqlTextOut
-                    If ShouldStopAggFallbackForError(errDesc, errSource) Then
-                        stopReason = "timeout_or_provider_internal"
+        If IsStartupProbeTimeoutOnCooldown(runtimeCatalog, machineId, tagFull) Then
+            stopReason = "timeout_cooldown_active"
+            timeoutCooldownSkipCount = timeoutCooldownSkipCount + 1
+            If machineStopReason = "completed" Then machineStopReason = "timeout_cooldown_active"
+        Else
+            For windowIdx = LBound(lookbackSeq) To UBound(lookbackSeq)
+                windowMinutes = CLng(lookbackSeq(windowIdx))
+                tTo = Now()
+                tFrom = DateAdd("n", -windowMinutes, tTo)
+
+                For aggIdx = 0 To UBound(aggs)
+                    timeoutBudgetUsedMs = ElapsedMs(timeoutBudgetStart)
+                    timeoutBudgetRemainingMs = STARTUP_VALIDATE_TIMEOUT_BUDGET_MS - timeoutBudgetUsedMs
+                    If timeoutBudgetRemainingMs <= 0 Then
+                        budgetStopTriggered = True
+                        machineStopReason = "startup_probe_budget_exhausted"
+                        stopReason = "probe_budget_exhausted"
                         Exit For
                     End If
-                End If
-            End If
-        Next
+
+                    aggExpr = CStr(aggs(aggIdx))
+                    If IsValidationBadAggOnCooldown(machineId, statusName, aggExpr) Then
+                        cooldownSkipCount = cooldownSkipCount + 1
+                        If cooldownSkipCount = aggCount Then
+                            stopReason = "all_aggs_on_cooldown"
+                        End If
+                    Else
+                        attemptedAggCount = attemptedAggCount + 1
+                        probeAttemptCount = probeAttemptCount + 1
+                        probeOk = ProbeCountTagArchive(cn, runtimeCatalog, tagFull, tFrom, tTo, aggExpr, insertedRows, hasNumeric, elapsedMsValue, errDesc, errNumber, errSource, sqlTextOut)
+                        If probeOk Then
+                            statusProbeSucceeded = True
+                            hasArchiveData = (insertedRows > 0)
+                            If hasArchiveData Then
+                                statusHadRows = True
+                                stopReason = "short_circuit_data_found_" & windowMinutes & "m"
+                            Else
+                                stopReason = "short_circuit_no_rows_" & windowMinutes & "m"
+                            End If
+                            aggSuccessCount(aggExpr) = CLng(aggSuccessCount(aggExpr)) + 1
+                            If hasNumeric Then aggNumericCount(aggExpr) = CLng(aggNumericCount(aggExpr)) + 1
+                            LogMsg LOG_LEVEL_INFO, "StartupValidate", _
+                                   "machine=" & machineId & _
+                                   " status=" & statusName & _
+                                   " tag_full=" & tagFull & _
+                                   " agg=" & aggExpr & _
+                                   " data_exists=" & CStr(hasArchiveData) & _
+                                   " inserted_rows=" & insertedRows & _
+                                   " has_numeric=" & hasNumeric & _
+                                   " lookback_min=" & windowMinutes & _
+                                   " elapsed_ms=" & elapsedMsValue
+                            Exit For
+                        Else
+                            MarkValidationBadAggCooldown machineId, statusName, aggExpr
+                            lastErrDesc = errDesc
+                            lastErrNumber = errNumber
+                            lastErrSource = errSource
+                            lastSqlText = sqlTextOut
+                            If IsTimeoutLikeError(errDesc) Then
+                                MarkStartupProbeTimeoutCooldown runtimeCatalog, machineId, tagFull
+                            End If
+                            If ShouldStopAggFallbackForError(errDesc, errSource) Then
+                                stopReason = "timeout_or_provider_internal"
+                                timeoutStopCount = timeoutStopCount + 1
+                                If machineStopReason = "completed" Then machineStopReason = "timeout_or_provider_internal"
+                                Exit For
+                            End If
+                        End If
+                    End If
+                Next
+
+                If statusProbeSucceeded Then Exit For
+                If stopReason = "timeout_or_provider_internal" Then Exit For
+                If stopReason = "probe_budget_exhausted" Then Exit For
+            Next
+        End If
 
         hasArchiveData = statusHadRows
         If hasArchiveData Then validStatusCount = validStatusCount + 1
@@ -691,6 +795,8 @@ Private Function ValidateMachineCountTags(ByVal cn, ByVal runtimeCatalog, ByVal 
                    " fallback_aggs_skipped_cooldown=" & cooldownSkipCount & _
                    " fallback_stop_reason=" & stopReason
         End If
+
+        If budgetStopTriggered Then Exit For
     Next
 
     winnerAgg = ""
@@ -719,6 +825,7 @@ Private Function ValidateMachineCountTags(ByVal cn, ByVal runtimeCatalog, ByVal 
 
     If hardFailCount > 0 Then
         validationState = VALIDATE_STATE_HARD_FAIL
+        If machineStopReason = "completed" Then machineStopReason = "hard_fail_probe_or_schema_error"
         If STARTUP_VALIDATION_BLOCK_WRITES_ON_PROBE_FAIL Then
             validationReason = "hard_fail_probe_or_schema_error"
             g_machineValidationOk(machineId) = False
@@ -741,11 +848,13 @@ Private Function ValidateMachineCountTags(ByVal cn, ByVal runtimeCatalog, ByVal 
     ElseIf validStatusCount > 0 Then
         validationState = VALIDATE_STATE_OK
         validationReason = "valid_recent_rows_detected"
+        If machineStopReason = "completed" Then machineStopReason = "valid_recent_rows_detected"
         g_machineValidationOk(machineId) = True
         ValidateMachineCountTags = True
     Else
         validationState = VALIDATE_STATE_NO_RECENT
         validationReason = "no_recent_rows_in_lookback"
+        If machineStopReason = "completed" Then machineStopReason = "no_recent_rows_in_lookback"
         g_machineValidationOk(machineId) = True
         ValidateMachineCountTags = True
         LogMsg LOG_LEVEL_WARN, "StartupValidate", _
@@ -758,6 +867,21 @@ Private Function ValidateMachineCountTags(ByVal cn, ByVal runtimeCatalog, ByVal 
     g_machineValidationState(machineId) = validationState
     g_machineValidationReason(machineId) = validationReason
     g_machineValidationLastTs(machineId) = Now()
+
+    timeoutBudgetUsedMs = ElapsedMs(timeoutBudgetStart)
+    timeoutBudgetRemainingMs = STARTUP_VALIDATE_TIMEOUT_BUDGET_MS - timeoutBudgetUsedMs
+    If timeoutBudgetRemainingMs < 0 Then timeoutBudgetRemainingMs = 0
+    LogMsg LOG_LEVEL_INFO, "StartupValidate", _
+           "probe_budget_summary machine=" & machineId & _
+           " catalog=" & runtimeCatalog & _
+           " budget_used_ms=" & timeoutBudgetUsedMs & _
+           " budget_limit_ms=" & STARTUP_VALIDATE_TIMEOUT_BUDGET_MS & _
+           " budget_remaining_ms=" & timeoutBudgetRemainingMs & _
+           " probe_attempts=" & probeAttemptCount & _
+           " timeout_cooldown_skips=" & timeoutCooldownSkipCount & _
+           " timeout_stops=" & timeoutStopCount & _
+           " hard_fail_count=" & hardFailCount & _
+           " stop_reason=" & machineStopReason
 End Function
 
 Private Function BuildCpTagStatisticExLiteral(ByVal runtimeCatalog, ByVal tagFullName, ByVal tFrom, ByVal tTo, ByVal aggExpr)
@@ -1098,7 +1222,7 @@ Private Function ExecuteStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByV
     On Error Resume Next
     Set cmd = CreateObject("ADODB.Command")
     Set cmd.ActiveConnection = cn
-    cmd.CommandTimeout = SQL_TIMEOUT_SECONDS
+    cmd.CommandTimeout = SQL_TIMEOUT_SECONDS_NORMAL_AGG
     cmd.CommandType = adCmdText
     cmd.CommandText = sqlText
 
@@ -1309,6 +1433,7 @@ Private Function GetStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal m
     Dim queryFailureCount
     Dim tagMap, allowFallbackAggs, selectedPath
     Dim persistedAggAtStart
+    Dim aggBudgetStart, aggBudgetUsedMs, aggBudgetRemainingMs, aggBudgetStopReason
 
     aggs = GetAggExprListForMachineCatalog(runtimeCatalog, machineId)
     persistedAggAtStart = GetPersistedBatchAgg(machineId, runtimeCatalog)
@@ -1324,9 +1449,17 @@ Private Function GetStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal m
     queryFailureCount = 0
     allowFallbackAggs = 0
     selectedPath = "no_data"
+    aggBudgetStart = Timer
+    aggBudgetStopReason = "completed"
     Set bestDict = Nothing
 
     For idx = 0 To UBound(aggs)
+        aggBudgetUsedMs = ElapsedMs(aggBudgetStart)
+        aggBudgetRemainingMs = NORMAL_AGG_TIMEOUT_BUDGET_MS - aggBudgetUsedMs
+        If aggBudgetRemainingMs <= 0 Then
+            aggBudgetStopReason = "normal_agg_budget_exhausted"
+            Exit For
+        End If
         If idx > 0 And allowFallbackAggs = 0 And queryFailureCount = 0 Then Exit For
 
         aggExpr = CStr(aggs(idx))
@@ -1456,6 +1589,9 @@ SkipBestSelection:
     Next
 
     If selectedIdx > 0 Then fallbackUsed = 1
+    aggBudgetUsedMs = ElapsedMs(aggBudgetStart)
+    aggBudgetRemainingMs = NORMAL_AGG_TIMEOUT_BUDGET_MS - aggBudgetUsedMs
+    If aggBudgetRemainingMs < 0 Then aggBudgetRemainingMs = 0
 
     LogMsg LOG_LEVEL_INFO, "GetStatusFractionsBatch", _
            "agg_trials machine=" & machineId & _
@@ -1466,7 +1602,11 @@ SkipBestSelection:
            " trials=[" & aggTrialSummary & "]" & _
            " fast_fail=" & fastFailApplied & _
            " data_path=" & selectedPath & _
-           " startup_or_cached_agg=" & persistedAggAtStart
+           " startup_or_cached_agg=" & persistedAggAtStart & _
+           " budget_used_ms=" & aggBudgetUsedMs & _
+           " budget_limit_ms=" & NORMAL_AGG_TIMEOUT_BUDGET_MS & _
+           " budget_remaining_ms=" & aggBudgetRemainingMs & _
+           " budget_stop_reason=" & aggBudgetStopReason
 
     If IsObject(bestDict) Then
         If Not (bestDict Is Nothing) Then

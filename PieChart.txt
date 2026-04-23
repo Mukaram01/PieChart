@@ -1194,7 +1194,10 @@ Private Function GetStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal m
 End Function
 
 Private Function GetCountFraction(ByVal statusFractions, ByVal statusName)
-    If (statusFractions Is Nothing) Then
+    On Error Resume Next
+    If (Not IsObject(statusFractions)) Then
+        GetCountFraction = 0
+    ElseIf (statusFractions Is Nothing) Then
         GetCountFraction = 0
     ElseIf statusFractions.Exists(statusName) Then
         If IsNumeric(statusFractions(statusName)) Then
@@ -1205,6 +1208,14 @@ Private Function GetCountFraction(ByVal statusFractions, ByVal statusName)
     Else
         GetCountFraction = 0
     End If
+    If Err.Number <> 0 Then
+        LogMsg LOG_LEVEL_WARN, "GetCombinedFractions", _
+               "status_fraction_object_invalid status=" & S(statusName) & _
+               " err=" & S(Err.Description)
+        Err.Clear
+        GetCountFraction = 0
+    End If
+    On Error GoTo 0
 End Function
 
 ' ─────────────────────────────────────────────────────────────────────
@@ -1218,7 +1229,20 @@ Private Sub GetCombinedFractions(ByVal cn, ByVal runtimeCatalog, ByVal machineId
     inputValid = False
 
     Set statusFractions = GetStatusFractionsBatch(cn, runtimeCatalog, machineId, periodKey, t1, t2)
-    If statusFractions Is Nothing Then Exit Sub
+    If Not IsObject(statusFractions) Then
+        LogMsg LOG_LEVEL_WARN, "GetCombinedFractions", _
+               "invalid_input_mode_continuing machineId=" & machineId & _
+               " periodKey=" & periodKey & _
+               " reason=batch_query_failure_or_invalid_result"
+        Exit Sub
+    End If
+    If statusFractions Is Nothing Then
+        LogMsg LOG_LEVEL_WARN, "GetCombinedFractions", _
+               "invalid_input_mode_continuing machineId=" & machineId & _
+               " periodKey=" & periodKey & _
+               " reason=batch_query_failure_or_invalid_result"
+        Exit Sub
+    End If
     inputValid = True
 
     a = GetCountFraction(statusFractions, "Aborted")
@@ -1261,12 +1285,30 @@ Private Function IsPieChartOutputTag(ByVal tag)
 End Function
 
 Private Sub WriteTag(ByVal tag, ByVal val)
-    Dim readBack, requestedVal, delta, isPieChartTag
+    Dim readBack, requestedVal, delta, isPieChartTag, hmiTag
 
     isPieChartTag = IsPieChartOutputTag(tag)
 
     On Error Resume Next
-    HMIRuntime.Tags(tag).Write val
+    Set hmiTag = HMIRuntime.Tags(tag)
+    If Err.Number <> 0 Then
+        LogMsg LOG_LEVEL_WARN, "HMITag", "Resolve failed: " & S(tag) & " -> " & S(Err.Description)
+        Err.Clear
+        On Error GoTo 0
+        Exit Sub
+    End If
+    If Not IsObject(hmiTag) Then
+        LogMsg LOG_LEVEL_WARN, "HMITag", "Resolve returned invalid object: " & S(tag)
+        On Error GoTo 0
+        Exit Sub
+    End If
+    If hmiTag Is Nothing Then
+        LogMsg LOG_LEVEL_WARN, "HMITag", "Resolve returned invalid object: " & S(tag)
+        On Error GoTo 0
+        Exit Sub
+    End If
+
+    hmiTag.Write val
     If Err.Number <> 0 Then
         LogMsg LOG_LEVEL_WARN, "HMITag", "Write failed: " & S(tag) & " -> " & S(Err.Description)
         Err.Clear
@@ -1279,7 +1321,7 @@ Private Sub WriteTag(ByVal tag, ByVal val)
     End If
 
     If CURRENT_LOG_LEVEL >= LOG_LEVEL_DEBUG And isPieChartTag Then
-        readBack = HMIRuntime.Tags(tag).Read
+        readBack = hmiTag.Read
         If Err.Number <> 0 Then
             LogMsg LOG_LEVEL_WARN, "HMITag", "Read-back failed: " & S(tag) & " -> " & S(Err.Description)
             Err.Clear

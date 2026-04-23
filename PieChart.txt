@@ -80,6 +80,7 @@ Const LOG_LEVEL_DEBUG        = 4
 ' IMPORTANT: must be literal in WinCC VBScript
 Const CURRENT_LOG_LEVEL      = 3
 Const WRITE_VERIFY_TOLERANCE = 0.01
+Const SCRIPT_VERSION         = "PieChart-2026-04-23-qualified-status-aliases-v1"
 
 ' ─────────────────────────────────────────────────────────────────────
 ' Runtime state
@@ -144,6 +145,8 @@ Private Sub InitGlobals()
     G_MACHINES.Add "MNA_0235", "WFL_M120_MNA_0235"
     G_MACHINES.Add "MNA_0237", "WFL_M50_MNA_0237"
     G_MACHINES.Add "MNA_0411", "Mazak_MNA_0411"
+
+    LogMsg LOG_LEVEL_INFO, "InitGlobals", "script_version=" & SCRIPT_VERSION
 
     g_inited = True
 End Sub

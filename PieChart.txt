@@ -76,7 +76,9 @@ Const VALIDATE_RETRY_HARD_FAIL_MINUTES = 2
 Const VALIDATE_RETRY_NORMAL_MINUTES = 180
 Const STARTUP_VALIDATION_BLOCK_WRITES_ON_PROBE_FAIL = False
 Const VALIDATE_BAD_AGG_COOLDOWN_MINUTES = 20
-Const STARTUP_NO_RECENT_SHORT_CIRCUIT = True
+' Legacy-compatible behavior: do not bypass SQL window aggregation when startup probes
+' report no recent rows; continue with normal aggregation path and write standard outputs.
+Const STARTUP_NO_RECENT_SHORT_CIRCUIT = False
 
 Const adCmdText              = 1
 Const adStateOpen            = 1

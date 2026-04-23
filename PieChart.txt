@@ -80,8 +80,8 @@ Const VALIDATE_RETRY_HARD_FAIL_MINUTES = 2
 Const VALIDATE_RETRY_NORMAL_MINUTES = 180
 Const STARTUP_VALIDATION_BLOCK_WRITES_ON_PROBE_FAIL = False
 Const VALIDATE_BAD_AGG_COOLDOWN_MINUTES = 20
-' Legacy-compatible behavior: do not bypass SQL window aggregation when startup probes
-' report no recent rows; continue with normal aggregation path and write standard outputs.
+' Legacy-compatible behavior: default remains False so startup NO_RECENT keeps normal
+' SQL window aggregation until operations explicitly enable this short-circuit.
 Const STARTUP_NO_RECENT_SHORT_CIRCUIT = False
 
 Const adCmdText              = 1
@@ -2348,6 +2348,8 @@ Public Sub MainStatusAggregation(ByVal machineId)
     Dim validationState, validationReason, validationLookbackMinutes
     Dim noRecentShortCircuitActive
     Dim noRecentShortCircuitEligible
+    Dim noRecentStateWithinCooldown, noRecentStateTs
+    Dim noRecentCooldownUntil, noRecentStateAgeMinutes
 
     ' WinCC VBScript does not support label-based handlers (On Error GoTo FAIL).
     On Error Resume Next
@@ -2434,22 +2436,36 @@ Public Sub MainStatusAggregation(ByVal machineId)
             guardReason = "skip_startup_validation_failed"
             canRun = False
         ElseIf validationState = VALIDATE_STATE_NO_RECENT Then
-            noRecentShortCircuitEligible = True
-            noRecentShortCircuitActive = (STARTUP_NO_RECENT_SHORT_CIRCUIT = True)
+            noRecentStateTs = nowDT
+            If g_machineValidationLastTs.Exists(machineId) Then
+                noRecentStateTs = CDate(g_machineValidationLastTs(machineId))
+            End If
+            noRecentStateAgeMinutes = DateDiff("n", noRecentStateTs, nowDT)
+            If noRecentStateAgeMinutes < 0 Then noRecentStateAgeMinutes = 0
+            noRecentCooldownUntil = DateAdd("n", VALIDATE_RETRY_NORMAL_MINUTES, noRecentStateTs)
+            noRecentStateWithinCooldown = (DateDiff("s", nowDT, noRecentCooldownUntil) > 0)
+
+            noRecentShortCircuitEligible = noRecentStateWithinCooldown
+            noRecentShortCircuitActive = (STARTUP_NO_RECENT_SHORT_CIRCUIT = True) And noRecentStateWithinCooldown
+
             If noRecentShortCircuitActive Then
                 LogMsg LOG_LEVEL_WARN, "MainStatusAggregation", _
-                       "startup_no_recent_rows_short_circuit machine=" & machineId & _
+                       "startup_validation_warning machine=" & machineId & _
                        " reason=" & validationReason & _
                        " lookback_min=" & validationLookbackMinutes & _
                        " action=skip_db_window_aggregation_and_write_fallback_outputs" & _
-                       " no_recent_short_circuit_applied=1"
+                       " no_recent_short_circuit_applied=1" & _
+                       " cooldown_until=" & TS3(noRecentCooldownUntil) & _
+                       " state_age_minutes=" & noRecentStateAgeMinutes
             Else
                 LogMsg LOG_LEVEL_WARN, "MainStatusAggregation", _
                        "startup_validation_warning machine=" & machineId & _
                        " reason=" & validationReason & _
                        " lookback_min=" & validationLookbackMinutes & _
                        " action=proceed_with_aggregation" & _
-                       " no_recent_short_circuit_applied=0"
+                       " no_recent_short_circuit_applied=0" & _
+                       " cooldown_until=" & TS3(noRecentCooldownUntil) & _
+                       " state_age_minutes=" & noRecentStateAgeMinutes
             End If
         ElseIf validationReason = "degraded_probe_fail" Then
             LogMsg LOG_LEVEL_WARN, "MainStatusAggregation", _

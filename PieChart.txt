@@ -76,7 +76,9 @@ Const VALIDATE_RETRY_HARD_FAIL_MINUTES = 2
 Const VALIDATE_RETRY_NORMAL_MINUTES = 180
 Const STARTUP_VALIDATION_BLOCK_WRITES_ON_PROBE_FAIL = False
 Const VALIDATE_BAD_AGG_COOLDOWN_MINUTES = 20
-Const STARTUP_NO_RECENT_SHORT_CIRCUIT = True
+' Legacy-compatible behavior: do not bypass SQL window aggregation when startup probes
+' report no recent rows; continue with normal aggregation path and write standard outputs.
+Const STARTUP_NO_RECENT_SHORT_CIRCUIT = False
 
 Const adCmdText              = 1
 Const adStateOpen            = 1
@@ -1098,6 +1100,7 @@ Private Function ExecuteStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByV
     Dim valA, valH, valR, valW, valI
     Dim cacheKey, cacheEntry
     Dim queryFailureKind, queryFailureDetail, hasUsableRow, parseFieldFailure
+    Dim foundDataRecordset
 
     startedAt = Now
     startTimer = Timer
@@ -1271,96 +1274,110 @@ Private Function ExecuteStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByV
         queryFailureKind = "db_query_failed"
         queryFailureDetail = S(Err.Description)
         Err.Clear
-    ElseIf (rs Is Nothing) Then
-        queryFailureKind = "empty_result"
-        queryFailureDetail = "recordset_is_nothing"
-    ElseIf rs.EOF Then
-        queryFailureKind = "empty_result"
-        queryFailureDetail = "recordset_eof"
-    ElseIf rs.Fields.Count < 5 Then
-        queryFailureKind = "parse_failure"
-        queryFailureDetail = "fields_lt_5"
     Else
-        hasUsableRow = 1
+        foundDataRecordset = 0
+        Do While Not (rs Is Nothing)
+            If rs.Fields.Count >= 5 Then
+                foundDataRecordset = 1
+                Exit Do
+            End If
+            Set rs = rs.NextRecordset
+            If Err.Number <> 0 Then
+                queryFailureKind = "parse_failure"
+                queryFailureDetail = "next_recordset_failed"
+                Err.Clear
+                Exit Do
+            End If
+        Loop
 
-        fieldValue = rs.Fields("a").Value
-        If Err.Number <> 0 Then
-            parseFieldFailure = 1
-        ElseIf IsNumeric(fieldValue) Then
-            outDict("Aborted") = CDbl(fieldValue)
-            hasNumericCount = hasNumericCount + 1
-        End If
-        Err.Clear
-        fieldValue = rs.Fields("h").Value
-        If Err.Number <> 0 Then
-            parseFieldFailure = 1
-        ElseIf IsNumeric(fieldValue) Then
-            outDict("Halted") = CDbl(fieldValue)
-            hasNumericCount = hasNumericCount + 1
-        End If
-        Err.Clear
-        fieldValue = rs.Fields("r").Value
-        If Err.Number <> 0 Then
-            parseFieldFailure = 1
-        ElseIf IsNumeric(fieldValue) Then
-            outDict("Running") = CDbl(fieldValue)
-            hasNumericCount = hasNumericCount + 1
-        End If
-        Err.Clear
-        fieldValue = rs.Fields("w").Value
-        If Err.Number <> 0 Then
-            parseFieldFailure = 1
-        ElseIf IsNumeric(fieldValue) Then
-            outDict("Waiting") = CDbl(fieldValue)
-            hasNumericCount = hasNumericCount + 1
-        End If
-        Err.Clear
-        fieldValue = rs.Fields("i").Value
-        If Err.Number <> 0 Then
-            parseFieldFailure = 1
-        ElseIf IsNumeric(fieldValue) Then
-            outDict("Interrupted") = CDbl(fieldValue)
-            hasNumericCount = hasNumericCount + 1
-        End If
-        Err.Clear
-
-        If rs.Fields.Count >= 20 Then
-            insertedRowsValue = rs.Fields("a_rows").Value: If IsNumeric(insertedRowsValue) Then diagRows("a") = CLng(insertedRowsValue)
-            insertedRowsValue = rs.Fields("h_rows").Value: If IsNumeric(insertedRowsValue) Then diagRows("h") = CLng(insertedRowsValue)
-            insertedRowsValue = rs.Fields("r_rows").Value: If IsNumeric(insertedRowsValue) Then diagRows("r") = CLng(insertedRowsValue)
-            insertedRowsValue = rs.Fields("w_rows").Value: If IsNumeric(insertedRowsValue) Then diagRows("w") = CLng(insertedRowsValue)
-            insertedRowsValue = rs.Fields("i_rows").Value: If IsNumeric(insertedRowsValue) Then diagRows("i") = CLng(insertedRowsValue)
-
-            isNumericValue = rs.Fields("a_num").Value: If IsNumeric(isNumericValue) Then diagNumeric("a") = CLng(isNumericValue)
-            isNumericValue = rs.Fields("h_num").Value: If IsNumeric(isNumericValue) Then diagNumeric("h") = CLng(isNumericValue)
-            isNumericValue = rs.Fields("r_num").Value: If IsNumeric(isNumericValue) Then diagNumeric("r") = CLng(isNumericValue)
-            isNumericValue = rs.Fields("w_num").Value: If IsNumeric(isNumericValue) Then diagNumeric("w") = CLng(isNumericValue)
-            isNumericValue = rs.Fields("i_num").Value: If IsNumeric(isNumericValue) Then diagNumeric("i") = CLng(isNumericValue)
-
-            statusElapsedMs = rs.Fields("a_ms").Value: If IsNumeric(statusElapsedMs) Then diagElapsedMs("a") = CLng(statusElapsedMs)
-            statusElapsedMs = rs.Fields("h_ms").Value: If IsNumeric(statusElapsedMs) Then diagElapsedMs("h") = CLng(statusElapsedMs)
-            statusElapsedMs = rs.Fields("r_ms").Value: If IsNumeric(statusElapsedMs) Then diagElapsedMs("r") = CLng(statusElapsedMs)
-            statusElapsedMs = rs.Fields("w_ms").Value: If IsNumeric(statusElapsedMs) Then diagElapsedMs("w") = CLng(statusElapsedMs)
-            statusElapsedMs = rs.Fields("i_ms").Value: If IsNumeric(statusElapsedMs) Then diagElapsedMs("i") = CLng(statusElapsedMs)
-        End If
-        If rs.Fields.Count >= 30 Then
-            errNumberValue = rs.Fields("a_err_num").Value: If IsNumeric(errNumberValue) Then diagErrNum("a") = CLng(errNumberValue)
-            errNumberValue = rs.Fields("h_err_num").Value: If IsNumeric(errNumberValue) Then diagErrNum("h") = CLng(errNumberValue)
-            errNumberValue = rs.Fields("r_err_num").Value: If IsNumeric(errNumberValue) Then diagErrNum("r") = CLng(errNumberValue)
-            errNumberValue = rs.Fields("w_err_num").Value: If IsNumeric(errNumberValue) Then diagErrNum("w") = CLng(errNumberValue)
-            errNumberValue = rs.Fields("i_err_num").Value: If IsNumeric(errNumberValue) Then diagErrNum("i") = CLng(errNumberValue)
-
-            errMessageValue = rs.Fields("a_err_msg").Value: If Not IsNull(errMessageValue) Then diagErrMsg("a") = CStr(errMessageValue)
-            errMessageValue = rs.Fields("h_err_msg").Value: If Not IsNull(errMessageValue) Then diagErrMsg("h") = CStr(errMessageValue)
-            errMessageValue = rs.Fields("r_err_msg").Value: If Not IsNull(errMessageValue) Then diagErrMsg("r") = CStr(errMessageValue)
-            errMessageValue = rs.Fields("w_err_msg").Value: If Not IsNull(errMessageValue) Then diagErrMsg("w") = CStr(errMessageValue)
-            errMessageValue = rs.Fields("i_err_msg").Value: If Not IsNull(errMessageValue) Then diagErrMsg("i") = CStr(errMessageValue)
-        End If
-        If parseFieldFailure <> 0 Then
-            queryFailureKind = "parse_failure"
-            queryFailureDetail = "field_access_error"
+        If foundDataRecordset = 0 Then
+            queryFailureKind = "empty_result"
+            queryFailureDetail = "recordset_eof_or_no_data_recordset"
+        ElseIf rs.EOF Then
+            queryFailureKind = "empty_result"
+            queryFailureDetail = "recordset_eof"
         Else
-            batchOk = 1
+            hasUsableRow = 1
+
+            fieldValue = rs.Fields("a").Value
+            If Err.Number <> 0 Then
+                parseFieldFailure = 1
+            ElseIf IsNumeric(fieldValue) Then
+                outDict("Aborted") = CDbl(fieldValue)
+                hasNumericCount = hasNumericCount + 1
+            End If
+            Err.Clear
+            fieldValue = rs.Fields("h").Value
+            If Err.Number <> 0 Then
+                parseFieldFailure = 1
+            ElseIf IsNumeric(fieldValue) Then
+                outDict("Halted") = CDbl(fieldValue)
+                hasNumericCount = hasNumericCount + 1
+            End If
+            Err.Clear
+            fieldValue = rs.Fields("r").Value
+            If Err.Number <> 0 Then
+                parseFieldFailure = 1
+            ElseIf IsNumeric(fieldValue) Then
+                outDict("Running") = CDbl(fieldValue)
+                hasNumericCount = hasNumericCount + 1
+            End If
+            Err.Clear
+            fieldValue = rs.Fields("w").Value
+            If Err.Number <> 0 Then
+                parseFieldFailure = 1
+            ElseIf IsNumeric(fieldValue) Then
+                outDict("Waiting") = CDbl(fieldValue)
+                hasNumericCount = hasNumericCount + 1
+            End If
+            Err.Clear
+            fieldValue = rs.Fields("i").Value
+            If Err.Number <> 0 Then
+                parseFieldFailure = 1
+            ElseIf IsNumeric(fieldValue) Then
+                outDict("Interrupted") = CDbl(fieldValue)
+                hasNumericCount = hasNumericCount + 1
+            End If
+            Err.Clear
+
+            If rs.Fields.Count >= 20 Then
+                insertedRowsValue = rs.Fields("a_rows").Value: If IsNumeric(insertedRowsValue) Then diagRows("a") = CLng(insertedRowsValue)
+                insertedRowsValue = rs.Fields("h_rows").Value: If IsNumeric(insertedRowsValue) Then diagRows("h") = CLng(insertedRowsValue)
+                insertedRowsValue = rs.Fields("r_rows").Value: If IsNumeric(insertedRowsValue) Then diagRows("r") = CLng(insertedRowsValue)
+                insertedRowsValue = rs.Fields("w_rows").Value: If IsNumeric(insertedRowsValue) Then diagRows("w") = CLng(insertedRowsValue)
+                insertedRowsValue = rs.Fields("i_rows").Value: If IsNumeric(insertedRowsValue) Then diagRows("i") = CLng(insertedRowsValue)
+
+                isNumericValue = rs.Fields("a_num").Value: If IsNumeric(isNumericValue) Then diagNumeric("a") = CLng(isNumericValue)
+                isNumericValue = rs.Fields("h_num").Value: If IsNumeric(isNumericValue) Then diagNumeric("h") = CLng(isNumericValue)
+                isNumericValue = rs.Fields("r_num").Value: If IsNumeric(isNumericValue) Then diagNumeric("r") = CLng(isNumericValue)
+                isNumericValue = rs.Fields("w_num").Value: If IsNumeric(isNumericValue) Then diagNumeric("w") = CLng(isNumericValue)
+                isNumericValue = rs.Fields("i_num").Value: If IsNumeric(isNumericValue) Then diagNumeric("i") = CLng(isNumericValue)
+
+                statusElapsedMs = rs.Fields("a_ms").Value: If IsNumeric(statusElapsedMs) Then diagElapsedMs("a") = CLng(statusElapsedMs)
+                statusElapsedMs = rs.Fields("h_ms").Value: If IsNumeric(statusElapsedMs) Then diagElapsedMs("h") = CLng(statusElapsedMs)
+                statusElapsedMs = rs.Fields("r_ms").Value: If IsNumeric(statusElapsedMs) Then diagElapsedMs("r") = CLng(statusElapsedMs)
+                statusElapsedMs = rs.Fields("w_ms").Value: If IsNumeric(statusElapsedMs) Then diagElapsedMs("w") = CLng(statusElapsedMs)
+                statusElapsedMs = rs.Fields("i_ms").Value: If IsNumeric(statusElapsedMs) Then diagElapsedMs("i") = CLng(statusElapsedMs)
+            End If
+            If rs.Fields.Count >= 30 Then
+                errNumberValue = rs.Fields("a_err_num").Value: If IsNumeric(errNumberValue) Then diagErrNum("a") = CLng(errNumberValue)
+                errNumberValue = rs.Fields("h_err_num").Value: If IsNumeric(errNumberValue) Then diagErrNum("h") = CLng(errNumberValue)
+                errNumberValue = rs.Fields("r_err_num").Value: If IsNumeric(errNumberValue) Then diagErrNum("r") = CLng(errNumberValue)
+                errNumberValue = rs.Fields("w_err_num").Value: If IsNumeric(errNumberValue) Then diagErrNum("w") = CLng(errNumberValue)
+                errNumberValue = rs.Fields("i_err_num").Value: If IsNumeric(errNumberValue) Then diagErrNum("i") = CLng(errNumberValue)
+
+                errMessageValue = rs.Fields("a_err_msg").Value: If Not IsNull(errMessageValue) Then diagErrMsg("a") = CStr(errMessageValue)
+                errMessageValue = rs.Fields("h_err_msg").Value: If Not IsNull(errMessageValue) Then diagErrMsg("h") = CStr(errMessageValue)
+                errMessageValue = rs.Fields("r_err_msg").Value: If Not IsNull(errMessageValue) Then diagErrMsg("r") = CStr(errMessageValue)
+                errMessageValue = rs.Fields("w_err_msg").Value: If Not IsNull(errMessageValue) Then diagErrMsg("w") = CStr(errMessageValue)
+                errMessageValue = rs.Fields("i_err_msg").Value: If Not IsNull(errMessageValue) Then diagErrMsg("i") = CStr(errMessageValue)
+            End If
+            If parseFieldFailure <> 0 Then
+                queryFailureKind = "parse_failure"
+                queryFailureDetail = "field_access_error"
+            Else
+                batchOk = 1
+            End If
         End If
     End If
 

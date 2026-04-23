@@ -1,183 +1,36 @@
 ' ======================================================================
-'  WinCC Global Script: Status % Aggregation (FINAL)
-'
-'  - Uses ONLY *_Count tags (binary 0/1 archived every 500ms)
-'  - Reads 5 base statuses:
-'       Aborted, Halted, Running, Waiting, Interrupted
-'  - Combines into 3 outputs (names UNCHANGED):
-'       Aborted  = Aborted + Waiting
-'       Halted   = Halted  + Interrupted
-'       Running  = Running
-'
-'  OUTPUT TAGS (unchanged):
-'    <Machine>_<Period>_Machine_<Status>_Percentage              (can be 0)
-'    <Machine>_<Period>_Machine_<Status>_Percentage_PieChart     (min 1)
-'
-'  Periods: 1D / 7D / 30D
+' WinCC Global Script: Status % Aggregation (Simplified / Production-Safe)
 ' ======================================================================
-
 Option Explicit
 
-' ─────────────────────────────────────────────────────────────────────
-' Configuration
-' ─────────────────────────────────────────────────────────────────────
-Const DEFAULT_PROVIDER       = "MSOLEDBSQL"
-Const FALLBACK_PROVIDER      = "SQLNCLI11"
-Const SQL_INSTANCE           = ".\WinCC"
-Const INITIAL_CATALOG        = "master"
-Const SQL_TIMEOUT_SECONDS    = 45
-Const SQL_TIMEOUT_SECONDS_PROBE = 12
-Const SQL_TIMEOUT_SECONDS_STARTUP_VALIDATE = 10
-Const SQL_TIMEOUT_SECONDS_NORMAL_AGG = 45
-Const SQL_TIMEOUT_SECONDS_LONG_AGG = 90
-Const NORMAL_AGG_TIMEOUT_BUDGET_MS_1D = 35000
-Const NORMAL_AGG_TIMEOUT_BUDGET_MS_7D = 70000
-Const NORMAL_AGG_TIMEOUT_BUDGET_MS_30D = 110000
-Const MIN_QUERY_START_BUDGET_MS = 1500
-Const LONG_WINDOW_SAFETY_RESERVE_MS = 5000
-Const MIN_PRACTICAL_QUERY_TIMEOUT_SECONDS = 2
-Const AGG_BUDGET_LOG_OVERHEAD_MS = 250
-Const MAX_RETRY_ATTEMPTS     = 2
-Const RETRY_BACKOFF_MS       = 250
-Const RETRY_BACKOFF_TIMEOUT_MS = 1250
+Const DEFAULT_PROVIDER = "MSOLEDBSQL"
+Const FALLBACK_PROVIDER = "SQLNCLI11"
+Const SQL_INSTANCE = ".\WinCC"
+Const INITIAL_CATALOG = "master"
+Const SQL_TIMEOUT_SECONDS = 45
 Const WINDOW_EXEC_WARN_THRESHOLD_MS = 15000
 
-' Toggle zero-total rendering for valid windows (totalPct=0).
-' True  = render deterministic fallback pie (34/33/33).
-' False = preserve legacy all-zero pie output for idle windows (ops can require this).
-Const RENDER_ZERO_TOTAL_AS_FALLBACK_PIE = True
+Const THROTTLE_1D_MINUTES = 30
+Const THROTTLE_7D_MINUTES = 360
+Const THROTTLE_30D_MINUTES = 1440
 
-' Project-specific batch aggregation configuration (ordered by preference).
-' Use "|" to separate expressions. Keep first expression as known-good for
-' your archive schema and list fallbacks after it.
-Const PROJECT_BATCH_AGG_LIST_DEFAULT = "AVG(RealValue)|AVG(Value)|AVG(ValueScaled)"
-Const PROJECT_BATCH_AGG_LIST_WINCC   = "AVG(Value)|AVG(RealValue)|AVG(ValueScaled)"
-Const PROJECT_BATCH_AGG_LIST_CCSLSGLO = "AVG(Value)|AVG(RealValue)|AVG(ValueScaled)"
+Const COUNT_TAG_PREFIX_JOINER = "\"
+Const COUNT_TAG_CORE_TEMPLATE = "{MACHINE_ID}_ProgramStatus_{STATUS_NAME}"
+Const COUNT_TAG_SUFFIX = "_Count"
+Const FIXED_AGG_EXPR = "AVG(RealValue)"
 
-Const THROTTLE_1D_MINUTES    = 30    ' every 30 minutes
-Const THROTTLE_7D_MINUTES    = 360   ' every 6 hours
-Const THROTTLE_30D_MINUTES   = 1440  ' every 24 hours
+Const adCmdText = 1
+Const adStateOpen = 1
 
-' Source tag full-name pattern pieces (configurable)
-Const COUNT_TAG_PREFIX_JOINER          = "\"
-Const COUNT_TAG_CORE_TEMPLATE          = "{MACHINE_ID}_ProgramStatus_{STATUS_NAME}"
-Const COUNT_TAG_SUFFIX                 = "_Count"
-Const STARTUP_VALIDATE_LOOKBACK_1D_MINUTES  = 1440
-Const STARTUP_VALIDATE_LOOKBACK_7D_MINUTES  = 10080
-Const STARTUP_VALIDATE_LOOKBACK_30D_MINUTES = 43200
-Const STARTUP_VALIDATE_LOOKBACK_PROBE_CAP_MINUTES = 43200
-Const STARTUP_VALIDATE_SHORT_WINDOW_1_MINUTES = 60
-Const STARTUP_VALIDATE_SHORT_WINDOW_2_MINUTES = 1440
-Const STARTUP_VALIDATE_TIMEOUT_CACHE_COOLDOWN_MINUTES = 45
-Const STARTUP_VALIDATE_TIMEOUT_BUDGET_MS = 20000
-Const STATUS_TAG_CACHE_MAX_ENTRIES = 256
-Const BATCH_RESULT_CACHE_MAX_ENTRIES = 384
+Const LOG_LEVEL_ERROR = 1
+Const LOG_LEVEL_WARN = 2
+Const LOG_LEVEL_INFO = 3
+Const CURRENT_LOG_LEVEL = 3
 
-Const VALIDATE_STATE_HARD_FAIL = 0
-Const VALIDATE_STATE_NO_RECENT = 1
-Const VALIDATE_STATE_OK = 2
-Const VALIDATE_RETRY_HARD_FAIL_MINUTES = 2
-Const VALIDATE_RETRY_NORMAL_MINUTES = 180
-Const STARTUP_VALIDATION_BLOCK_WRITES_ON_PROBE_FAIL = False
-Const VALIDATE_BAD_AGG_COOLDOWN_MINUTES = 20
-' Legacy-compatible behavior: default remains False so startup NO_RECENT keeps normal
-' SQL window aggregation until operations explicitly enable this short-circuit.
-Const STARTUP_NO_RECENT_SHORT_CIRCUIT = False
-
-Const adCmdText              = 1
-Const adStateOpen            = 1
-
-' ─────────────────────────────────────────────────────────────────────
-' Log Levels
-' ─────────────────────────────────────────────────────────────────────
-Const LOG_LEVEL_ERROR        = 1
-Const LOG_LEVEL_WARN         = 2
-Const LOG_LEVEL_INFO         = 3
-Const LOG_LEVEL_DEBUG        = 4
-
-' IMPORTANT: must be literal in WinCC VBScript
-Const CURRENT_LOG_LEVEL      = 3
-Const WRITE_VERIFY_TOLERANCE = 0.01
-Const SCRIPT_VERSION         = "PieChart-2026-04-23-startup-lookback-cap-30d-v1"
-
-' ─────────────────────────────────────────────────────────────────────
-' Runtime state
-' ─────────────────────────────────────────────────────────────────────
 Dim g_lastRunByMachinePeriod
-Dim g_machineLocks
-Dim g_machineValidationOk
-Dim g_machineValidationDone
-Dim g_machineValidationState
-Dim g_machineValidationReason
-Dim g_machineValidationLastTs
-Dim g_validationBadAggUntil
-Dim g_batchResultCache
-Dim g_statusTagFullNameCache
-Dim g_lastAggUsed
-Dim g_preferredBatchAggByMachineCatalog
-Dim g_startupProbeTimeoutUntil
 Dim G_MACHINES
 Dim g_inited
 
-' ─────────────────────────────────────────────────────────────────────
-' Redundancy helper
-' ─────────────────────────────────────────────────────────────────────
-Private Function IsMaster()
-    On Error Resume Next
-    IsMaster = (CLng(HMIRuntime.Tags("@RM_MASTER").Read) = 1)
-    If Err.Number <> 0 Then
-        ' Fail-open for standalone / tag not present
-        IsMaster = True
-        Err.Clear
-    End If
-    On Error GoTo 0
-End Function
-
-' ─────────────────────────────────────────────────────────────────────
-' Init dictionaries
-' ─────────────────────────────────────────────────────────────────────
-Private Sub InitGlobals()
-    If g_inited Then Exit Sub
-
-    Set g_lastRunByMachinePeriod = CreateObject("Scripting.Dictionary")
-    Set g_machineLocks = CreateObject("Scripting.Dictionary")
-    Set g_machineValidationOk = CreateObject("Scripting.Dictionary")
-    Set g_machineValidationDone = CreateObject("Scripting.Dictionary")
-    Set g_machineValidationState = CreateObject("Scripting.Dictionary")
-    Set g_machineValidationReason = CreateObject("Scripting.Dictionary")
-    Set g_machineValidationLastTs = CreateObject("Scripting.Dictionary")
-    Set g_validationBadAggUntil = CreateObject("Scripting.Dictionary")
-    Set g_batchResultCache = CreateObject("Scripting.Dictionary")
-    Set g_statusTagFullNameCache = CreateObject("Scripting.Dictionary")
-    Set g_preferredBatchAggByMachineCatalog = CreateObject("Scripting.Dictionary")
-    Set g_startupProbeTimeoutUntil = CreateObject("Scripting.Dictionary")
-
-    Set G_MACHINES = CreateObject("Scripting.Dictionary")
-    ' MachineId → Tag-logging prefix (left of backslash)
-    G_MACHINES.Add "MNA_0269", "DMG_Mori1_MNA_0269"
-    G_MACHINES.Add "MNA_0270", "DMG_Mori2_MNA_0270"
-    G_MACHINES.Add "MNA_0332", "DMG_Mori3_MNA_0332"
-
-    ' Wheelabrator
-    G_MACHINES.Add "MNA_0164", "Wheelabrator_MNP_0164"
-
-    ' Droop & Rein
-    G_MACHINES.Add "MNA_0085", "Droop_Rein_1_MNA_0085_LM33H"
-    G_MACHINES.Add "MNA_0087", "Droop_Rein_4_MNA_0087_LM33F"
-
-    ' MLG Mill Turns
-    G_MACHINES.Add "MNA_0235", "WFL_M120_MNA_0235"
-    G_MACHINES.Add "MNA_0237", "WFL_M50_MNA_0237"
-    G_MACHINES.Add "MNA_0411", "Mazak_MNA_0411"
-
-    LogMsg LOG_LEVEL_INFO, "InitGlobals", "script_version=" & SCRIPT_VERSION
-
-    g_inited = True
-End Sub
-
-' ─────────────────────────────────────────────────────────────────────
-' Logging (Null-safe)
-' ─────────────────────────────────────────────────────────────────────
 Private Function S(ByVal v)
     On Error Resume Next
     If IsNull(v) Or IsEmpty(v) Or IsObject(v) Then
@@ -192,34 +45,66 @@ Private Function S(ByVal v)
     On Error GoTo 0
 End Function
 
+Private Function TS3(ByVal dt)
+    TS3 = Year(dt) & "-" & Right("0" & Month(dt),2) & "-" & Right("0" & Day(dt),2) & _
+          " " & Right("0" & Hour(dt),2) & ":" & Right("0" & Minute(dt),2) & ":" & Right("0" & Second(dt),2) & ".000"
+End Function
+
+Private Function ElapsedMs(ByVal timerStart)
+    Dim timerEnd
+    timerEnd = Timer
+    If timerEnd < timerStart Then timerEnd = timerEnd + 86400
+    ElapsedMs = CLng((timerEnd - timerStart) * 1000)
+End Function
+
 Private Sub LogMsg(ByVal level, ByVal src, ByVal msg)
     If level > CURRENT_LOG_LEVEL Then Exit Sub
     On Error Resume Next
-    HMIRuntime.Trace _
-        FormatDateTime(Now(), vbShortDate) & " " & _
-        FormatDateTime(Now(), vbLongTime) & " [PieChart/" & src & "] " & S(msg) & vbCrLf
+    HMIRuntime.Trace FormatDateTime(Now(), vbShortDate) & " " & _
+                     FormatDateTime(Now(), vbLongTime) & " [PieChart/" & src & "] " & S(msg) & vbCrLf
     On Error GoTo 0
 End Sub
 
-Private Sub SleepMs(ByVal ms)
+Private Function IsMaster()
     On Error Resume Next
-    HMIRuntime.Sleep ms
+    IsMaster = (CLng(HMIRuntime.Tags("@RM_MASTER").Read) = 1)
+    If Err.Number <> 0 Then
+        IsMaster = True
+        Err.Clear
+    End If
     On Error GoTo 0
+End Function
+
+Private Sub InitGlobals()
+    If g_inited Then Exit Sub
+
+    Set g_lastRunByMachinePeriod = CreateObject("Scripting.Dictionary")
+    Set G_MACHINES = CreateObject("Scripting.Dictionary")
+
+    G_MACHINES.Add "MNA_0269", "DMG_Mori1_MNA_0269"
+    G_MACHINES.Add "MNA_0270", "DMG_Mori2_MNA_0270"
+    G_MACHINES.Add "MNA_0332", "DMG_Mori3_MNA_0332"
+    G_MACHINES.Add "MNA_0164", "Wheelabrator_MNP_0164"
+    G_MACHINES.Add "MNA_0085", "Droop_Rein_1_MNA_0085_LM33H"
+    G_MACHINES.Add "MNA_0087", "Droop_Rein_4_MNA_0087_LM33F"
+    G_MACHINES.Add "MNA_0235", "WFL_M120_MNA_0235"
+    G_MACHINES.Add "MNA_0237", "WFL_M50_MNA_0237"
+    G_MACHINES.Add "MNA_0411", "Mazak_MNA_0411"
+
+    g_inited = True
+    LogMsg LOG_LEVEL_INFO, "InitGlobals", "initialized"
 End Sub
 
-' ─────────────────────────────────────────────────────────────────────
-' SQL helpers
-' ─────────────────────────────────────────────────────────────────────
 Private Function OpenConnection()
     On Error Resume Next
     Dim cn, prov
-    prov = DEFAULT_PROVIDER
 
+    prov = DEFAULT_PROVIDER
     Set cn = CreateObject("ADODB.Connection")
     cn.Open "Provider=" & prov & ";Data Source=" & SQL_INSTANCE & ";Initial Catalog=" & INITIAL_CATALOG & ";Integrated Security=SSPI;"
 
     If Err.Number <> 0 Then
-        LogMsg LOG_LEVEL_WARN, "OpenConnection", "Switching provider to " & FALLBACK_PROVIDER & " (" & S(Err.Description) & ")"
+        LogMsg LOG_LEVEL_WARN, "InitGlobals", "provider_fallback=" & FALLBACK_PROVIDER & " reason=" & S(Err.Description)
         Err.Clear
         prov = FALLBACK_PROVIDER
         Set cn = CreateObject("ADODB.Connection")
@@ -227,7 +112,7 @@ Private Function OpenConnection()
     End If
 
     If Err.Number <> 0 Then
-        LogMsg LOG_LEVEL_ERROR, "OpenConnection", "ERROR: " & S(Err.Description)
+        LogMsg LOG_LEVEL_ERROR, "InitGlobals", "sql_open_failed=" & S(Err.Description)
         Set cn = Nothing
         Err.Clear
     End If
@@ -248,285 +133,41 @@ Private Sub CloseConn(ByVal cn)
 End Sub
 
 Private Function GetRuntimeCatalog()
-    On Error Resume Next
     Dim cat
+    On Error Resume Next
     cat = HMIRuntime.Tags("@DatasourceNameRT").Read
-    If Err.Number <> 0 Or IsNull(cat) Or IsEmpty(cat) Then
+    If Err.Number <> 0 Or IsNull(cat) Or IsEmpty(cat) Or Len(CStr(cat)) = 0 Then
         Err.Clear
         GetRuntimeCatalog = "WinCC"
-    ElseIf Len(CStr(cat)) > 0 Then
-        GetRuntimeCatalog = CStr(cat)
     Else
-        GetRuntimeCatalog = "WinCC"
+        GetRuntimeCatalog = CStr(cat)
     End If
     On Error GoTo 0
 End Function
 
-Private Function TS3(ByVal dt)
-    TS3 = Year(dt) & "-" & Right("0" & Month(dt),2) & "-" & Right("0" & Day(dt),2) & _
-          " " & Right("0" & Hour(dt),2) & ":" & Right("0" & Minute(dt),2) & ":" & Right("0" & Second(dt),2) & ".000"
-End Function
-
-Private Function ElapsedMs(ByVal timerStart)
-    Dim timerEnd
-    timerEnd = Timer
-    If timerEnd < timerStart Then timerEnd = timerEnd + 86400
-    ElapsedMs = CLng((timerEnd - timerStart) * 1000)
-End Function
-
-Private Function IsTimeoutLikeError(ByVal errDesc)
-    Dim lowered
-    lowered = LCase(S(errDesc))
-    IsTimeoutLikeError = (InStr(lowered, "timeout") > 0) Or _
-                         (InStr(lowered, "time out") > 0) Or _
-                         (InStr(lowered, "expired") > 0)
-End Function
-
-Private Function IsProviderInternalLikeError(ByVal errDesc, ByVal errSource)
-    Dim loweredDesc, loweredSource
-    loweredDesc = LCase(S(errDesc))
-    loweredSource = LCase(S(errSource))
-
-    IsProviderInternalLikeError = (InStr(loweredDesc, "provider") > 0 And InStr(loweredDesc, "internal") > 0) Or _
-                                  (InStr(loweredDesc, "internal provider") > 0) Or _
-                                  (InStr(loweredDesc, "severe error") > 0) Or _
-                                  (InStr(loweredDesc, "communication link failure") > 0) Or _
-                                  (InStr(loweredDesc, "transport-level") > 0) Or _
-                                  (InStr(loweredSource, "provider") > 0 And InStr(loweredSource, "oledb") > 0)
-End Function
-
-Private Function ShouldStopAggFallbackForError(ByVal errDesc, ByVal errSource)
-    ShouldStopAggFallbackForError = IsTimeoutLikeError(errDesc) Or IsProviderInternalLikeError(errDesc, errSource)
-End Function
-
-Private Function BuildValidationBadAggKey(ByVal machineId, ByVal statusName, ByVal aggExpr)
-    BuildValidationBadAggKey = machineId & "|" & statusName & "|" & aggExpr
-End Function
-
-Private Function IsValidationBadAggOnCooldown(ByVal machineId, ByVal statusName, ByVal aggExpr)
-    Dim cacheKey, untilTs
-    cacheKey = BuildValidationBadAggKey(machineId, statusName, aggExpr)
-    IsValidationBadAggOnCooldown = False
-
-    If Not g_validationBadAggUntil.Exists(cacheKey) Then Exit Function
-    untilTs = CDate(g_validationBadAggUntil(cacheKey))
-    If DateDiff("s", Now(), untilTs) > 0 Then
-        IsValidationBadAggOnCooldown = True
-    Else
-        g_validationBadAggUntil.Remove cacheKey
+Private Sub WriteTag(ByVal tagName, ByVal value)
+    On Error Resume Next
+    HMIRuntime.Tags(tagName).Write CDbl(value)
+    If Err.Number <> 0 Then
+        LogMsg LOG_LEVEL_WARN, "HMITag", "write_failed tag=" & tagName & " err=" & S(Err.Description)
+        Err.Clear
     End If
-End Function
-
-Private Sub MarkValidationBadAggCooldown(ByVal machineId, ByVal statusName, ByVal aggExpr)
-    Dim cacheKey, untilTs
-    cacheKey = BuildValidationBadAggKey(machineId, statusName, aggExpr)
-    untilTs = DateAdd("n", VALIDATE_BAD_AGG_COOLDOWN_MINUTES, Now())
-    g_validationBadAggUntil(cacheKey) = untilTs
+    On Error GoTo 0
 End Sub
 
-Private Function BuildStartupProbeTimeoutKey(ByVal runtimeCatalog, ByVal machineId, ByVal tagFullName)
-    BuildStartupProbeTimeoutKey = UCase(S(runtimeCatalog)) & "|" & machineId & "|" & tagFullName
-End Function
+Private Function ShouldRun(ByVal machineId, ByVal periodKey, ByVal throttleMinutes)
+    Dim k, minsSince
+    k = machineId & "|" & periodKey
 
-Private Function IsStartupProbeTimeoutOnCooldown(ByVal runtimeCatalog, ByVal machineId, ByVal tagFullName)
-    Dim cacheKey, untilTs
-    cacheKey = BuildStartupProbeTimeoutKey(runtimeCatalog, machineId, tagFullName)
-    IsStartupProbeTimeoutOnCooldown = False
-    If Not g_startupProbeTimeoutUntil.Exists(cacheKey) Then Exit Function
-
-    untilTs = CDate(g_startupProbeTimeoutUntil(cacheKey))
-    If DateDiff("s", Now(), untilTs) > 0 Then
-        IsStartupProbeTimeoutOnCooldown = True
-    Else
-        g_startupProbeTimeoutUntil.Remove cacheKey
-    End If
-End Function
-
-Private Sub MarkStartupProbeTimeoutCooldown(ByVal runtimeCatalog, ByVal machineId, ByVal tagFullName)
-    Dim cacheKey, untilTs
-    cacheKey = BuildStartupProbeTimeoutKey(runtimeCatalog, machineId, tagFullName)
-    untilTs = DateAdd("n", STARTUP_VALIDATE_TIMEOUT_CACHE_COOLDOWN_MINUTES, Now())
-    g_startupProbeTimeoutUntil(cacheKey) = untilTs
-End Sub
-
-Private Function ResolveStartupValidationLookbackSequence(ByVal lookbackMinutes)
-    Dim seq(), seqCount
-    seqCount = 0
-    ReDim seq(2)
-
-    seq(seqCount) = STARTUP_VALIDATE_SHORT_WINDOW_1_MINUTES: seqCount = seqCount + 1
-    If lookbackMinutes > STARTUP_VALIDATE_SHORT_WINDOW_1_MINUTES Then
-        seq(seqCount) = STARTUP_VALIDATE_SHORT_WINDOW_2_MINUTES: seqCount = seqCount + 1
-    End If
-    If lookbackMinutes > STARTUP_VALIDATE_SHORT_WINDOW_2_MINUTES Then
-        seq(seqCount) = lookbackMinutes: seqCount = seqCount + 1
+    If Not g_lastRunByMachinePeriod.Exists(k) Then
+        ShouldRun = True
+        Exit Function
     End If
 
-    ReDim Preserve seq(seqCount - 1)
-    ResolveStartupValidationLookbackSequence = seq
+    minsSince = DateDiff("n", CDate(g_lastRunByMachinePeriod(k)), Now())
+    ShouldRun = (minsSince >= throttleMinutes)
 End Function
 
-' ─────────────────────────────────────────────────────────────────────
-' cp_TagStatisticEx (short retry, null-safe)
-' ─────────────────────────────────────────────────────────────────────
-Private Function ExecCpTagStatisticEx(ByVal cn, ByVal runtimeCatalog, ByVal tagFullName, ByVal tFrom, ByVal tTo, ByVal aggList, ByVal machineId, ByVal periodKey, ByVal statusName)
-    Dim i, cmd, rs, sSql, safeTag, fieldValue
-    Dim startTimer, startedAt, completedAt, elapsedMsValue
-    Dim returnedRows, valueText, infoMsg, errDesc, backoffMs
-
-    startedAt = Now
-    startTimer = Timer
-    returnedRows = 0
-    valueText = ""
-
-    safeTag = Replace(tagFullName, "'", "''")
-
-    For i = 1 To MAX_RETRY_ATTEMPTS
-        On Error Resume Next
-
-        Set cmd = CreateObject("ADODB.Command")
-        Set cmd.ActiveConnection = cn
-        cmd.CommandTimeout = GetAggCommandTimeoutSeconds(periodKey)
-        cmd.CommandType = adCmdText
-
-        sSql = "cp_TagStatisticEx '" & runtimeCatalog & "'," & _
-               "'TAG:R,''" & safeTag & "'',''" & TS3(tFrom) & "'',''" & TS3(tTo) & "'''," & _
-               "'" & aggList & "'"
-
-        cmd.CommandText = sSql
-
-        If CURRENT_LOG_LEVEL >= LOG_LEVEL_DEBUG Then
-            LogMsg LOG_LEVEL_DEBUG, "cp_TagStatisticEx", "SQL=[" & sSql & "]"
-        End If
-
-        Set rs = cmd.Execute
-
-        If Err.Number = 0 Then
-            ExecCpTagStatisticEx = Empty
-
-            If Not (rs Is Nothing) Then
-                If Not rs.EOF Then
-                    returnedRows = 1
-                    If rs.Fields.Count >= 1 Then
-                        fieldValue = rs.Fields(0).Value
-                        If Not (IsNull(fieldValue) Or IsEmpty(fieldValue)) Then
-                            ExecCpTagStatisticEx = fieldValue
-                            valueText = CStr(fieldValue)
-                        Else
-                            valueText = "<null>"
-                        End If
-                    End If
-                End If
-                rs.Close
-            End If
-
-            Set rs = Nothing
-            Set cmd = Nothing
-            On Error GoTo 0
-
-            completedAt = Now
-            elapsedMsValue = ElapsedMs(startTimer)
-            If valueText = "" Then valueText = "<empty>"
-            infoMsg = "machine=" & machineId & _
-                      " window=" & periodKey & _
-                      " status=" & statusName & _
-                      " sql_from=" & TS3(tFrom) & _
-                      " sql_to=" & TS3(tTo) & _
-                      " started=" & TS3(startedAt) & _
-                      " ended=" & TS3(completedAt) & _
-                      " elapsed_ms=" & elapsedMsValue & _
-                      " success=true" & _
-                      " rows=" & returnedRows & _
-                      " value=" & valueText
-            LogMsg LOG_LEVEL_INFO, "cp_TagStatisticEx", infoMsg
-            Exit Function
-        Else
-            errDesc = S(Err.Description)
-            LogMsg LOG_LEVEL_WARN, "cp_TagStatisticEx", "Attempt " & i & " failed: " & errDesc
-            Err.Clear
-            On Error GoTo 0
-            If i < MAX_RETRY_ATTEMPTS Then
-                backoffMs = RETRY_BACKOFF_MS
-                If IsTimeoutLikeError(errDesc) Then backoffMs = RETRY_BACKOFF_TIMEOUT_MS
-                SleepMs backoffMs
-            End If
-        End If
-    Next
-
-    ExecCpTagStatisticEx = Empty
-    completedAt = Now
-    elapsedMsValue = ElapsedMs(startTimer)
-    infoMsg = "machine=" & machineId & _
-              " window=" & periodKey & _
-              " status=" & statusName & _
-              " sql_from=" & TS3(tFrom) & _
-              " sql_to=" & TS3(tTo) & _
-              " started=" & TS3(startedAt) & _
-              " ended=" & TS3(completedAt) & _
-              " elapsed_ms=" & elapsedMsValue & _
-              " success=false rows=0 value=<none>"
-    LogMsg LOG_LEVEL_INFO, "cp_TagStatisticEx", infoMsg
-End Function
-
-Private Function CpAggregate(ByVal cn, ByVal runtimeCatalog, ByVal tagFullName, ByVal t1, ByVal t2, ByVal agg, ByVal machineId, ByVal periodKey, ByVal statusName)
-    Dim res
-    res = ExecCpTagStatisticEx(cn, runtimeCatalog, tagFullName, t1, t2, agg, machineId, periodKey, statusName)
-
-    If IsNull(res) Or IsEmpty(res) Or (CStr(res) = "") Then
-        CpAggregate = Empty
-    ElseIf IsNumeric(res) Then
-        CpAggregate = CDbl(res)
-    Else
-        CpAggregate = Empty
-    End If
-End Function
-
-Private Function TryAggListForTag(ByVal cn, ByVal runtimeCatalog, ByVal tag, ByVal t1, ByVal t2, ByVal aggList, ByVal machineId, ByVal periodKey, ByVal statusName)
-    Dim i, v
-
-    g_lastAggUsed = ""
-    For i = LBound(aggList) To UBound(aggList)
-        v = CpAggregate(cn, runtimeCatalog, tag, t1, t2, aggList(i), machineId, periodKey, statusName)
-        If IsNumeric(v) Then
-            If v >= 0 And v <= 1 Then
-                g_lastAggUsed = aggList(i)
-                TryAggListForTag = v
-                Exit Function
-            End If
-        End If
-    Next
-
-    TryAggListForTag = Empty
-End Function
-
-Private Function TryAvgFraction(ByVal cn, ByVal runtimeCatalog, ByVal tagFull, ByVal t1, ByVal t2, ByVal machineId, ByVal periodKey, ByVal statusName)
-    Dim v, baseTag, aggList
-
-    aggList = GetAggExprListForMachineCatalog(runtimeCatalog, machineId)
-
-    v = TryAggListForTag(cn, runtimeCatalog, tagFull, t1, t2, aggList, machineId, periodKey, statusName)
-    If IsNumeric(v) Then TryAvgFraction = v : Exit Function
-
-    baseTag = tagFull
-    If Right(baseTag, Len(COUNT_TAG_SUFFIX)) = COUNT_TAG_SUFFIX Then
-        baseTag = Left(baseTag, Len(baseTag) - Len(COUNT_TAG_SUFFIX))
-    End If
-
-    If baseTag <> tagFull Then
-        v = TryAggListForTag(cn, runtimeCatalog, baseTag, t1, t2, aggList, machineId, periodKey, statusName)
-        If IsNumeric(v) Then
-            LogMsg LOG_LEVEL_INFO, "TryAvgFraction", "fallback_to_plain_tag machine=" & machineId & " window=" & periodKey & " status=" & statusName & " agg=" & g_lastAggUsed
-            TryAvgFraction = v
-            Exit Function
-        End If
-    End If
-
-    TryAvgFraction = Empty
-End Function
-
-' ─────────────────────────────────────────────────────────────────────
-' READ ONLY *_Count (single SQL roundtrip for all 5 statuses)
-' ─────────────────────────────────────────────────────────────────────
 Private Function BuildCountTagFullName(ByVal machineId, ByVal statusName)
     Dim basePrefix, baseCore
     basePrefix = G_MACHINES(machineId)
@@ -536,51 +177,40 @@ Private Function BuildCountTagFullName(ByVal machineId, ByVal statusName)
     BuildCountTagFullName = basePrefix & COUNT_TAG_PREFIX_JOINER & baseCore & COUNT_TAG_SUFFIX
 End Function
 
-Private Function ProbeCountTagArchive(ByVal cn, ByVal runtimeCatalog, ByVal tagFullName, ByVal tFrom, ByVal tTo, ByVal aggExpr, ByRef insertedRows, ByRef hasNumeric, ByRef elapsedMsValue, ByRef errDesc, ByRef errNumber, ByRef errSource, ByRef sqlTextOut)
-    Dim cmd, rs, sqlText, cpCall, startTimer, tmp
+Private Function ReadSingleFraction(ByVal cn, ByVal runtimeCatalog, ByVal tagFullName, ByVal tFrom, ByVal tTo, ByVal machineId, ByVal periodKey, ByVal statusName)
+    Dim cmd, rs, sqlText, safeTag, t0, ms
+    Dim v
 
-    insertedRows = 0
-    hasNumeric = 0
-    elapsedMsValue = 0
-    errDesc = ""
-    errNumber = 0
-    errSource = ""
-    sqlTextOut = ""
-    ProbeCountTagArchive = False
+    ReadSingleFraction = Empty
+    safeTag = Replace(tagFullName, "'", "''")
+    sqlText = "cp_TagStatisticEx '" & runtimeCatalog & "','TAG:R,''" & safeTag & "'',''" & TS3(tFrom) & "'',''" & TS3(tTo) & "''','" & FIXED_AGG_EXPR & "'"
 
-    cpCall = BuildCpTagStatisticExLiteral(runtimeCatalog, tagFullName, tFrom, tTo, aggExpr)
-    sqlText = "DECLARE @Probe TABLE (frac SQL_VARIANT);" & vbCrLf & _
-              "INSERT INTO @Probe (frac) EXEC " & cpCall & ";" & vbCrLf & _
-              "SELECT COUNT(1) AS inserted_rows, " & _
-              "MAX(CASE WHEN TRY_CONVERT(FLOAT, frac) IS NOT NULL THEN 1 ELSE 0 END) AS has_numeric " & _
-              "FROM @Probe;"
-
-    startTimer = Timer
-
+    t0 = Timer
     On Error Resume Next
     Set cmd = CreateObject("ADODB.Command")
     Set cmd.ActiveConnection = cn
-    cmd.CommandTimeout = SQL_TIMEOUT_SECONDS_STARTUP_VALIDATE
     cmd.CommandType = adCmdText
+    cmd.CommandTimeout = SQL_TIMEOUT_SECONDS
     cmd.CommandText = sqlText
-    sqlTextOut = sqlText
-
     Set rs = cmd.Execute
-    elapsedMsValue = ElapsedMs(startTimer)
+    ms = ElapsedMs(t0)
+
     If Err.Number <> 0 Then
-        errDesc = S(Err.Description)
-        errNumber = CLng(Err.Number)
-        errSource = S(Err.Source)
+        LogMsg LOG_LEVEL_WARN, "cp_TagStatisticEx", "machine=" & machineId & " period=" & periodKey & " status=" & statusName & " elapsed_ms=" & ms & " ok=false err=" & S(Err.Description)
         Err.Clear
-    ElseIf Not (rs Is Nothing) Then
-        If Not rs.EOF Then
-            tmp = rs.Fields("inserted_rows").Value
-            If IsNumeric(tmp) Then insertedRows = CLng(tmp)
-            tmp = rs.Fields("has_numeric").Value
-            If IsNumeric(tmp) Then hasNumeric = CLng(tmp)
-            ProbeCountTagArchive = True
+    Else
+        If Not (rs Is Nothing) Then
+            If Not rs.EOF Then
+                v = rs.Fields(0).Value
+                If IsNumeric(v) Then
+                    If CDbl(v) >= 0 And CDbl(v) <= 1 Then
+                        ReadSingleFraction = CDbl(v)
+                    End If
+                End If
+            End If
+            rs.Close
         End If
-        rs.Close
+        LogMsg LOG_LEVEL_INFO, "cp_TagStatisticEx", "machine=" & machineId & " period=" & periodKey & " status=" & statusName & " elapsed_ms=" & ms & " ok=true"
     End If
     On Error GoTo 0
 
@@ -588,2066 +218,139 @@ Private Function ProbeCountTagArchive(ByVal cn, ByVal runtimeCatalog, ByVal tagF
     Set cmd = Nothing
 End Function
 
-Private Function ResolveStartupValidationLookbackMinutes(ByVal due1D, ByVal due7D, ByVal due30D)
-    ResolveStartupValidationLookbackMinutes = STARTUP_VALIDATE_LOOKBACK_1D_MINUTES
-    If due7D Then
-        If STARTUP_VALIDATE_LOOKBACK_7D_MINUTES > ResolveStartupValidationLookbackMinutes Then
-            ResolveStartupValidationLookbackMinutes = STARTUP_VALIDATE_LOOKBACK_7D_MINUTES
-        End If
+Private Sub GetCombinedFractions(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal tFrom, ByVal tTo, ByVal periodKey, ByRef fRun, ByRef fHalt, ByRef fAbort, ByRef inputValid)
+    Dim a, h, r, w, i
+
+    inputValid = False
+    fRun = 0
+    fHalt = 0
+    fAbort = 0
+
+    a = ReadSingleFraction(cn, runtimeCatalog, BuildCountTagFullName(machineId, "Aborted"), tFrom, tTo, machineId, periodKey, "Aborted")
+    h = ReadSingleFraction(cn, runtimeCatalog, BuildCountTagFullName(machineId, "Halted"), tFrom, tTo, machineId, periodKey, "Halted")
+    r = ReadSingleFraction(cn, runtimeCatalog, BuildCountTagFullName(machineId, "Running"), tFrom, tTo, machineId, periodKey, "Running")
+    w = ReadSingleFraction(cn, runtimeCatalog, BuildCountTagFullName(machineId, "Waiting"), tFrom, tTo, machineId, periodKey, "Waiting")
+    i = ReadSingleFraction(cn, runtimeCatalog, BuildCountTagFullName(machineId, "Interrupted"), tFrom, tTo, machineId, periodKey, "Interrupted")
+
+    If IsNumeric(a) And IsNumeric(h) And IsNumeric(r) And IsNumeric(w) And IsNumeric(i) Then
+        fAbort = CDbl(a) + CDbl(w)
+        fHalt = CDbl(h) + CDbl(i)
+        fRun = CDbl(r)
+        inputValid = True
     End If
-    If due30D Then
-        If STARTUP_VALIDATE_LOOKBACK_30D_MINUTES > ResolveStartupValidationLookbackMinutes Then
-            ResolveStartupValidationLookbackMinutes = STARTUP_VALIDATE_LOOKBACK_30D_MINUTES
-        End If
+End Sub
+
+Private Sub NormalizeFractionsToPct(ByVal fRun, ByVal fHalt, ByVal fAbort, ByRef pRun, ByRef pHalt, ByRef pAbort)
+    Dim tot
+    tot = CDbl(fRun) + CDbl(fHalt) + CDbl(fAbort)
+
+    If tot <= 0 Then
+        pRun = 0
+        pHalt = 0
+        pAbort = 0
+    Else
+        pRun = Round((CDbl(fRun) / tot) * 100, 2)
+        pHalt = Round((CDbl(fHalt) / tot) * 100, 2)
+        pAbort = Round((CDbl(fAbort) / tot) * 100, 2)
     End If
-    If ResolveStartupValidationLookbackMinutes > STARTUP_VALIDATE_LOOKBACK_PROBE_CAP_MINUTES Then
-        ResolveStartupValidationLookbackMinutes = STARTUP_VALIDATE_LOOKBACK_PROBE_CAP_MINUTES
+End Sub
+
+Private Function PieVal(ByVal pct)
+    If pct <= 0 Then
+        PieVal = 0
+    ElseIf pct < 1 Then
+        PieVal = 1
+    Else
+        PieVal = pct
     End If
 End Function
 
-Private Function ValidationStateName(ByVal validationState)
-    Select Case CLng(validationState)
-        Case VALIDATE_STATE_OK
-            ValidationStateName = "OK"
-        Case VALIDATE_STATE_NO_RECENT
-            ValidationStateName = "NO_RECENT"
-        Case VALIDATE_STATE_HARD_FAIL
-            ValidationStateName = "HARD_FAIL"
-        Case Else
-            ValidationStateName = "UNKNOWN(" & CStr(validationState) & ")"
-    End Select
-End Function
+Private Sub AggregatePeriod(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal periodKey, ByVal lookbackMinutes)
+    Dim tFrom, tTo, t0, elapsed
+    Dim fRun, fHalt, fAbort, inputValid
+    Dim pRun, pHalt, pAbort
+    Dim base
 
-Private Function ValidateMachineCountTags(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal lookbackMinutes, ByRef validationState, ByRef validationReason)
-    Dim statuses, idx, statusName, tagFull, aggExpr, aggs
-    Dim tFrom, tTo, insertedRows, hasNumeric, elapsedMsValue, errDesc
-    Dim probeOk, hasArchiveData, validStatusCount, hardFailCount
-    Dim aggIdx, aggCount, statusProbeSucceeded, statusHadRows, lastErrDesc
-    Dim errNumber, errSource, sqlTextOut, lastErrNumber, lastErrSource, lastSqlText
-    Dim cacheTs, elapsedMins, retryIntervalMins, priorState, priorReason
-    Dim attemptedAggCount, cooldownSkipCount, stopReason
-    Dim aggSuccessCount, aggNumericCount, winnerAgg, winnerNumericCount, winnerSuccessCount
-    Dim lookbackSeq, windowIdx, windowMinutes
-    Dim timeoutBudgetStart, timeoutBudgetUsedMs, timeoutBudgetRemainingMs
-    Dim budgetStopTriggered, machineStopReason
-    Dim timeoutCooldownSkipCount, timeoutStopCount, probeAttemptCount
-
-    If g_machineValidationDone.Exists(machineId) Then
-        priorState = CLng(g_machineValidationState(machineId))
-        priorReason = CStr(g_machineValidationReason(machineId))
-        cacheTs = #1/1/1970#
-        If g_machineValidationLastTs.Exists(machineId) Then
-            cacheTs = CDate(g_machineValidationLastTs(machineId))
-        End If
-        elapsedMins = DateDiff("n", cacheTs, Now())
-
-        If priorState = VALIDATE_STATE_HARD_FAIL Then
-            retryIntervalMins = VALIDATE_RETRY_HARD_FAIL_MINUTES
-        Else
-            retryIntervalMins = VALIDATE_RETRY_NORMAL_MINUTES
-        End If
-
-        If elapsedMins < retryIntervalMins Then
-            validationState = priorState
-            validationReason = priorReason
-            ValidateMachineCountTags = CBool(g_machineValidationOk(machineId))
-            LogMsg LOG_LEVEL_INFO, "StartupValidate", _
-                   "cache_reused=1 machine=" & machineId & _
-                   " prior_state=" & ValidationStateName(priorState) & _
-                   " prior_reason=" & priorReason & _
-                   " age_min=" & elapsedMins & _
-                   " retry_interval_min=" & retryIntervalMins
-            LogMsg LOG_LEVEL_INFO, "StartupValidate", _
-                   "probe_budget_summary machine=" & machineId & _
-                   " catalog=" & runtimeCatalog & _
-                   " budget_used_ms=0 budget_limit_ms=" & STARTUP_VALIDATE_TIMEOUT_BUDGET_MS & _
-                   " budget_remaining_ms=" & STARTUP_VALIDATE_TIMEOUT_BUDGET_MS & _
-                   " probe_attempts=0 timeout_cooldown_skips=0 timeout_stops=0 hard_fail_count=0 stop_reason=cache_reused"
-            Exit Function
-        End If
-
-        LogMsg LOG_LEVEL_INFO, "StartupValidate", _
-               "cache_reprobe=1 machine=" & machineId & _
-               " prior_state=" & ValidationStateName(priorState) & _
-               " prior_reason=" & priorReason & _
-               " age_min=" & elapsedMins & _
-               " retry_interval_min=" & retryIntervalMins
-    End If
-
-    statuses = Array("Aborted", "Halted", "Running", "Waiting", "Interrupted")
-    aggs = GetAggExprList(runtimeCatalog)
-    aggCount = UBound(aggs) + 1
-    Set aggSuccessCount = CreateObject("Scripting.Dictionary")
-    Set aggNumericCount = CreateObject("Scripting.Dictionary")
-    For aggIdx = 0 To UBound(aggs)
-        aggExpr = CStr(aggs(aggIdx))
-        aggSuccessCount.Add aggExpr, 0
-        aggNumericCount.Add aggExpr, 0
-    Next
+    t0 = Timer
     tTo = Now()
     tFrom = DateAdd("n", -lookbackMinutes, tTo)
-    validStatusCount = 0
-    hardFailCount = 0
-    timeoutCooldownSkipCount = 0
-    timeoutStopCount = 0
-    probeAttemptCount = 0
-    budgetStopTriggered = False
-    machineStopReason = "completed"
-    timeoutBudgetStart = Timer
-    lookbackSeq = ResolveStartupValidationLookbackSequence(lookbackMinutes)
 
-    For idx = 0 To UBound(statuses)
-        statusName = CStr(statuses(idx))
-        tagFull = BuildCountTagFullName(machineId, statusName)
-        statusProbeSucceeded = False
-        statusHadRows = False
-        lastErrDesc = ""
-        lastErrNumber = 0
-        lastErrSource = ""
-        lastSqlText = ""
-        attemptedAggCount = 0
-        cooldownSkipCount = 0
-        stopReason = "all_aggs_failed"
+    LogMsg LOG_LEVEL_INFO, "Aggregate", "start machine=" & machineId & " period=" & periodKey & " from=" & TS3(tFrom) & " to=" & TS3(tTo)
 
-        If IsStartupProbeTimeoutOnCooldown(runtimeCatalog, machineId, tagFull) Then
-            stopReason = "timeout_cooldown_active"
-            timeoutCooldownSkipCount = timeoutCooldownSkipCount + 1
-            If machineStopReason = "completed" Then machineStopReason = "timeout_cooldown_active"
-        Else
-            For windowIdx = LBound(lookbackSeq) To UBound(lookbackSeq)
-                windowMinutes = CLng(lookbackSeq(windowIdx))
-                tTo = Now()
-                tFrom = DateAdd("n", -windowMinutes, tTo)
+    GetCombinedFractions cn, runtimeCatalog, machineId, tFrom, tTo, periodKey, fRun, fHalt, fAbort, inputValid
 
-                For aggIdx = 0 To UBound(aggs)
-                    timeoutBudgetUsedMs = ElapsedMs(timeoutBudgetStart)
-                    timeoutBudgetRemainingMs = STARTUP_VALIDATE_TIMEOUT_BUDGET_MS - timeoutBudgetUsedMs
-                    If timeoutBudgetRemainingMs <= 0 Then
-                        budgetStopTriggered = True
-                        machineStopReason = "startup_probe_budget_exhausted"
-                        stopReason = "probe_budget_exhausted"
-                        Exit For
-                    End If
-
-                    aggExpr = CStr(aggs(aggIdx))
-                    If IsValidationBadAggOnCooldown(machineId, statusName, aggExpr) Then
-                        cooldownSkipCount = cooldownSkipCount + 1
-                        If cooldownSkipCount = aggCount Then
-                            stopReason = "all_aggs_on_cooldown"
-                        End If
-                    Else
-                        attemptedAggCount = attemptedAggCount + 1
-                        probeAttemptCount = probeAttemptCount + 1
-                        probeOk = ProbeCountTagArchive(cn, runtimeCatalog, tagFull, tFrom, tTo, aggExpr, insertedRows, hasNumeric, elapsedMsValue, errDesc, errNumber, errSource, sqlTextOut)
-                        If probeOk Then
-                            statusProbeSucceeded = True
-                            hasArchiveData = (insertedRows > 0)
-                            If hasArchiveData Then
-                                statusHadRows = True
-                                stopReason = "short_circuit_data_found_" & windowMinutes & "m"
-                            Else
-                                stopReason = "short_circuit_no_rows_" & windowMinutes & "m"
-                            End If
-                            aggSuccessCount(aggExpr) = CLng(aggSuccessCount(aggExpr)) + 1
-                            If hasNumeric Then aggNumericCount(aggExpr) = CLng(aggNumericCount(aggExpr)) + 1
-                            LogMsg LOG_LEVEL_INFO, "StartupValidate", _
-                                   "machine=" & machineId & _
-                                   " status=" & statusName & _
-                                   " tag_full=" & tagFull & _
-                                   " agg=" & aggExpr & _
-                                   " data_exists=" & CStr(hasArchiveData) & _
-                                   " inserted_rows=" & insertedRows & _
-                                   " has_numeric=" & hasNumeric & _
-                                   " lookback_min=" & windowMinutes & _
-                                   " elapsed_ms=" & elapsedMsValue
-                            Exit For
-                        Else
-                            MarkValidationBadAggCooldown machineId, statusName, aggExpr
-                            lastErrDesc = errDesc
-                            lastErrNumber = errNumber
-                            lastErrSource = errSource
-                            lastSqlText = sqlTextOut
-                            If IsTimeoutLikeError(errDesc) Then
-                                MarkStartupProbeTimeoutCooldown runtimeCatalog, machineId, tagFull
-                            End If
-                            If ShouldStopAggFallbackForError(errDesc, errSource) Then
-                                stopReason = "timeout_or_provider_internal"
-                                timeoutStopCount = timeoutStopCount + 1
-                                If machineStopReason = "completed" Then machineStopReason = "timeout_or_provider_internal"
-                                Exit For
-                            End If
-                        End If
-                    End If
-                Next
-
-                If statusProbeSucceeded Then Exit For
-                If stopReason = "timeout_or_provider_internal" Then Exit For
-                If stopReason = "probe_budget_exhausted" Then Exit For
-            Next
-        End If
-
-        hasArchiveData = statusHadRows
-        If hasArchiveData Then validStatusCount = validStatusCount + 1
-
-        If Not statusProbeSucceeded Then
-            hardFailCount = hardFailCount + 1
-            LogMsg LOG_LEVEL_WARN, "StartupValidate", _
-                   "machine=" & machineId & _
-                   " status=" & statusName & _
-                   " tag_full=" & tagFull & _
-                   " data_exists=False" & _
-                   " probe_failed=1" & _
-                   " provider_err_num=" & CStr(lastErrNumber) & _
-                   " provider_err_source=" & lastErrSource & _
-                   " provider_err_desc=" & lastErrDesc & _
-                   " probe_sql=" & lastSqlText & _
-                   " fallback_aggs_attempted=" & attemptedAggCount & _
-                   " fallback_aggs_skipped_cooldown=" & cooldownSkipCount & _
-                   " fallback_stop_reason=" & stopReason
-        End If
-
-        If budgetStopTriggered Then Exit For
-    Next
-
-    winnerAgg = ""
-    winnerNumericCount = -1
-    winnerSuccessCount = -1
-    For aggIdx = 0 To UBound(aggs)
-        aggExpr = CStr(aggs(aggIdx))
-        If CLng(aggSuccessCount(aggExpr)) > 0 Then
-            If CLng(aggNumericCount(aggExpr)) > winnerNumericCount Then
-                winnerAgg = aggExpr
-                winnerNumericCount = CLng(aggNumericCount(aggExpr))
-                winnerSuccessCount = CLng(aggSuccessCount(aggExpr))
-            ElseIf CLng(aggNumericCount(aggExpr)) = winnerNumericCount Then
-                If CLng(aggSuccessCount(aggExpr)) > winnerSuccessCount Then
-                    winnerAgg = aggExpr
-                    winnerSuccessCount = CLng(aggSuccessCount(aggExpr))
-                End If
-            End If
-        End If
-    Next
-    If Len(winnerAgg) > 0 Then
-        PersistBatchAggWinner machineId, runtimeCatalog, winnerAgg, "startup_validate"
-    End If
-
-    g_machineValidationDone(machineId) = True
-
-    If hardFailCount > 0 Then
-        validationState = VALIDATE_STATE_HARD_FAIL
-        If machineStopReason = "completed" Then machineStopReason = "hard_fail_probe_or_schema_error"
-        If STARTUP_VALIDATION_BLOCK_WRITES_ON_PROBE_FAIL Then
-            validationReason = "hard_fail_probe_or_schema_error"
-            g_machineValidationOk(machineId) = False
-            ValidateMachineCountTags = False
-            LogMsg LOG_LEVEL_WARN, "StartupValidate", _
-                   "HIGH_PRIORITY machine=" & machineId & _
-                   " message=startup_validation_hard_failure; output_writes_suppressed" & _
-                   " lookback_min=" & lookbackMinutes & _
-                   " fallback_aggs_attempted=" & aggCount
-        Else
-            validationReason = "degraded_probe_fail"
-            g_machineValidationOk(machineId) = True
-            ValidateMachineCountTags = True
-            LogMsg LOG_LEVEL_WARN, "StartupValidate", _
-                   "HIGH_PRIORITY machine=" & machineId & _
-                   " message=startup_validation_hard_failure; output_writes_allowed_with_warning" & _
-                   " lookback_min=" & lookbackMinutes & _
-                   " fallback_aggs_attempted=" & aggCount
-        End If
-    ElseIf validStatusCount > 0 Then
-        validationState = VALIDATE_STATE_OK
-        validationReason = "valid_recent_rows_detected"
-        If machineStopReason = "completed" Then machineStopReason = "valid_recent_rows_detected"
-        g_machineValidationOk(machineId) = True
-        ValidateMachineCountTags = True
+    If inputValid Then
+        NormalizeFractionsToPct fRun, fHalt, fAbort, pRun, pHalt, pAbort
     Else
-        validationState = VALIDATE_STATE_NO_RECENT
-        validationReason = "no_recent_rows_in_lookback"
-        If machineStopReason = "completed" Then machineStopReason = "no_recent_rows_in_lookback"
-        g_machineValidationOk(machineId) = True
-        ValidateMachineCountTags = True
-        LogMsg LOG_LEVEL_WARN, "StartupValidate", _
-               "HIGH_PRIORITY machine=" & machineId & _
-               " message=no_recent_rows_detected; output_writes_allowed_with_warning" & _
-               " lookback_min=" & lookbackMinutes & _
-               " fallback_aggs_attempted=" & aggCount
+        pRun = 0
+        pHalt = 0
+        pAbort = 0
     End If
 
-    g_machineValidationState(machineId) = validationState
-    g_machineValidationReason(machineId) = validationReason
-    g_machineValidationLastTs(machineId) = Now()
+    base = machineId & "_" & periodKey & "_Machine_"
 
-    timeoutBudgetUsedMs = ElapsedMs(timeoutBudgetStart)
-    timeoutBudgetRemainingMs = STARTUP_VALIDATE_TIMEOUT_BUDGET_MS - timeoutBudgetUsedMs
-    If timeoutBudgetRemainingMs < 0 Then timeoutBudgetRemainingMs = 0
-    LogMsg LOG_LEVEL_INFO, "StartupValidate", _
-           "probe_budget_summary machine=" & machineId & _
-           " catalog=" & runtimeCatalog & _
-           " budget_used_ms=" & timeoutBudgetUsedMs & _
-           " budget_limit_ms=" & STARTUP_VALIDATE_TIMEOUT_BUDGET_MS & _
-           " budget_remaining_ms=" & timeoutBudgetRemainingMs & _
-           " probe_attempts=" & probeAttemptCount & _
-           " timeout_cooldown_skips=" & timeoutCooldownSkipCount & _
-           " timeout_stops=" & timeoutStopCount & _
-           " hard_fail_count=" & hardFailCount & _
-           " stop_reason=" & machineStopReason
-End Function
+    WriteTag base & "Running_Percentage", pRun
+    WriteTag base & "Halted_Percentage", pHalt
+    WriteTag base & "Aborted_Percentage", pAbort
 
-Private Function BuildCpTagStatisticExLiteral(ByVal runtimeCatalog, ByVal tagFullName, ByVal tFrom, ByVal tTo, ByVal aggExpr)
-    Dim safeCatalog, safeTag
-    safeCatalog = Replace(runtimeCatalog, "'", "''")
-    safeTag = Replace(tagFullName, "'", "''")
-    BuildCpTagStatisticExLiteral = "cp_TagStatisticEx '" & safeCatalog & "'," & _
-                                   "'TAG:R,''" & safeTag & "'',''" & TS3(tFrom) & "'',''" & TS3(tTo) & "'''," & _
-                                   "'" & aggExpr & "'"
-End Function
+    WriteTag base & "Running_Percentage_PieChart", PieVal(pRun)
+    WriteTag base & "Halted_Percentage_PieChart", PieVal(pHalt)
+    WriteTag base & "Aborted_Percentage_PieChart", PieVal(pAbort)
 
-Private Function BuildBatchCacheKey(ByVal runtimeCatalog, ByVal machineId, ByVal periodKey, ByVal t1, ByVal t2, ByVal aggExpr)
-    BuildBatchCacheKey = runtimeCatalog & "|" & machineId & "|" & periodKey & "|" & TS3(t1) & "|" & TS3(t2) & "|" & aggExpr
-End Function
+    elapsed = ElapsedMs(t0)
+    If inputValid Then
+        LogMsg LOG_LEVEL_INFO, "Aggregate", "end machine=" & machineId & " period=" & periodKey & " result=valid run=" & pRun & " halt=" & pHalt & " abort=" & pAbort & " elapsed_ms=" & elapsed
+    Else
+        LogMsg LOG_LEVEL_WARN, "Aggregate", "end machine=" & machineId & " period=" & periodKey & " result=zero_no_data elapsed_ms=" & elapsed
+    End If
 
-Private Sub TrimCacheIfNeeded(ByVal dictObj, ByVal maxEntries, ByVal cacheName)
-    Dim removeCount, keys, idx, keyToRemove
-    If dictObj Is Nothing Then Exit Sub
-    If maxEntries < 1 Then maxEntries = 1
-    If dictObj.Count <= maxEntries Then Exit Sub
+    If elapsed > WINDOW_EXEC_WARN_THRESHOLD_MS Then
+        LogMsg LOG_LEVEL_WARN, "Aggregate", "slow_period machine=" & machineId & " period=" & periodKey & " elapsed_ms=" & elapsed
+    End If
 
-    removeCount = dictObj.Count - maxEntries
-    keys = dictObj.Keys
-    For idx = 0 To removeCount - 1
-        keyToRemove = CStr(keys(idx))
-        If dictObj.Exists(keyToRemove) Then dictObj.Remove keyToRemove
-    Next
-
-    LogMsg LOG_LEVEL_WARN, "CacheTrim", _
-           "cache_eviction cache=" & cacheName & _
-           " removed=" & removeCount & _
-           " max_entries=" & maxEntries & _
-           " remaining=" & dictObj.Count
+    g_lastRunByMachinePeriod(machineId & "|" & periodKey) = Now()
 End Sub
 
-Private Function BuildStatusTagMap(ByVal machineId, ByVal periodKey, ByVal t1, ByVal t2)
-    Dim cacheKey, d
-    cacheKey = machineId
-
-    If g_statusTagFullNameCache.Exists(cacheKey) Then
-        Set BuildStatusTagMap = g_statusTagFullNameCache(cacheKey)
-        Exit Function
-    End If
-
-    Set d = CreateObject("Scripting.Dictionary")
-    d.Add "Aborted", BuildCountTagFullName(machineId, "Aborted")
-    d.Add "Halted", BuildCountTagFullName(machineId, "Halted")
-    d.Add "Running", BuildCountTagFullName(machineId, "Running")
-    d.Add "Waiting", BuildCountTagFullName(machineId, "Waiting")
-    d.Add "Interrupted", BuildCountTagFullName(machineId, "Interrupted")
-    TrimCacheIfNeeded g_statusTagFullNameCache, STATUS_TAG_CACHE_MAX_ENTRIES, "g_statusTagFullNameCache"
-    Set g_statusTagFullNameCache(cacheKey) = d
-    Set BuildStatusTagMap = d
-End Function
-
-Private Function CopyStatusFractions(ByVal srcDict)
-    Dim dst
-    Set dst = CreateObject("Scripting.Dictionary")
-    dst.Add "Aborted", srcDict("Aborted")
-    dst.Add "Halted", srcDict("Halted")
-    dst.Add "Running", srcDict("Running")
-    dst.Add "Waiting", srcDict("Waiting")
-    dst.Add "Interrupted", srcDict("Interrupted")
-    Set CopyStatusFractions = dst
-End Function
-
-Private Function SumStatusFractions(ByVal d)
-    SumStatusFractions = CDbl(d("Aborted")) + CDbl(d("Halted")) + CDbl(d("Running")) + CDbl(d("Waiting")) + CDbl(d("Interrupted"))
-End Function
-
-Private Function GetAggExprList(ByVal runtimeCatalog)
-    Dim cfg, normalizedCatalog
-    cfg = PROJECT_BATCH_AGG_LIST_DEFAULT
-    normalizedCatalog = UCase(S(runtimeCatalog))
-
-    If normalizedCatalog = "WINCC" Then
-        cfg = PROJECT_BATCH_AGG_LIST_WINCC
-    ElseIf Left(normalizedCatalog, 10) = "CC_SLSGLO_" Then
-        cfg = PROJECT_BATCH_AGG_LIST_CCSLSGLO
-    End If
-    GetAggExprList = Split(cfg, "|")
-End Function
-
-Private Function BuildMachineCatalogAggKey(ByVal machineId, ByVal runtimeCatalog)
-    BuildMachineCatalogAggKey = machineId & "|" & UCase(S(runtimeCatalog))
-End Function
-
-Private Function GetPersistedBatchAgg(ByVal machineId, ByVal runtimeCatalog)
-    Dim cacheKey
-    cacheKey = BuildMachineCatalogAggKey(machineId, runtimeCatalog)
-    GetPersistedBatchAgg = ""
-    If g_preferredBatchAggByMachineCatalog.Exists(cacheKey) Then
-        GetPersistedBatchAgg = CStr(g_preferredBatchAggByMachineCatalog(cacheKey))
-    End If
-End Function
-
-Private Sub PersistBatchAggWinner(ByVal machineId, ByVal runtimeCatalog, ByVal aggExpr, ByVal src)
-    Dim cacheKey, priorAgg
-    cacheKey = BuildMachineCatalogAggKey(machineId, runtimeCatalog)
-    priorAgg = ""
-    If g_preferredBatchAggByMachineCatalog.Exists(cacheKey) Then
-        priorAgg = CStr(g_preferredBatchAggByMachineCatalog(cacheKey))
-    End If
-
-    g_preferredBatchAggByMachineCatalog(cacheKey) = aggExpr
-    If priorAgg <> aggExpr Then
-        LogMsg LOG_LEVEL_INFO, "BatchAgg", _
-               "winner_updated machine=" & machineId & _
-               " catalog=" & runtimeCatalog & _
-               " agg=" & aggExpr & _
-               " source=" & src & _
-               " prior=" & priorAgg
-    End If
-End Sub
-
-Private Function GetAggExprListForMachineCatalog(ByVal runtimeCatalog, ByVal machineId)
-    Dim baseAggs, preferredAgg, preferredIdx, idx, orderedAggs
-    baseAggs = GetAggExprList(runtimeCatalog)
-    preferredAgg = GetPersistedBatchAgg(machineId, runtimeCatalog)
-    preferredIdx = -1
-
-    If Len(preferredAgg) > 0 Then
-        For idx = LBound(baseAggs) To UBound(baseAggs)
-            If CStr(baseAggs(idx)) = preferredAgg Then
-                preferredIdx = idx
-                Exit For
-            End If
-        Next
-    End If
-
-    If preferredIdx <= 0 Then
-        GetAggExprListForMachineCatalog = baseAggs
-        Exit Function
-    End If
-
-    ReDim orderedAggs(UBound(baseAggs))
-    orderedAggs(0) = preferredAgg
-    For idx = LBound(baseAggs) To UBound(baseAggs)
-        If idx < preferredIdx Then
-            orderedAggs(idx + 1) = baseAggs(idx)
-        ElseIf idx > preferredIdx Then
-            orderedAggs(idx) = baseAggs(idx)
-        End If
-    Next
-
-    GetAggExprListForMachineCatalog = orderedAggs
-End Function
-
-Private Function ExecuteStatusFractionsSingleFallback(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal periodKey, ByVal t1, ByVal t2, ByVal tagMap, ByRef numericCount)
-    Dim outDict, statuses, idx, statusName, tagFull, v, infoMsg
-    Set outDict = CreateObject("Scripting.Dictionary")
-    outDict.Add "Aborted", 0
-    outDict.Add "Halted", 0
-    outDict.Add "Running", 0
-    outDict.Add "Waiting", 0
-    outDict.Add "Interrupted", 0
-    numericCount = 0
-
-    statuses = Array("Aborted", "Halted", "Running", "Waiting", "Interrupted")
-    For idx = 0 To UBound(statuses)
-        statusName = CStr(statuses(idx))
-        tagFull = CStr(tagMap(statusName))
-        v = TryAvgFraction(cn, runtimeCatalog, tagFull, t1, t2, machineId, periodKey, statusName)
-        If IsNumeric(v) Then
-            outDict(statusName) = CDbl(v)
-            numericCount = numericCount + 1
-        End If
-    Next
-
-    infoMsg = "single_fallback machine=" & machineId & _
-              " window=" & periodKey & _
-              " catalog=" & runtimeCatalog & _
-              " sql_from=" & TS3(t1) & _
-              " sql_to=" & TS3(t2) & _
-              " numeric=" & numericCount
-    LogMsg LOG_LEVEL_INFO, "GetStatusFractionsBatch", infoMsg
-
-    If numericCount > 0 Then
-        Set ExecuteStatusFractionsSingleFallback = outDict
-    Else
-        Set ExecuteStatusFractionsSingleFallback = Nothing
-    End If
-End Function
-
-Private Function GetAggCommandTimeoutSeconds(ByVal periodKey)
-    Select Case UCase(CStr(periodKey))
-        Case "7D", "30D"
-            GetAggCommandTimeoutSeconds = SQL_TIMEOUT_SECONDS_LONG_AGG
-        Case Else
-            GetAggCommandTimeoutSeconds = SQL_TIMEOUT_SECONDS_NORMAL_AGG
-    End Select
-End Function
-
-Private Function GetAggCommandTimeoutSecondsCapped(ByVal periodKey, ByVal remainingBudgetMs)
-    Dim baselineTimeoutSeconds, budgetLimitedSeconds, cappedTimeoutSeconds, effectiveBudgetMs
-    baselineTimeoutSeconds = GetAggCommandTimeoutSeconds(periodKey)
-    effectiveBudgetMs = remainingBudgetMs
-    Select Case UCase(CStr(periodKey))
-        Case "7D", "30D"
-            effectiveBudgetMs = effectiveBudgetMs - LONG_WINDOW_SAFETY_RESERVE_MS
-    End Select
-    If effectiveBudgetMs < 0 Then effectiveBudgetMs = 0
-    budgetLimitedSeconds = Int(CDbl(effectiveBudgetMs) / 1000)
-
-    If budgetLimitedSeconds < 1 Then budgetLimitedSeconds = 1
-
-    cappedTimeoutSeconds = baselineTimeoutSeconds
-    If budgetLimitedSeconds < cappedTimeoutSeconds Then cappedTimeoutSeconds = budgetLimitedSeconds
-    If cappedTimeoutSeconds < 1 Then cappedTimeoutSeconds = 1
-
-    GetAggCommandTimeoutSecondsCapped = cappedTimeoutSeconds
-End Function
-
-Private Function GetAggTimeoutBudgetMs(ByVal periodKey)
-    Select Case UCase(CStr(periodKey))
-        Case "7D"
-            GetAggTimeoutBudgetMs = NORMAL_AGG_TIMEOUT_BUDGET_MS_7D
-        Case "30D"
-            GetAggTimeoutBudgetMs = NORMAL_AGG_TIMEOUT_BUDGET_MS_30D
-        Case Else
-            GetAggTimeoutBudgetMs = NORMAL_AGG_TIMEOUT_BUDGET_MS_1D
-    End Select
-End Function
-
-Private Function ExecuteStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal periodKey, ByVal t1, ByVal t2, ByVal aggExpr, ByVal tagMap, ByVal remainingBudgetMs, ByRef hasNumericCount, ByRef insertedStatusCount, ByRef allNullNoNumeric, ByRef batchOk, ByRef queryFailureKindOut, ByRef timeoutLikeFailureOut, ByRef baselineTimeoutSecondsOut, ByRef cappedTimeoutSecondsOut)
-    Dim cmd, rs, sqlText, startedAt, completedAt, startTimer, elapsedMsValue, infoMsg
-    Dim statuses, aliases, idx, statusName, tagFull, cpCall
-    Dim outDict, fieldValue, diagRows, diagNumeric, diagElapsedMs, diagErrNum, diagErrMsg
-    Dim aliasKey, statusLabel, insertedRowsValue, isNumericValue, insertedFlag, numericFlag, statusElapsedMs, errNumberValue, errMessageValue
-    Dim valA, valH, valR, valW, valI
-    Dim cacheKey, cacheEntry
-    Dim queryFailureKind, queryFailureDetail, hasUsableRow, parseFieldFailure
-    Dim foundDataRecordset
-    Dim baselineTimeoutSeconds, cappedTimeoutSeconds
-
-    startedAt = Now
-    startTimer = Timer
-    hasNumericCount = 0
-    insertedStatusCount = 0
-    allNullNoNumeric = 0
-    batchOk = 0
-    queryFailureKindOut = "none"
-    timeoutLikeFailureOut = 0
-    baselineTimeoutSecondsOut = GetAggCommandTimeoutSeconds(periodKey)
-    cappedTimeoutSecondsOut = GetAggCommandTimeoutSecondsCapped(periodKey, remainingBudgetMs)
-    baselineTimeoutSeconds = baselineTimeoutSecondsOut
-    cappedTimeoutSeconds = cappedTimeoutSecondsOut
-    If cappedTimeoutSeconds < MIN_PRACTICAL_QUERY_TIMEOUT_SECONDS Then
-        LogMsg LOG_LEVEL_WARN, "GetStatusFractionsBatch", _
-               "agg_timeout_cap_below_practical_threshold machine=" & machineId & _
-               " window=" & periodKey & _
-               " agg=" & aggExpr & _
-               " timeout_baseline_s=" & baselineTimeoutSeconds & _
-               " timeout_capped_s=" & cappedTimeoutSeconds & _
-               " practical_threshold_s=" & MIN_PRACTICAL_QUERY_TIMEOUT_SECONDS & _
-               " budget_remaining_ms=" & remainingBudgetMs
-    End If
-
-    Set outDict = CreateObject("Scripting.Dictionary")
-    outDict.Add "Aborted", 0
-    outDict.Add "Halted", 0
-    outDict.Add "Running", 0
-    outDict.Add "Waiting", 0
-    outDict.Add "Interrupted", 0
-
-    statuses = Array("Aborted", "Halted", "Running", "Waiting", "Interrupted")
-    aliases  = Array("a", "h", "r", "w", "i")
-
-    Set diagRows = CreateObject("Scripting.Dictionary")
-    Set diagNumeric = CreateObject("Scripting.Dictionary")
-    Set diagElapsedMs = CreateObject("Scripting.Dictionary")
-    Set diagErrNum = CreateObject("Scripting.Dictionary")
-    Set diagErrMsg = CreateObject("Scripting.Dictionary")
-    queryFailureKind = "none"
-    queryFailureDetail = ""
-    hasUsableRow = 0
-    parseFieldFailure = 0
-    For idx = 0 To UBound(aliases)
-        aliasKey = CStr(aliases(idx))
-        diagRows(aliasKey) = 0
-        diagNumeric(aliasKey) = 0
-        diagElapsedMs(aliasKey) = 0
-        diagErrNum(aliasKey) = 0
-        diagErrMsg(aliasKey) = ""
-    Next
-
-    cacheKey = BuildBatchCacheKey(runtimeCatalog, machineId, periodKey, t1, t2, aggExpr)
-    If g_batchResultCache.Exists(cacheKey) Then
-        Set cacheEntry = g_batchResultCache(cacheKey)
-        hasNumericCount = CLng(cacheEntry("hasNumericCount"))
-        insertedStatusCount = CLng(cacheEntry("insertedStatusCount"))
-        allNullNoNumeric = CLng(cacheEntry("allNullNoNumeric"))
-        batchOk = CLng(cacheEntry("batchOk"))
-        If cacheEntry.Exists("hasOutDict") And CLng(cacheEntry("hasOutDict")) = 1 Then
-            Set outDict = CreateObject("Scripting.Dictionary")
-            outDict.Add "Aborted", CDbl(cacheEntry("Aborted"))
-            outDict.Add "Halted", CDbl(cacheEntry("Halted"))
-            outDict.Add "Running", CDbl(cacheEntry("Running"))
-            outDict.Add "Waiting", CDbl(cacheEntry("Waiting"))
-            outDict.Add "Interrupted", CDbl(cacheEntry("Interrupted"))
-            Set ExecuteStatusFractionsBatch = outDict
-        Else
-            Set ExecuteStatusFractionsBatch = Nothing
-        End If
-        If cacheEntry.Exists("queryFailureKind") Then
-            queryFailureKindOut = CStr(cacheEntry("queryFailureKind"))
-        Else
-            queryFailureKindOut = "cache_hit"
-        End If
-        If cacheEntry.Exists("timeoutLikeFailure") Then
-            timeoutLikeFailureOut = CLng(cacheEntry("timeoutLikeFailure"))
-        Else
-            timeoutLikeFailureOut = 0
-        End If
-        LogMsg LOG_LEVEL_DEBUG, "GetStatusFractionsBatch", _
-               "batch_cache_hit machine=" & machineId & _
-               " window=" & periodKey & _
-               " agg=" & aggExpr & _
-               " batch_ok=" & batchOk
-        Exit Function
-    End If
-
-    sqlText = "DECLARE @Status TABLE (status_alias NVARCHAR(1), frac FLOAT);" & vbCrLf
-    sqlText = sqlText & "DECLARE @StatusDiag TABLE (" & _
-              "status_alias NVARCHAR(1) NOT NULL, " & _
-              "inserted_rows INT NOT NULL, " & _
-              "is_numeric INT NOT NULL, " & _
-              "elapsed_ms INT NULL, " & _
-              "error_number INT NULL, " & _
-              "error_severity INT NULL, " & _
-              "error_state INT NULL, " & _
-              "error_procedure NVARCHAR(128) NULL, " & _
-              "error_line INT NULL, " & _
-              "error_message NVARCHAR(4000) NULL);" & vbCrLf
-    sqlText = sqlText & "INSERT INTO @StatusDiag (status_alias, inserted_rows, is_numeric, elapsed_ms, error_number, error_severity, error_state, error_procedure, error_line, error_message) VALUES " & _
-              "('a',0,0,NULL,NULL,NULL,NULL,NULL,NULL,NULL)," & _
-              "('h',0,0,NULL,NULL,NULL,NULL,NULL,NULL,NULL)," & _
-              "('r',0,0,NULL,NULL,NULL,NULL,NULL,NULL,NULL)," & _
-              "('w',0,0,NULL,NULL,NULL,NULL,NULL,NULL,NULL)," & _
-              "('i',0,0,NULL,NULL,NULL,NULL,NULL,NULL,NULL);" & vbCrLf
-    sqlText = sqlText & "DECLARE @cpStart DATETIME2(3);" & vbCrLf
-    sqlText = sqlText & "DECLARE @insertedRows INT;" & vbCrLf
-    For idx = 0 To UBound(statuses)
-        statusName = CStr(statuses(idx))
-        tagFull = CStr(tagMap(statusName))
-        cpCall = BuildCpTagStatisticExLiteral(runtimeCatalog, tagFull, t1, t2, aggExpr)
-        sqlText = sqlText & "SET @cpStart = SYSDATETIME();" & vbCrLf
-        sqlText = sqlText & "BEGIN TRY" & vbCrLf
-        sqlText = sqlText & "  SET @insertedRows = 0;" & vbCrLf
-        sqlText = sqlText & "  INSERT INTO @Status (frac) EXEC " & cpCall & ";" & vbCrLf
-        sqlText = sqlText & "  SET @insertedRows = @@ROWCOUNT;" & vbCrLf
-        sqlText = sqlText & "  UPDATE @Status SET status_alias='" & CStr(aliases(idx)) & "' WHERE status_alias IS NULL;" & vbCrLf
-        sqlText = sqlText & "  UPDATE d SET " & _
-                 "inserted_rows = @insertedRows, " & _
-                 "is_numeric = CASE WHEN @insertedRows > 0 AND EXISTS (SELECT 1 FROM @Status s WHERE s.status_alias=d.status_alias AND TRY_CONVERT(FLOAT, s.frac) IS NOT NULL) THEN 1 ELSE 0 END, " & _
-                 "elapsed_ms = DATEDIFF(MILLISECOND, @cpStart, SYSDATETIME()), " & _
-                 "error_number = NULL, error_severity = NULL, error_state = NULL, error_procedure = NULL, error_line = NULL, error_message = NULL " & _
-                 "FROM @StatusDiag d WHERE d.status_alias='" & CStr(aliases(idx)) & "';" & vbCrLf
-        sqlText = sqlText & "END TRY" & vbCrLf
-        sqlText = sqlText & "BEGIN CATCH" & vbCrLf
-        sqlText = sqlText & "  UPDATE d SET " & _
-                 "inserted_rows = 0, " & _
-                 "is_numeric = 0, " & _
-                 "elapsed_ms = DATEDIFF(MILLISECOND, @cpStart, SYSDATETIME()), " & _
-                 "error_number = ERROR_NUMBER(), " & _
-                 "error_severity = ERROR_SEVERITY(), " & _
-                 "error_state = ERROR_STATE(), " & _
-                 "error_procedure = ERROR_PROCEDURE(), " & _
-                 "error_line = ERROR_LINE(), " & _
-                 "error_message = ERROR_MESSAGE() " & _
-                 "FROM @StatusDiag d WHERE d.status_alias='" & CStr(aliases(idx)) & "';" & vbCrLf
-        sqlText = sqlText & "END CATCH" & vbCrLf
-    Next
-    sqlText = sqlText & "SELECT " & _
-              "(SELECT MAX(s.frac) FROM @Status s WHERE s.status_alias='a') AS a," & _
-              "(SELECT MAX(s.frac) FROM @Status s WHERE s.status_alias='h') AS h," & _
-              "(SELECT MAX(s.frac) FROM @Status s WHERE s.status_alias='r') AS r," & _
-              "(SELECT MAX(s.frac) FROM @Status s WHERE s.status_alias='w') AS w," & _
-              "(SELECT MAX(s.frac) FROM @Status s WHERE s.status_alias='i') AS i," & _
-              "(SELECT d.inserted_rows FROM @StatusDiag d WHERE d.status_alias='a') AS a_rows," & _
-              "(SELECT d.inserted_rows FROM @StatusDiag d WHERE d.status_alias='h') AS h_rows," & _
-              "(SELECT d.inserted_rows FROM @StatusDiag d WHERE d.status_alias='r') AS r_rows," & _
-              "(SELECT d.inserted_rows FROM @StatusDiag d WHERE d.status_alias='w') AS w_rows," & _
-              "(SELECT d.inserted_rows FROM @StatusDiag d WHERE d.status_alias='i') AS i_rows," & _
-              "(SELECT d.is_numeric FROM @StatusDiag d WHERE d.status_alias='a') AS a_num," & _
-              "(SELECT d.is_numeric FROM @StatusDiag d WHERE d.status_alias='h') AS h_num," & _
-              "(SELECT d.is_numeric FROM @StatusDiag d WHERE d.status_alias='r') AS r_num," & _
-              "(SELECT d.is_numeric FROM @StatusDiag d WHERE d.status_alias='w') AS w_num," & _
-              "(SELECT d.is_numeric FROM @StatusDiag d WHERE d.status_alias='i') AS i_num," & _
-              "(SELECT d.elapsed_ms FROM @StatusDiag d WHERE d.status_alias='a') AS a_ms," & _
-              "(SELECT d.elapsed_ms FROM @StatusDiag d WHERE d.status_alias='h') AS h_ms," & _
-              "(SELECT d.elapsed_ms FROM @StatusDiag d WHERE d.status_alias='r') AS r_ms," & _
-              "(SELECT d.elapsed_ms FROM @StatusDiag d WHERE d.status_alias='w') AS w_ms," & _
-              "(SELECT d.elapsed_ms FROM @StatusDiag d WHERE d.status_alias='i') AS i_ms," & _
-              "(SELECT d.error_number FROM @StatusDiag d WHERE d.status_alias='a') AS a_err_num," & _
-              "(SELECT d.error_number FROM @StatusDiag d WHERE d.status_alias='h') AS h_err_num," & _
-              "(SELECT d.error_number FROM @StatusDiag d WHERE d.status_alias='r') AS r_err_num," & _
-              "(SELECT d.error_number FROM @StatusDiag d WHERE d.status_alias='w') AS w_err_num," & _
-              "(SELECT d.error_number FROM @StatusDiag d WHERE d.status_alias='i') AS i_err_num," & _
-              "(SELECT d.error_message FROM @StatusDiag d WHERE d.status_alias='a') AS a_err_msg," & _
-              "(SELECT d.error_message FROM @StatusDiag d WHERE d.status_alias='h') AS h_err_msg," & _
-              "(SELECT d.error_message FROM @StatusDiag d WHERE d.status_alias='r') AS r_err_msg," & _
-              "(SELECT d.error_message FROM @StatusDiag d WHERE d.status_alias='w') AS w_err_msg," & _
-              "(SELECT d.error_message FROM @StatusDiag d WHERE d.status_alias='i') AS i_err_msg;"
-
-    On Error Resume Next
-    Set cmd = CreateObject("ADODB.Command")
-    Set cmd.ActiveConnection = cn
-    cmd.CommandTimeout = cappedTimeoutSeconds
-    cmd.CommandType = adCmdText
-    cmd.CommandText = sqlText
-
-    If CURRENT_LOG_LEVEL >= LOG_LEVEL_DEBUG Then
-        LogMsg LOG_LEVEL_DEBUG, "GetStatusFractionsBatch", "SQL=[" & sqlText & "]"
-    End If
-
-    Set rs = cmd.Execute
-    If Err.Number <> 0 Then
-        queryFailureKind = "db_query_failed"
-        queryFailureDetail = S(Err.Description)
-        Err.Clear
-    Else
-        foundDataRecordset = 0
-        Do While Not (rs Is Nothing)
-            If rs.Fields.Count >= 5 Then
-                foundDataRecordset = 1
-                Exit Do
-            End If
-            Set rs = rs.NextRecordset
-            If Err.Number <> 0 Then
-                queryFailureKind = "parse_failure"
-                queryFailureDetail = "next_recordset_failed"
-                Err.Clear
-                Exit Do
-            End If
-        Loop
-
-        If foundDataRecordset = 0 Then
-            queryFailureKind = "empty_result"
-            queryFailureDetail = "recordset_eof_or_no_data_recordset"
-        ElseIf rs.EOF Then
-            queryFailureKind = "empty_result"
-            queryFailureDetail = "recordset_eof"
-        Else
-            hasUsableRow = 1
-
-            fieldValue = rs.Fields("a").Value
-            If Err.Number <> 0 Then
-                parseFieldFailure = 1
-            ElseIf IsNumeric(fieldValue) Then
-                outDict("Aborted") = CDbl(fieldValue)
-                hasNumericCount = hasNumericCount + 1
-            End If
-            Err.Clear
-            fieldValue = rs.Fields("h").Value
-            If Err.Number <> 0 Then
-                parseFieldFailure = 1
-            ElseIf IsNumeric(fieldValue) Then
-                outDict("Halted") = CDbl(fieldValue)
-                hasNumericCount = hasNumericCount + 1
-            End If
-            Err.Clear
-            fieldValue = rs.Fields("r").Value
-            If Err.Number <> 0 Then
-                parseFieldFailure = 1
-            ElseIf IsNumeric(fieldValue) Then
-                outDict("Running") = CDbl(fieldValue)
-                hasNumericCount = hasNumericCount + 1
-            End If
-            Err.Clear
-            fieldValue = rs.Fields("w").Value
-            If Err.Number <> 0 Then
-                parseFieldFailure = 1
-            ElseIf IsNumeric(fieldValue) Then
-                outDict("Waiting") = CDbl(fieldValue)
-                hasNumericCount = hasNumericCount + 1
-            End If
-            Err.Clear
-            fieldValue = rs.Fields("i").Value
-            If Err.Number <> 0 Then
-                parseFieldFailure = 1
-            ElseIf IsNumeric(fieldValue) Then
-                outDict("Interrupted") = CDbl(fieldValue)
-                hasNumericCount = hasNumericCount + 1
-            End If
-            Err.Clear
-
-            If rs.Fields.Count >= 20 Then
-                insertedRowsValue = rs.Fields("a_rows").Value: If IsNumeric(insertedRowsValue) Then diagRows("a") = CLng(insertedRowsValue)
-                insertedRowsValue = rs.Fields("h_rows").Value: If IsNumeric(insertedRowsValue) Then diagRows("h") = CLng(insertedRowsValue)
-                insertedRowsValue = rs.Fields("r_rows").Value: If IsNumeric(insertedRowsValue) Then diagRows("r") = CLng(insertedRowsValue)
-                insertedRowsValue = rs.Fields("w_rows").Value: If IsNumeric(insertedRowsValue) Then diagRows("w") = CLng(insertedRowsValue)
-                insertedRowsValue = rs.Fields("i_rows").Value: If IsNumeric(insertedRowsValue) Then diagRows("i") = CLng(insertedRowsValue)
-
-                isNumericValue = rs.Fields("a_num").Value: If IsNumeric(isNumericValue) Then diagNumeric("a") = CLng(isNumericValue)
-                isNumericValue = rs.Fields("h_num").Value: If IsNumeric(isNumericValue) Then diagNumeric("h") = CLng(isNumericValue)
-                isNumericValue = rs.Fields("r_num").Value: If IsNumeric(isNumericValue) Then diagNumeric("r") = CLng(isNumericValue)
-                isNumericValue = rs.Fields("w_num").Value: If IsNumeric(isNumericValue) Then diagNumeric("w") = CLng(isNumericValue)
-                isNumericValue = rs.Fields("i_num").Value: If IsNumeric(isNumericValue) Then diagNumeric("i") = CLng(isNumericValue)
-
-                statusElapsedMs = rs.Fields("a_ms").Value: If IsNumeric(statusElapsedMs) Then diagElapsedMs("a") = CLng(statusElapsedMs)
-                statusElapsedMs = rs.Fields("h_ms").Value: If IsNumeric(statusElapsedMs) Then diagElapsedMs("h") = CLng(statusElapsedMs)
-                statusElapsedMs = rs.Fields("r_ms").Value: If IsNumeric(statusElapsedMs) Then diagElapsedMs("r") = CLng(statusElapsedMs)
-                statusElapsedMs = rs.Fields("w_ms").Value: If IsNumeric(statusElapsedMs) Then diagElapsedMs("w") = CLng(statusElapsedMs)
-                statusElapsedMs = rs.Fields("i_ms").Value: If IsNumeric(statusElapsedMs) Then diagElapsedMs("i") = CLng(statusElapsedMs)
-            End If
-            If rs.Fields.Count >= 30 Then
-                errNumberValue = rs.Fields("a_err_num").Value: If IsNumeric(errNumberValue) Then diagErrNum("a") = CLng(errNumberValue)
-                errNumberValue = rs.Fields("h_err_num").Value: If IsNumeric(errNumberValue) Then diagErrNum("h") = CLng(errNumberValue)
-                errNumberValue = rs.Fields("r_err_num").Value: If IsNumeric(errNumberValue) Then diagErrNum("r") = CLng(errNumberValue)
-                errNumberValue = rs.Fields("w_err_num").Value: If IsNumeric(errNumberValue) Then diagErrNum("w") = CLng(errNumberValue)
-                errNumberValue = rs.Fields("i_err_num").Value: If IsNumeric(errNumberValue) Then diagErrNum("i") = CLng(errNumberValue)
-
-                errMessageValue = rs.Fields("a_err_msg").Value: If Not IsNull(errMessageValue) Then diagErrMsg("a") = CStr(errMessageValue)
-                errMessageValue = rs.Fields("h_err_msg").Value: If Not IsNull(errMessageValue) Then diagErrMsg("h") = CStr(errMessageValue)
-                errMessageValue = rs.Fields("r_err_msg").Value: If Not IsNull(errMessageValue) Then diagErrMsg("r") = CStr(errMessageValue)
-                errMessageValue = rs.Fields("w_err_msg").Value: If Not IsNull(errMessageValue) Then diagErrMsg("w") = CStr(errMessageValue)
-                errMessageValue = rs.Fields("i_err_msg").Value: If Not IsNull(errMessageValue) Then diagErrMsg("i") = CStr(errMessageValue)
-            End If
-            If parseFieldFailure <> 0 Then
-                queryFailureKind = "parse_failure"
-                queryFailureDetail = "field_access_error"
-            Else
-                batchOk = 1
-            End If
-        End If
-    End If
-
-    If Not (rs Is Nothing) Then rs.Close
-    On Error GoTo 0
-
-    Set rs = Nothing
-    Set cmd = Nothing
-
-    For idx = 0 To UBound(statuses)
-        aliasKey = CStr(aliases(idx))
-        statusLabel = CStr(statuses(idx))
-        insertedRowsValue = 0
-        isNumericValue = 0
-        insertedFlag = 0
-        numericFlag = 0
-        statusElapsedMs = 0
-        errNumberValue = 0
-        errMessageValue = ""
-
-        If diagRows.Exists(aliasKey) Then insertedRowsValue = CLng(diagRows(aliasKey))
-        If diagNumeric.Exists(aliasKey) Then isNumericValue = CLng(diagNumeric(aliasKey))
-        If diagElapsedMs.Exists(aliasKey) Then statusElapsedMs = CLng(diagElapsedMs(aliasKey))
-        If diagErrNum.Exists(aliasKey) Then errNumberValue = CLng(diagErrNum(aliasKey))
-        If diagErrMsg.Exists(aliasKey) Then errMessageValue = CStr(diagErrMsg(aliasKey))
-        If insertedRowsValue > 0 Then insertedFlag = 1
-        If isNumericValue <> 0 Then numericFlag = 1
-        If insertedFlag = 1 Then insertedStatusCount = insertedStatusCount + 1
-
-        tagFull = CStr(tagMap(statusLabel))
-        LogMsg LOG_LEVEL_INFO, "GetStatusFractionsBatch", _
-               "status_diag machine=" & machineId & _
-               " window=" & periodKey & _
-               " agg=" & aggExpr & _
-               " status=" & statusLabel & _
-               " tag_full=" & tagFull & _
-               " inserted=" & insertedFlag & _
-               " inserted_rows=" & insertedRowsValue & _
-               " is_numeric=" & numericFlag & _
-               " elapsed_ms=" & statusElapsedMs & _
-               " err_num=" & errNumberValue & _
-               " err_msg=" & errMessageValue
-    Next
-    If hasNumericCount = 0 And insertedStatusCount = 5 Then allNullNoNumeric = 1
-
-    completedAt = Now
-    elapsedMsValue = ElapsedMs(startTimer)
-    If batchOk = 1 Then
-        valA = outDict("Aborted")
-        valH = outDict("Halted")
-        valR = outDict("Running")
-        valW = outDict("Waiting")
-        valI = outDict("Interrupted")
-        infoMsg = "machine=" & machineId & _
-                  " window=" & periodKey & _
-                  " agg=" & aggExpr & _
-                  " sql_from=" & TS3(t1) & _
-                  " sql_to=" & TS3(t2) & _
-                  " started=" & TS3(startedAt) & _
-                  " ended=" & TS3(completedAt) & _
-                  " elapsed_ms=" & elapsedMsValue & _
-                  " numeric=" & hasNumericCount & _
-                  " a=" & valA & _
-                  " h=" & valH & _
-                  " r=" & valR & _
-                  " w=" & valW & _
-                  " i=" & valI
-        LogMsg LOG_LEVEL_INFO, "GetStatusFractionsBatch", infoMsg
-        Set ExecuteStatusFractionsBatch = outDict
-    Else
-        If queryFailureKind = "none" Then
-            If hasUsableRow = 0 Then
-                queryFailureKind = "empty_result"
-                queryFailureDetail = "no_usable_result_row"
-            Else
-                queryFailureKind = "parse_failure"
-                queryFailureDetail = "non_numeric_or_invalid_fields"
-            End If
-        End If
-        LogMsg LOG_LEVEL_WARN, "GetStatusFractionsBatch", _
-               "batch_result_event machine=" & machineId & _
-               " window=" & periodKey & _
-               " agg=" & aggExpr & _
-               " event=" & queryFailureKind & _
-               " detail=" & queryFailureDetail & _
-               " timeout_baseline_s=" & baselineTimeoutSeconds & _
-               " timeout_capped_s=" & cappedTimeoutSeconds & _
-               " budget_remaining_ms=" & remainingBudgetMs
-        LogMsg LOG_LEVEL_WARN, "GetStatusFractionsBatch", _
-               "batch_result_invalid machine=" & machineId & _
-               " window=" & periodKey & _
-               " agg=" & aggExpr & _
-               " sql_from=" & TS3(t1) & _
-               " sql_to=" & TS3(t2) & _
-               " started=" & TS3(startedAt) & _
-               " ended=" & TS3(completedAt) & _
-               " elapsed_ms=" & elapsedMsValue & _
-               " reason=" & queryFailureKind
-        LogMsg LOG_LEVEL_WARN, "GetStatusFractionsBatch", _
-               "degraded_period_record machine=" & machineId & _
-               " window=" & periodKey & _
-               " agg=" & aggExpr & _
-               " cause=" & queryFailureKind & _
-               " output=invalid_input_mode"
-        Set ExecuteStatusFractionsBatch = Nothing
-    End If
-
-    queryFailureKindOut = queryFailureKind
-    If batchOk = 0 Then
-        If IsTimeoutLikeError(queryFailureDetail) Then
-            timeoutLikeFailureOut = 1
-        Else
-            timeoutLikeFailureOut = 0
-        End If
-    End If
-
-    Set cacheEntry = CreateObject("Scripting.Dictionary")
-    cacheEntry.Add "hasNumericCount", hasNumericCount
-    cacheEntry.Add "insertedStatusCount", insertedStatusCount
-    cacheEntry.Add "allNullNoNumeric", allNullNoNumeric
-    cacheEntry.Add "batchOk", batchOk
-    cacheEntry.Add "queryFailureKind", CStr(queryFailureKindOut)
-    cacheEntry.Add "timeoutLikeFailure", CLng(timeoutLikeFailureOut)
-    If ExecuteStatusFractionsBatch Is Nothing Then
-        cacheEntry.Add "hasOutDict", 0
-    Else
-        cacheEntry.Add "hasOutDict", 1
-        cacheEntry.Add "Aborted", CDbl(ExecuteStatusFractionsBatch("Aborted"))
-        cacheEntry.Add "Halted", CDbl(ExecuteStatusFractionsBatch("Halted"))
-        cacheEntry.Add "Running", CDbl(ExecuteStatusFractionsBatch("Running"))
-        cacheEntry.Add "Waiting", CDbl(ExecuteStatusFractionsBatch("Waiting"))
-        cacheEntry.Add "Interrupted", CDbl(ExecuteStatusFractionsBatch("Interrupted"))
-    End If
-    TrimCacheIfNeeded g_batchResultCache, BATCH_RESULT_CACHE_MAX_ENTRIES, "g_batchResultCache"
-    Set g_batchResultCache(cacheKey) = cacheEntry
-End Function
-
-Private Function GetStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal periodKey, ByVal t1, ByVal t2)
-    Dim aggs, idx, aggExpr
-    Dim currentDict, bestDict
-    Dim hasCurrentDict, hasBestDict, currentDictReady
-    Dim numericCount, bestNumericCount, insertedStatusCount, allNullNoNumeric, batchOk
-    Dim currentSum, bestSum
-    Dim selectedAgg, selectedIdx, aggTrialSummary, currentTrial, fastFailApplied, fallbackUsed, zeroInsertedWarnLogged
-    Dim queryFailureCount
-    Dim tagMap, allowFallbackAggs, selectedPath
-    Dim persistedAggAtStart
-    Dim aggBudgetStart, aggBudgetUsedMs, aggBudgetRemainingMs, aggBudgetStopReason, aggBudgetLimitMs
-    Dim aggBudgetUsedMsReported, aggBudgetOverLimitMs
-    Dim queryFailureKind, timeoutLikeFailure, skipFallbackScanDueTimeout
-    Dim baselineTimeoutSeconds, cappedTimeoutSeconds
-
-    aggs = GetAggExprListForMachineCatalog(runtimeCatalog, machineId)
-    persistedAggAtStart = GetPersistedBatchAgg(machineId, runtimeCatalog)
-    Set tagMap = BuildStatusTagMap(machineId, periodKey, t1, t2)
-    bestNumericCount = -1
-    bestSum = -1
-    selectedAgg = ""
-    selectedIdx = -1
-    aggTrialSummary = ""
-    fastFailApplied = 0
-    fallbackUsed = 0
-    zeroInsertedWarnLogged = 0
-    queryFailureCount = 0
-    allowFallbackAggs = 0
-    selectedPath = "no_data"
-    aggBudgetStart = Timer
-    aggBudgetStopReason = "completed"
-    aggBudgetLimitMs = GetAggTimeoutBudgetMs(periodKey)
-    skipFallbackScanDueTimeout = 0
-    Set bestDict = Nothing
-
-    For idx = 0 To UBound(aggs)
-        aggBudgetUsedMs = ElapsedMs(aggBudgetStart)
-        aggBudgetRemainingMs = aggBudgetLimitMs - aggBudgetUsedMs
-        If aggBudgetRemainingMs <= 0 Then
-            aggBudgetStopReason = "normal_agg_budget_exhausted"
-            Exit For
-        End If
-        If idx > 0 And allowFallbackAggs = 0 And queryFailureCount = 0 Then Exit For
-
-        aggExpr = CStr(aggs(idx))
-        baselineTimeoutSeconds = GetAggCommandTimeoutSeconds(periodKey)
-        cappedTimeoutSeconds = GetAggCommandTimeoutSecondsCapped(periodKey, aggBudgetRemainingMs)
-        If aggBudgetRemainingMs < MIN_QUERY_START_BUDGET_MS Then
-            aggBudgetStopReason = "insufficient_remaining_budget_to_start_trial"
-            LogMsg LOG_LEVEL_WARN, "GetStatusFractionsBatch", _
-                   "agg_budget_guard_stop machine=" & machineId & _
-                   " window=" & periodKey & _
-                   " catalog=" & runtimeCatalog & _
-                   " agg=" & aggExpr & _
-                   " budget_remaining_ms=" & aggBudgetRemainingMs & _
-                   " min_start_budget_ms=" & MIN_QUERY_START_BUDGET_MS & _
-                   " budget_stop_reason=insufficient_remaining_budget_to_start_trial"
-            Exit For
-        End If
-        Set currentDict = ExecuteStatusFractionsBatch(cn, runtimeCatalog, machineId, periodKey, t1, t2, aggExpr, tagMap, aggBudgetRemainingMs, numericCount, insertedStatusCount, allNullNoNumeric, batchOk, queryFailureKind, timeoutLikeFailure, baselineTimeoutSeconds, cappedTimeoutSeconds)
-        hasCurrentDict = IsObject(currentDict)
-        currentDictReady = 0
-        If batchOk = 1 Then
-            If hasCurrentDict Then
-                If Not (currentDict Is Nothing) Then
-                    currentDictReady = 1
-                    currentSum = SumStatusFractions(currentDict)
-                    currentTrial = aggExpr & "{ok=1,numeric=" & numericCount & ",inserted=" & insertedStatusCount & ",sum=" & currentSum & ",timeout_base_s=" & baselineTimeoutSeconds & ",timeout_cap_s=" & cappedTimeoutSeconds & ",budget_remaining_ms=" & aggBudgetRemainingMs & "}"
-                    If idx = 0 Then
-                        If numericCount > 0 Then
-                            Set bestDict = CopyStatusFractions(currentDict)
-                            bestNumericCount = numericCount
-                            bestSum = currentSum
-                            selectedAgg = aggExpr
-                            selectedIdx = idx
-                            If numericCount < 5 Then
-                                selectedPath = "batch_degraded"
-                            Else
-                                selectedPath = "batch"
-                            End If
-                            Exit For
-                        Else
-                            allowFallbackAggs = 1
-                        End If
-                    End If
-                Else
-                    currentSum = 0
-                    currentTrial = aggExpr & "{ok=0,query_failure=1,timeout_base_s=" & baselineTimeoutSeconds & ",timeout_cap_s=" & cappedTimeoutSeconds & ",budget_remaining_ms=" & aggBudgetRemainingMs & "}"
-                    queryFailureCount = queryFailureCount + 1
-                End If
-            Else
-                currentSum = 0
-                currentTrial = aggExpr & "{ok=0,query_failure=1,timeout_base_s=" & baselineTimeoutSeconds & ",timeout_cap_s=" & cappedTimeoutSeconds & ",budget_remaining_ms=" & aggBudgetRemainingMs & "}"
-                queryFailureCount = queryFailureCount + 1
-            End If
-        Else
-            currentSum = 0
-            currentTrial = aggExpr & "{ok=0,query_failure=1,timeout_base_s=" & baselineTimeoutSeconds & ",timeout_cap_s=" & cappedTimeoutSeconds & ",budget_remaining_ms=" & aggBudgetRemainingMs & "}"
-            queryFailureCount = queryFailureCount + 1
-            If idx = 0 And timeoutLikeFailure <> 0 Then
-                skipFallbackScanDueTimeout = 1
-            End If
-            LogMsg LOG_LEVEL_WARN, "GetStatusFractionsBatch", _
-                   "agg_query_failed machine=" & machineId & _
-                   " window=" & periodKey & _
-                   " catalog=" & runtimeCatalog & _
-                   " agg=" & aggExpr & _
-                   " reason=" & queryFailureKind & _
-                   " sql_from=" & TS3(t1) & _
-                   " sql_to=" & TS3(t2) & _
-                   " timeout_baseline_s=" & baselineTimeoutSeconds & _
-                   " timeout_capped_s=" & cappedTimeoutSeconds & _
-                   " budget_remaining_ms=" & aggBudgetRemainingMs & _
-                   " fallback_scan_skipped_due_timeout=" & skipFallbackScanDueTimeout
-            If idx = 0 And timeoutLikeFailure <> 0 Then
-                aggBudgetStopReason = "first_agg_timeout_like_failure"
-                Exit For
-            End If
-        End If
-        If Len(aggTrialSummary) > 0 Then
-            aggTrialSummary = aggTrialSummary & "; "
-        End If
-        aggTrialSummary = aggTrialSummary & currentTrial
-
-        If batchOk = 1 And zeroInsertedWarnLogged = 0 Then
-            If insertedStatusCount > 0 And currentSum = 0 Then
-                LogMsg LOG_LEVEL_WARN, "GetStatusFractionsBatch", _
-                       "zero_sum_with_inserted_rows machine=" & machineId & _
-                       " window=" & periodKey & _
-                       " catalog=" & runtimeCatalog & _
-                       " agg=" & aggExpr & _
-                       " inserted_statuses=" & insertedStatusCount & _
-                       " numeric=" & numericCount & _
-                       " sum=" & currentSum
-                zeroInsertedWarnLogged = 1
-            End If
-        End If
-
-        If batchOk = 1 Then
-            If currentDictReady <> 0 Then
-                hasBestDict = IsObject(bestDict)
-            If Not hasBestDict Then
-                Set bestDict = CopyStatusFractions(currentDict)
-                bestNumericCount = numericCount
-                bestSum = currentSum
-                selectedAgg = aggExpr
-                selectedIdx = idx
-                If numericCount < 5 Then
-                    selectedPath = "batch_degraded"
-                Else
-                    selectedPath = "batch"
-                End If
-            Else
-                If bestDict Is Nothing Then
-                    Set bestDict = CopyStatusFractions(currentDict)
-                    bestNumericCount = numericCount
-                    bestSum = currentSum
-                    selectedAgg = aggExpr
-                    selectedIdx = idx
-                    If numericCount < 5 Then
-                        selectedPath = "batch_degraded"
-                    Else
-                        selectedPath = "batch"
-                    End If
-                ElseIf (numericCount > bestNumericCount) Or _
-                       (numericCount = bestNumericCount And currentSum > bestSum And bestSum <= 0) Then
-                    Set bestDict = CopyStatusFractions(currentDict)
-                    bestNumericCount = numericCount
-                    bestSum = currentSum
-                    selectedAgg = aggExpr
-                    selectedIdx = idx
-                    If numericCount < 5 Then
-                        selectedPath = "batch_degraded"
-                    Else
-                        selectedPath = "batch"
-                    End If
-                End If
-            End If
-            End If
-        End If
-SkipBestSelection:
-
-        If batchOk = 1 And idx = 0 And allNullNoNumeric = 1 Then
-            fastFailApplied = 1
-            LogMsg LOG_LEVEL_WARN, "GetStatusFractionsBatch", _
-                   "fast_fail_unsupported_first_agg machine=" & machineId & _
-                   " window=" & periodKey & _
-                   " catalog=" & runtimeCatalog & _
-                   " agg=" & aggExpr & _
-                   " reason=all_null_no_numeric; continuing_fallback_scan=1"
-            allowFallbackAggs = 1
-        End If
-
-        If batchOk = 1 And numericCount = 5 And currentSum > 0 Then Exit For
-    Next
-
-    If selectedIdx > 0 Then fallbackUsed = 1
-    aggBudgetUsedMs = ElapsedMs(aggBudgetStart)
-    aggBudgetRemainingMs = aggBudgetLimitMs - aggBudgetUsedMs
-    If aggBudgetRemainingMs < 0 Then aggBudgetRemainingMs = 0
-    aggBudgetOverLimitMs = aggBudgetUsedMs - aggBudgetLimitMs
-    aggBudgetUsedMsReported = aggBudgetUsedMs
-    If aggBudgetUsedMsReported > (aggBudgetLimitMs + AGG_BUDGET_LOG_OVERHEAD_MS) Then
-        aggBudgetUsedMsReported = aggBudgetLimitMs + AGG_BUDGET_LOG_OVERHEAD_MS
-    End If
-    If aggBudgetOverLimitMs > AGG_BUDGET_LOG_OVERHEAD_MS Then
-        LogMsg LOG_LEVEL_WARN, "GetStatusFractionsBatch", _
-               "agg_budget_over_limit machine=" & machineId & _
-               " window=" & periodKey & _
-               " catalog=" & runtimeCatalog & _
-               " budget_used_ms_raw=" & aggBudgetUsedMs & _
-               " budget_limit_ms=" & aggBudgetLimitMs & _
-               " allowed_overhead_ms=" & AGG_BUDGET_LOG_OVERHEAD_MS & _
-               " over_limit_ms=" & aggBudgetOverLimitMs
-    End If
-
-    LogMsg LOG_LEVEL_INFO, "GetStatusFractionsBatch", _
-           "agg_trials machine=" & machineId & _
-           " window=" & periodKey & _
-           " catalog=" & runtimeCatalog & _
-           " sql_from=" & TS3(t1) & _
-           " sql_to=" & TS3(t2) & _
-           " trials=[" & aggTrialSummary & "]" & _
-           " fast_fail=" & fastFailApplied & _
-           " data_path=" & selectedPath & _
-           " startup_or_cached_agg=" & persistedAggAtStart & _
-           " budget_used_ms=" & aggBudgetUsedMsReported & _
-           " budget_limit_ms=" & aggBudgetLimitMs & _
-           " budget_remaining_ms=" & aggBudgetRemainingMs & _
-           " budget_stop_reason=" & aggBudgetStopReason & _
-           " fallback_scan_skipped_due_timeout=" & skipFallbackScanDueTimeout
-
-    If IsObject(bestDict) Then
-        If Not (bestDict Is Nothing) Then
-            If bestNumericCount = 0 Then
-                LogMsg LOG_LEVEL_WARN, "GetStatusFractionsBatch", _
-                       "all_aggs_non_numeric machine=" & machineId & _
-                       " catalog=" & runtimeCatalog & _
-                       " window=" & periodKey & _
-                       " sql_from=" & TS3(t1) & _
-                       " sql_to=" & TS3(t2)
-            End If
-        End If
-    End If
-
-    hasBestDict = IsObject(bestDict)
-    If hasBestDict Then
-        If bestDict Is Nothing Then
-            If queryFailureCount = (UBound(aggs) + 1) Then
-                Set bestDict = ExecuteStatusFractionsSingleFallback(cn, runtimeCatalog, machineId, periodKey, t1, t2, tagMap, numericCount)
-                If IsObject(bestDict) Then
-                    If Not (bestDict Is Nothing) Then
-                        bestNumericCount = numericCount
-                        bestSum = SumStatusFractions(bestDict)
-                        selectedAgg = "single_status_path"
-                        selectedIdx = -1
-                        fallbackUsed = 1
-                        selectedPath = "fallback_single"
-                    End If
-                End If
-            End If
-        End If
-    End If
-
-    If bestDict Is Nothing Then
-        LogMsg LOG_LEVEL_WARN, "GetStatusFractionsBatch", _
-               "output_suppressed_due_query_failure machine=" & machineId & _
-               " window=" & periodKey & _
-               " catalog=" & runtimeCatalog & _
-               " sql_from=" & TS3(t1) & _
-               " sql_to=" & TS3(t2) & _
-               " failed_trials=" & queryFailureCount & _
-               " data_path=no_data"
-        Set GetStatusFractionsBatch = Nothing
-        Exit Function
-    End If
-
-    LogMsg LOG_LEVEL_INFO, "GetStatusFractionsBatch", _
-           "selected_agg machine=" & machineId & _
-           " window=" & periodKey & _
-           " catalog=" & runtimeCatalog & _
-           " agg=" & selectedAgg & _
-           " idx=" & selectedIdx & _
-           " fallback_used=" & fallbackUsed & _
-           " numeric=" & bestNumericCount & _
-           " sum=" & bestSum & _
-           " data_path=" & selectedPath
-
-    If bestNumericCount > 0 And bestNumericCount < 5 Then
-        LogMsg LOG_LEVEL_WARN, "GetStatusFractionsBatch", _
-               "partial_numeric_statuses_treated_as_degraded_usable machine=" & machineId & _
-               " window=" & periodKey & _
-               " catalog=" & runtimeCatalog & _
-               " agg=" & selectedAgg & _
-               " numeric=" & bestNumericCount
-    End If
-
-    If Len(selectedAgg) > 0 Then
-        PersistBatchAggWinner machineId, runtimeCatalog, selectedAgg, "batch_execute"
-    End If
-
-    LogMsg LOG_LEVEL_INFO, "GetStatusFractionsBatch", _
-           "batch_execution_final_agg machine=" & machineId & _
-           " window=" & periodKey & _
-           " catalog=" & runtimeCatalog & _
-           " agg=" & selectedAgg & _
-           " data_path=" & selectedPath
-
-    Set GetStatusFractionsBatch = bestDict
-End Function
-
-Private Function GetCountFraction(ByVal statusFractions, ByVal statusName)
-    On Error Resume Next
-    If (Not IsObject(statusFractions)) Then
-        GetCountFraction = 0
-    ElseIf (statusFractions Is Nothing) Then
-        GetCountFraction = 0
-    ElseIf statusFractions.Exists(statusName) Then
-        If IsNumeric(statusFractions(statusName)) Then
-            GetCountFraction = CDbl(statusFractions(statusName))
-        Else
-            GetCountFraction = 0
-        End If
-    Else
-        GetCountFraction = 0
-    End If
-    If Err.Number <> 0 Then
-        LogMsg LOG_LEVEL_WARN, "GetCombinedFractions", _
-               "status_fraction_object_invalid status=" & S(statusName) & _
-               " err=" & S(Err.Description)
-        Err.Clear
-        GetCountFraction = 0
-    End If
-    On Error GoTo 0
-End Function
-
-' ─────────────────────────────────────────────────────────────────────
-' Combine 5 → 3 (your rule), normalize if overlap makes sum > 1
-' ─────────────────────────────────────────────────────────────────────
-Private Sub GetCombinedFractions(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal periodKey, ByVal t1, ByVal t2, ByRef fRun, ByRef fHalt, ByRef fAbort, ByRef inputValid)
-    Dim a, h, r, w, i, total, statusFractions
-
-    ' Initialise outputs so callers always receive well-defined values
-    a = 0 : h = 0 : r = 0 : w = 0 : i = 0 : total = 0
-    fRun = 0 : fHalt = 0 : fAbort = 0
-    inputValid = False
-
-    Set statusFractions = GetStatusFractionsBatch(cn, runtimeCatalog, machineId, periodKey, t1, t2)
-    If Not IsObject(statusFractions) Then
-        LogMsg LOG_LEVEL_WARN, "GetCombinedFractions", _
-               "invalid_input_mode_continuing machineId=" & machineId & _
-               " periodKey=" & periodKey & _
-               " reason=batch_query_failure_or_invalid_result"
-        Exit Sub
-    End If
-    If statusFractions Is Nothing Then
-        LogMsg LOG_LEVEL_WARN, "GetCombinedFractions", _
-               "invalid_input_mode_continuing machineId=" & machineId & _
-               " periodKey=" & periodKey & _
-               " reason=batch_query_failure_or_invalid_result"
-        Exit Sub
-    End If
-    inputValid = True
-
-    a = GetCountFraction(statusFractions, "Aborted")
-    h = GetCountFraction(statusFractions, "Halted")
-    r = GetCountFraction(statusFractions, "Running")
-    w = GetCountFraction(statusFractions, "Waiting")
-    i = GetCountFraction(statusFractions, "Interrupted")
-
-    fRun   = r
-    fHalt  = h + i
-    fAbort = a + w
-
-    ' clamp just in case
-    If fRun < 0 Then fRun = 0
-    If fHalt < 0 Then fHalt = 0
-    If fAbort < 0 Then fAbort = 0
-
-    ' If your PLC logic overlaps states, sum can exceed 1 → normalize safely
-    total = fRun + fHalt + fAbort
-    If total > 1.000001 Then
-        fRun   = fRun / total
-        fHalt  = fHalt / total
-        fAbort = fAbort / total
-    End If
-End Sub
-
-' ─────────────────────────────────────────────────────────────────────
-' Output helpers
-' ─────────────────────────────────────────────────────────────────────
-Private Function OutTagName(ByVal machineId, ByVal periodKey, ByVal statusDispName, ByVal pieChart)
-    If pieChart Then
-        OutTagName = machineId & "_" & periodKey & "_Machine_" & statusDispName & "_Percentage_PieChart"
-    Else
-        OutTagName = machineId & "_" & periodKey & "_Machine_" & statusDispName & "_Percentage"
-    End If
-End Function
-
-Private Function IsPieChartOutputTag(ByVal tag)
-    IsPieChartOutputTag = (InStr(1, S(tag), "_Percentage_PieChart", vbTextCompare) > 0)
-End Function
-
-Private Sub WriteTag(ByVal tag, ByVal val)
-    Dim readBack, requestedVal, delta, isPieChartTag, hmiTag
-
-    isPieChartTag = IsPieChartOutputTag(tag)
-
-    On Error Resume Next
-    Set hmiTag = HMIRuntime.Tags(tag)
-    If Err.Number <> 0 Then
-        LogMsg LOG_LEVEL_WARN, "HMITag", "Resolve failed: " & S(tag) & " -> " & S(Err.Description)
-        Err.Clear
-        On Error GoTo 0
-        Exit Sub
-    End If
-    If Not IsObject(hmiTag) Then
-        LogMsg LOG_LEVEL_WARN, "HMITag", "Resolve returned invalid object: " & S(tag)
-        On Error GoTo 0
-        Exit Sub
-    End If
-    If hmiTag Is Nothing Then
-        LogMsg LOG_LEVEL_WARN, "HMITag", "Resolve returned invalid object: " & S(tag)
-        On Error GoTo 0
-        Exit Sub
-    End If
-
-    hmiTag.Write val
-    If Err.Number <> 0 Then
-        LogMsg LOG_LEVEL_WARN, "HMITag", "Write failed: " & S(tag) & " -> " & S(Err.Description)
-        Err.Clear
-        On Error GoTo 0
-        Exit Sub
-    End If
-
-    If CURRENT_LOG_LEVEL >= LOG_LEVEL_DEBUG And isPieChartTag Then
-        LogMsg LOG_LEVEL_DEBUG, "HMITag", "write_ok tag=" & S(tag) & " value=" & S(val)
-    End If
-
-    If CURRENT_LOG_LEVEL >= LOG_LEVEL_DEBUG And isPieChartTag Then
-        readBack = hmiTag.Read
-        If Err.Number <> 0 Then
-            LogMsg LOG_LEVEL_WARN, "HMITag", "Read-back failed: " & S(tag) & " -> " & S(Err.Description)
-            Err.Clear
-        ElseIf IsNumeric(readBack) And IsNumeric(val) Then
-            requestedVal = CDbl(val)
-            delta = Abs(CDbl(readBack) - requestedVal)
-            If delta > WRITE_VERIFY_TOLERANCE Then
-                LogMsg LOG_LEVEL_WARN, "HMITag", "write_mismatch tag=" & S(tag) & " wrote=" & requestedVal & " read=" & CDbl(readBack) & " delta=" & delta
-            End If
-        Else
-            LogMsg LOG_LEVEL_DEBUG, "HMITag", "write_verify_non_numeric tag=" & S(tag) & " wrote=" & S(val) & " read=" & S(readBack)
-        End If
-    End If
-    On Error GoTo 0
-End Sub
-
-Private Sub NormalizeFractionsToPct(ByVal runFrac, ByVal haltFrac, ByVal abortFrac, ByRef pctRun, ByRef pctHalt, ByRef pctAbort)
-    Dim safeRun, safeHalt, safeAbort, sumFrac
-    Dim rawRun, rawHalt, rawAbort
-    Dim floorRun, floorHalt, floorAbort
-    Dim remRun, remHalt, remAbort
-    Dim remaining
-
-    safeRun = CDbl(runFrac)
-    safeHalt = CDbl(haltFrac)
-    safeAbort = CDbl(abortFrac)
-
-    If safeRun < 0 Then safeRun = 0
-    If safeHalt < 0 Then safeHalt = 0
-    If safeAbort < 0 Then safeAbort = 0
-
-    sumFrac = safeRun + safeHalt + safeAbort
-    If sumFrac <= 0 Then
-        pctRun = 0
-        pctHalt = 0
-        pctAbort = 0
-        Exit Sub
-    End If
-
-    rawRun = (safeRun / sumFrac) * 100
-    rawHalt = (safeHalt / sumFrac) * 100
-    rawAbort = (safeAbort / sumFrac) * 100
-
-    floorRun = Int(rawRun)
-    floorHalt = Int(rawHalt)
-    floorAbort = Int(rawAbort)
-
-    remRun = rawRun - floorRun
-    remHalt = rawHalt - floorHalt
-    remAbort = rawAbort - floorAbort
-
-    remaining = 100 - (floorRun + floorHalt + floorAbort)
-
-    pctRun = floorRun
-    pctHalt = floorHalt
-    pctAbort = floorAbort
-
-    Do While remaining > 0
-        If remRun >= remHalt And remRun >= remAbort Then
-            pctRun = pctRun + 1
-            remRun = -1
-        ElseIf remHalt >= remRun And remHalt >= remAbort Then
-            pctHalt = pctHalt + 1
-            remHalt = -1
-        Else
-            pctAbort = pctAbort + 1
-            remAbort = -1
-        End If
-        remaining = remaining - 1
-    Loop
-End Sub
-
-Private Sub WriteNoRecentFallbackOutputs(ByVal machineId, ByVal periodKey, ByVal reason)
-    Dim tagPct, tagPie
-
-    On Error Resume Next
-
-    ' Keep main status percentages at zero for no-data windows.
-    tagPct = OutTagName(machineId, periodKey, "Running", False): WriteTag tagPct, 0
-    tagPct = OutTagName(machineId, periodKey, "Halted",  False): WriteTag tagPct, 0
-    tagPct = OutTagName(machineId, periodKey, "Aborted", False): WriteTag tagPct, 0
-
-    ' Match invalid/no-data rendering behavior: deterministic fallback pie split.
-    tagPie = OutTagName(machineId, periodKey, "Running", True): WriteTag tagPie, 34
-    tagPie = OutTagName(machineId, periodKey, "Halted",  True): WriteTag tagPie, 33
-    tagPie = OutTagName(machineId, periodKey, "Aborted", True): WriteTag tagPie, 33
-
-    LogMsg LOG_LEVEL_WARN, "NoRecentFallback", _
-           "no_recent_output_fallback_written machine=" & machineId & _
-           " period=" & periodKey & _
-           " reason=" & reason & _
-           " fallback_render_path=True"
-
-    On Error GoTo 0
-End Sub
-
-' ─────────────────────────────────────────────────────────────────────
-' Aggregate one period (writes Aborted/Halted/Running only)
-' ─────────────────────────────────────────────────────────────────────
-Private Sub AggregatePeriod(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal periodKey, ByVal startDt, ByVal endDt)
-    Dim fRun, fHalt, fAbort
-    Dim pctRun, pctHalt, pctAbort
-    Dim tagPct, tagPie, pieVal
-    Dim totalPct
-    Dim inputValid
-    Dim usedFallbackPie
-    Dim zeroTotalRenderMode
-    Dim procName, branchContext
-    Dim hasAggregateError, aggErrNumber, aggErrDescription
-
-    procName = "AggregatePeriod"
-    branchContext = "init"
-    hasAggregateError = False
-    aggErrNumber = 0
-    aggErrDescription = ""
-
-    fRun = 0 : fHalt = 0 : fAbort = 0
-    pctRun = 0 : pctHalt = 0 : pctAbort = 0
-    tagPct = "" : tagPie = "" : pieVal = 0
-    totalPct = 0
-    inputValid = False
-    usedFallbackPie = False
-    zeroTotalRenderMode = "preserve_zero"
-
-    On Error Resume Next
-    branchContext = "log_start"
-    LogMsg LOG_LEVEL_INFO, "Aggregate", machineId & " " & periodKey & "  " & TS3(startDt) & " -> " & TS3(endDt)
-    If Err.Number <> 0 Then
-        hasAggregateError = True
-        aggErrNumber = Err.Number
-        aggErrDescription = Err.Description
-        Err.Clear
-    End If
-
-    branchContext = "combined_fractions"
-    Call GetCombinedFractions(cn, runtimeCatalog, machineId, periodKey, startDt, endDt, fRun, fHalt, fAbort, inputValid)
-    If Err.Number <> 0 Then
-        hasAggregateError = True
-        aggErrNumber = Err.Number
-        aggErrDescription = Err.Description
-        Err.Clear
-    End If
-
-    If hasAggregateError Or (Not inputValid) Then
-        If hasAggregateError Then
-            LogMsg LOG_LEVEL_ERROR, "Aggregate", _
-                   "aggregate_internal_error procedure=" & procName & _
-                   " branch=" & branchContext & _
-                   " machineId=" & machineId & _
-                   " periodKey=" & periodKey & _
-                   " runtimeCatalog=" & runtimeCatalog & _
-                   " err_number=" & S(aggErrNumber) & _
-                   " err_description=" & S(aggErrDescription)
-        End If
-
-        branchContext = "invalid_or_error_fallback"
-        LogMsg LOG_LEVEL_WARN, "Aggregate", _
-               "aggregate_input_invalid machineId=" & machineId & _
-               " periodKey=" & periodKey & _
-               " runtimeCatalog=" & runtimeCatalog & _
-               " aggExpr=none_selected"
-
-        ' Invalid/no-data path: keep main percentage tags at 0 but force a
-        ' deterministic pie split so UI can distinguish this from true idle.
-        pctRun = 0: pctHalt = 0: pctAbort = 0
-        totalPct = 0
-        usedFallbackPie = True
-        zeroTotalRenderMode = "fallback"
-    Else
-        branchContext = "normalize"
-        NormalizeFractionsToPct fRun, fHalt, fAbort, pctRun, pctHalt, pctAbort
-        If Err.Number <> 0 Then
-            hasAggregateError = True
-            aggErrNumber = Err.Number
-            aggErrDescription = Err.Description
-            Err.Clear
-        End If
-
-        If hasAggregateError Then
-            LogMsg LOG_LEVEL_ERROR, "Aggregate", _
-                   "aggregate_internal_error procedure=" & procName & _
-                   " branch=" & branchContext & _
-                   " machineId=" & machineId & _
-                   " periodKey=" & periodKey & _
-                   " runtimeCatalog=" & runtimeCatalog & _
-                   " err_number=" & S(aggErrNumber) & _
-                   " err_description=" & S(aggErrDescription)
-            pctRun = 0: pctHalt = 0: pctAbort = 0
-            totalPct = 0
-            usedFallbackPie = True
-            zeroTotalRenderMode = "fallback"
-        Else
-            totalPct = pctRun + pctHalt + pctAbort
-
-            If totalPct = 0 And RENDER_ZERO_TOTAL_AS_FALLBACK_PIE Then
-                usedFallbackPie = True
-                zeroTotalRenderMode = "fallback"
-            End If
-        End If
-    End If
-
-    LogMsg LOG_LEVEL_INFO, "Aggregate", _
-           "computed machine=" & machineId & _
-           " period=" & periodKey & _
-           " input_valid=" & CStr(inputValid) & _
-           " pctRun=" & pctRun & _
-           " pctHalt=" & pctHalt & _
-           " pctAbort=" & pctAbort & _
-           " totalPct=" & totalPct & _
-           " fallback_render_path=" & CStr(usedFallbackPie) & _
-           " zero_total_render_mode=" & zeroTotalRenderMode
-
-    ' main % (can be 0)
-    branchContext = "write_main_percentages"
-    tagPct = OutTagName(machineId, periodKey, "Running", False): WriteTag tagPct, pctRun
-    tagPct = OutTagName(machineId, periodKey, "Halted",  False): WriteTag tagPct, pctHalt
-    tagPct = OutTagName(machineId, periodKey, "Aborted", False): WriteTag tagPct, pctAbort
-    If Err.Number <> 0 Then
-        hasAggregateError = True
-        aggErrNumber = Err.Number
-        aggErrDescription = Err.Description
-        Err.Clear
-    End If
-
-    ' pie chart output strategy:
-    ' 1) invalid/no-data input -> deterministic fallback split for rendering.
-    ' 2) valid input -> zero-total behavior is controlled by
-    '    RENDER_ZERO_TOTAL_AS_FALLBACK_PIE (fallback split vs preserved zeroes).
-    If usedFallbackPie Then
-        branchContext = "write_fallback_pie"
-        tagPie = OutTagName(machineId, periodKey, "Running", True): WriteTag tagPie, 34
-        tagPie = OutTagName(machineId, periodKey, "Halted",  True): WriteTag tagPie, 33
-        tagPie = OutTagName(machineId, periodKey, "Aborted", True): WriteTag tagPie, 33
-        LogMsg LOG_LEVEL_WARN, "Aggregate", _
-               "pie_fallback_applied machine=" & machineId & _
-               " period=" & periodKey & _
-               " input_valid=" & CStr(inputValid) & _
-               " totalPct=" & totalPct & _
-               " fallback_render_path=True" & _
-               " zero_total_render_mode=" & zeroTotalRenderMode
-    Else
-        branchContext = "write_standard_pie"
-        pieVal = pctRun:   If pieVal < 1 And totalPct > 0 Then pieVal = 1
-        tagPie = OutTagName(machineId, periodKey, "Running", True): WriteTag tagPie, pieVal
-
-        pieVal = pctHalt:  If pieVal < 1 And totalPct > 0 Then pieVal = 1
-        tagPie = OutTagName(machineId, periodKey, "Halted", True): WriteTag tagPie, pieVal
-
-        pieVal = pctAbort: If pieVal < 1 And totalPct > 0 Then pieVal = 1
-        tagPie = OutTagName(machineId, periodKey, "Aborted", True): WriteTag tagPie, pieVal
-
-        If totalPct = 0 Then
-            LogMsg LOG_LEVEL_INFO, "Aggregate", _
-                   "pie_idle_window_preserved machine=" & machineId & _
-                   " period=" & periodKey & _
-                   " input_valid=" & CStr(inputValid) & _
-                   " totalPct=" & totalPct & _
-                   " fallback_render_path=False" & _
-                   " zero_total_render_mode=" & zeroTotalRenderMode
-        End If
-    End If
-    If Err.Number <> 0 Then
-        hasAggregateError = True
-        aggErrNumber = Err.Number
-        aggErrDescription = Err.Description
-        Err.Clear
-    End If
-
-    If hasAggregateError Then
-        LogMsg LOG_LEVEL_ERROR, "Aggregate", _
-               "aggregate_internal_error procedure=" & procName & _
-               " branch=" & branchContext & _
-               " machineId=" & machineId & _
-               " periodKey=" & periodKey & _
-               " runtimeCatalog=" & runtimeCatalog & _
-               " err_number=" & S(aggErrNumber) & _
-               " err_description=" & S(aggErrDescription)
-    End If
-
-    LogMsg LOG_LEVEL_INFO, "Aggregate", _
-           "zero_total_render_mode=" & zeroTotalRenderMode & _
-           " machine=" & machineId & _
-           " period=" & periodKey
-
-    LogMsg LOG_LEVEL_INFO, "Aggregate", "writes_completed machine=" & machineId & " period=" & periodKey
-    On Error GoTo 0
-End Sub
-
-Private Function ShouldRun(ByVal lastRun, ByVal throttleMin)
-    If IsEmpty(lastRun) Or IsNull(lastRun) Then
-        ShouldRun = True
-        Exit Function
-    End If
-    ShouldRun = (DateDiff("n", lastRun, Now()) >= throttleMin)
-End Function
-
-Private Function RunWindowWithGuard(ByVal cn, ByVal rtCat, ByVal machineId, ByVal periodKey, ByVal tFrom, ByVal tTo, ByRef windowElapsedMs)
-    Dim windowTimer
-    windowElapsedMs = 0
-    windowTimer = Timer
-    On Error Resume Next
-    AggregatePeriod cn, rtCat, machineId, periodKey, tFrom, tTo
-    windowElapsedMs = ElapsedMs(windowTimer)
-    If Err.Number <> 0 Then
-        LogMsg LOG_LEVEL_ERROR, "RunWindowWithGuard", _
-               "window_guard_error machine=" & machineId & _
-               " period=" & periodKey & _
-               " err=" & S(Err.Description)
-        Err.Clear
-        windowElapsedMs = 0
-    End If
-    RunWindowWithGuard = (windowElapsedMs > WINDOW_EXEC_WARN_THRESHOLD_MS)
-    On Error GoTo 0
-End Function
-
-Private Function RunNoRecentWindowShortCircuitWithGuard(ByVal machineId, ByVal periodKey, ByVal reason, ByRef windowElapsedMs)
-    Dim windowTimer
-    windowElapsedMs = 0
-    windowTimer = Timer
-    On Error Resume Next
-    WriteNoRecentFallbackOutputs machineId, periodKey, reason
-    windowElapsedMs = ElapsedMs(windowTimer)
-    If Err.Number <> 0 Then
-        LogMsg LOG_LEVEL_ERROR, "RunNoRecentWindowShortCircuitWithGuard", _
-               "window_guard_error machine=" & machineId & _
-               " period=" & periodKey & _
-               " err=" & S(Err.Description)
-        Err.Clear
-        windowElapsedMs = 0
-    End If
-    LogMsg LOG_LEVEL_INFO, "RunNoRecentWindowShortCircuitWithGuard", _
-           "window_guard_short_circuit machine=" & machineId & _
-           " period=" & periodKey & _
-           " elapsed_ms=" & windowElapsedMs & _
-           " no_recent_short_circuit_applied=1"
-    RunNoRecentWindowShortCircuitWithGuard = (windowElapsedMs > WINDOW_EXEC_WARN_THRESHOLD_MS)
-    On Error GoTo 0
-End Function
-
-' ─────────────────────────────────────────────────────────────────────
-' Main Entry Point
-' ─────────────────────────────────────────────────────────────────────
 Public Sub MainStatusAggregation(ByVal machineId)
-    Dim cn, rtCat, nowDT
-    Dim tFrom, tTo
-    Dim key, lastRun
-    Dim due1D, due7D, due30D
-    Dim startedAt, completedAt, startTimer, totalElapsedMs
-    Dim guardReason, lockAcquired, canRun
-    Dim skipLowerPriority, windowElapsedMs
-    Dim validationState, validationReason, validationLookbackMinutes
-    Dim noRecentShortCircuitActive
-    Dim noRecentShortCircuitEligible
-    Dim noRecentStateWithinCooldown, noRecentStateTs
-    Dim noRecentCooldownUntil, noRecentStateAgeMinutes
-
-    ' WinCC VBScript does not support label-based handlers (On Error GoTo FAIL).
-    On Error Resume Next
-
-    startedAt = Now
-    startTimer = Timer
-    guardReason = "completed"
-    lockAcquired = False
-    canRun = True
-    skipLowerPriority = False
-    noRecentShortCircuitActive = False
-    noRecentShortCircuitEligible = False
-    Set cn = Nothing
+    Dim cn, runtimeCatalog
+    Dim targetPeriod, lookback
 
     InitGlobals
 
-    If Not TryAcquireMachineLock(machineId) Then
-        LogMsg LOG_LEVEL_WARN, "MainStatusAggregation", "Lock already active; skipping machineId: " & S(machineId)
-        guardReason = "skip_lock_held"
-        canRun = False
-    End If
-    If canRun Then lockAcquired = True
+    If Not IsMaster() Then Exit Sub
 
-    If canRun Then
-        If Not IsMaster() Then
-            guardReason = "skip_not_master"
-            canRun = False
-        End If
+    If Not G_MACHINES.Exists(machineId) Then
+        LogMsg LOG_LEVEL_WARN, "MainStatusAggregation", "unknown_machine=" & machineId
+        Exit Sub
     End If
 
-    If canRun Then
-        If Not G_MACHINES.Exists(machineId) Then
-            LogMsg LOG_LEVEL_WARN, "MainStatusAggregation", "Unknown machineId: " & S(machineId)
-            guardReason = "skip_unknown_machine"
-            canRun = False
-        End If
-    End If
+    targetPeriod = ""
+    lookback = 0
 
-    If canRun Then
-        nowDT = Now()
-        due1D = False : due7D = False : due30D = False
-
-        key = machineId & "|1D"
-        lastRun = Empty
-        If g_lastRunByMachinePeriod.Exists(key) Then lastRun = g_lastRunByMachinePeriod(key)
-        due1D = ShouldRun(lastRun, THROTTLE_1D_MINUTES)
-
-        key = machineId & "|7D"
-        lastRun = Empty
-        If g_lastRunByMachinePeriod.Exists(key) Then lastRun = g_lastRunByMachinePeriod(key)
-        due7D = ShouldRun(lastRun, THROTTLE_7D_MINUTES)
-
-        lastRun = Empty
-        key = machineId & "|30D"
-        If g_lastRunByMachinePeriod.Exists(key) Then lastRun = g_lastRunByMachinePeriod(key)
-        due30D = ShouldRun(lastRun, THROTTLE_30D_MINUTES)
-
-        ' Important: avoid SQL connection work when nothing is due.
-        If Not (due1D Or due7D Or due30D) Then
-            guardReason = "skip_throttle"
-            canRun = False
-        End If
-    End If
-
-    If canRun Then
-        Set cn = OpenConnection()
-        If cn Is Nothing Then
-            LogMsg LOG_LEVEL_ERROR, "MainStatusAggregation", "ERROR: cannot open SQL connection"
-            guardReason = "fail_open_connection"
-            canRun = False
-        ElseIf cn.State <> adStateOpen Then
-            LogMsg LOG_LEVEL_ERROR, "MainStatusAggregation", "ERROR: cannot open SQL connection"
-            guardReason = "fail_connection_state"
-            canRun = False
-        End If
-    End If
-
-    If canRun Then rtCat = GetRuntimeCatalog()
-    If canRun Then
-        validationLookbackMinutes = ResolveStartupValidationLookbackMinutes(due1D, due7D, due30D)
-        validationState = VALIDATE_STATE_HARD_FAIL
-        validationReason = ""
-        If Not ValidateMachineCountTags(cn, rtCat, machineId, validationLookbackMinutes, validationState, validationReason) Then
-            guardReason = "skip_startup_validation_failed"
-            canRun = False
-        ElseIf validationState = VALIDATE_STATE_NO_RECENT Then
-            noRecentStateTs = nowDT
-            If g_machineValidationLastTs.Exists(machineId) Then
-                noRecentStateTs = CDate(g_machineValidationLastTs(machineId))
-            End If
-            noRecentStateAgeMinutes = DateDiff("n", noRecentStateTs, nowDT)
-            If noRecentStateAgeMinutes < 0 Then noRecentStateAgeMinutes = 0
-            noRecentCooldownUntil = DateAdd("n", VALIDATE_RETRY_NORMAL_MINUTES, noRecentStateTs)
-            noRecentStateWithinCooldown = (DateDiff("s", nowDT, noRecentCooldownUntil) > 0)
-
-            noRecentShortCircuitEligible = noRecentStateWithinCooldown
-            noRecentShortCircuitActive = (STARTUP_NO_RECENT_SHORT_CIRCUIT = True) And noRecentStateWithinCooldown
-
-            If noRecentShortCircuitActive Then
-                LogMsg LOG_LEVEL_WARN, "MainStatusAggregation", _
-                       "startup_validation_warning machine=" & machineId & _
-                       " reason=" & validationReason & _
-                       " lookback_min=" & validationLookbackMinutes & _
-                       " action=skip_db_window_aggregation_and_write_fallback_outputs" & _
-                       " no_recent_short_circuit_applied=1" & _
-                       " cooldown_until=" & TS3(noRecentCooldownUntil) & _
-                       " state_age_minutes=" & noRecentStateAgeMinutes
-            Else
-                LogMsg LOG_LEVEL_WARN, "MainStatusAggregation", _
-                       "startup_validation_warning machine=" & machineId & _
-                       " reason=" & validationReason & _
-                       " lookback_min=" & validationLookbackMinutes & _
-                       " action=proceed_with_aggregation" & _
-                       " no_recent_short_circuit_applied=0" & _
-                       " cooldown_until=" & TS3(noRecentCooldownUntil) & _
-                       " state_age_minutes=" & noRecentStateAgeMinutes
-            End If
-        ElseIf validationReason = "degraded_probe_fail" Then
-            LogMsg LOG_LEVEL_WARN, "MainStatusAggregation", _
-                   "startup_validation_degraded machine=" & machineId & _
-                   " reason=" & validationReason & _
-                   " lookback_min=" & validationLookbackMinutes & _
-                   " action=proceed_with_aggregation"
-        End If
-    End If
-    If canRun Then
-        LogMsg LOG_LEVEL_INFO, "MainStatusAggregation", _
-               "aggregation_start machine=" & machineId & _
-               " cn_state=" & CStr(cn.State) & _
-               " runtime_catalog=" & rtCat
-    End If
-
-    ' Execute due periods by priority:
-    ' 1D -> 7D -> 30D
-    ' If any period exceeds threshold, skip lower-priority windows for responsiveness.
-    If canRun Then
-        If due1D Then
-            If noRecentShortCircuitActive Then
-                Err.Clear
-                skipLowerPriority = RunNoRecentWindowShortCircuitWithGuard(machineId, "1D", validationReason, windowElapsedMs)
-                If Err.Number <> 0 Then
-                    LogMsg LOG_LEVEL_ERROR, "MainStatusAggregation", _
-                           "window_error machine=" & machineId & _
-                           " period=1D err=" & S(Err.Description)
-                    Err.Clear
-                Else
-                    If skipLowerPriority Then
-                        LogMsg LOG_LEVEL_WARN, "MainStatusAggregation", _
-                               "window_slow machine=" & machineId & _
-                               " period=1D elapsed_ms=" & windowElapsedMs & _
-                               " threshold_ms=" & WINDOW_EXEC_WARN_THRESHOLD_MS
-                    End If
-                    g_lastRunByMachinePeriod(machineId & "|1D") = nowDT
-                    guardReason = "startup_no_recent_short_circuit_1D"
-                End If
-            Else
-                tTo = nowDT: tFrom = DateAdd("d", -1, tTo)
-                Err.Clear
-                skipLowerPriority = RunWindowWithGuard(cn, rtCat, machineId, "1D", tFrom, tTo, windowElapsedMs)
-                If Err.Number <> 0 Then
-                    LogMsg LOG_LEVEL_ERROR, "MainStatusAggregation", _
-                           "window_error machine=" & machineId & _
-                           " period=1D err=" & S(Err.Description)
-                    Err.Clear
-                Else
-                    If skipLowerPriority Then
-                        LogMsg LOG_LEVEL_WARN, "MainStatusAggregation", _
-                               "window_slow machine=" & machineId & _
-                               " period=1D elapsed_ms=" & windowElapsedMs & _
-                               " threshold_ms=" & WINDOW_EXEC_WARN_THRESHOLD_MS
-                    End If
-                    g_lastRunByMachinePeriod(machineId & "|1D") = nowDT
-                    guardReason = "ran_1D"
-                End If
-            End If
-        End If
-
-        If due7D And (Not skipLowerPriority) Then
-            If noRecentShortCircuitActive Then
-                Err.Clear
-                skipLowerPriority = RunNoRecentWindowShortCircuitWithGuard(machineId, "7D", validationReason, windowElapsedMs)
-                If Err.Number <> 0 Then
-                    LogMsg LOG_LEVEL_ERROR, "MainStatusAggregation", _
-                           "window_error machine=" & machineId & _
-                           " period=7D err=" & S(Err.Description)
-                    Err.Clear
-                Else
-                    If skipLowerPriority Then
-                        LogMsg LOG_LEVEL_WARN, "MainStatusAggregation", _
-                               "window_slow machine=" & machineId & _
-                               " period=7D elapsed_ms=" & windowElapsedMs & _
-                               " threshold_ms=" & WINDOW_EXEC_WARN_THRESHOLD_MS
-                    End If
-                    g_lastRunByMachinePeriod(machineId & "|7D") = nowDT
-                    guardReason = "startup_no_recent_short_circuit_7D"
-                End If
-            Else
-                tTo = nowDT: tFrom = DateAdd("d", -7, tTo)
-                Err.Clear
-                skipLowerPriority = RunWindowWithGuard(cn, rtCat, machineId, "7D", tFrom, tTo, windowElapsedMs)
-                If Err.Number <> 0 Then
-                    LogMsg LOG_LEVEL_ERROR, "MainStatusAggregation", _
-                           "window_error machine=" & machineId & _
-                           " period=7D err=" & S(Err.Description)
-                    Err.Clear
-                Else
-                    If skipLowerPriority Then
-                        LogMsg LOG_LEVEL_WARN, "MainStatusAggregation", _
-                               "window_slow machine=" & machineId & _
-                               " period=7D elapsed_ms=" & windowElapsedMs & _
-                               " threshold_ms=" & WINDOW_EXEC_WARN_THRESHOLD_MS
-                    End If
-                    g_lastRunByMachinePeriod(machineId & "|7D") = nowDT
-                    guardReason = "ran_7D"
-                End If
-            End If
-        End If
-
-        If due30D And (Not skipLowerPriority) Then
-            If noRecentShortCircuitActive Then
-                Err.Clear
-                skipLowerPriority = RunNoRecentWindowShortCircuitWithGuard(machineId, "30D", validationReason, windowElapsedMs)
-                If Err.Number <> 0 Then
-                    LogMsg LOG_LEVEL_ERROR, "MainStatusAggregation", _
-                           "window_error machine=" & machineId & _
-                           " period=30D err=" & S(Err.Description)
-                    Err.Clear
-                Else
-                    If skipLowerPriority Then
-                        LogMsg LOG_LEVEL_WARN, "MainStatusAggregation", _
-                               "window_slow machine=" & machineId & _
-                               " period=30D elapsed_ms=" & windowElapsedMs & _
-                               " threshold_ms=" & WINDOW_EXEC_WARN_THRESHOLD_MS
-                    End If
-                    g_lastRunByMachinePeriod(machineId & "|30D") = nowDT
-                    guardReason = "startup_no_recent_short_circuit_30D"
-                End If
-            Else
-                tTo = nowDT: tFrom = DateAdd("d", -30, tTo)
-                Err.Clear
-                skipLowerPriority = RunWindowWithGuard(cn, rtCat, machineId, "30D", tFrom, tTo, windowElapsedMs)
-                If Err.Number <> 0 Then
-                    LogMsg LOG_LEVEL_ERROR, "MainStatusAggregation", _
-                           "window_error machine=" & machineId & _
-                           " period=30D err=" & S(Err.Description)
-                    Err.Clear
-                Else
-                    If skipLowerPriority Then
-                        LogMsg LOG_LEVEL_WARN, "MainStatusAggregation", _
-                               "window_slow machine=" & machineId & _
-                               " period=30D elapsed_ms=" & windowElapsedMs & _
-                               " threshold_ms=" & WINDOW_EXEC_WARN_THRESHOLD_MS
-                    End If
-                    g_lastRunByMachinePeriod(machineId & "|30D") = nowDT
-                    guardReason = "ran_30D"
-                End If
-            End If
-        End If
-    End If
-
-CLEANUP:
-    If IsObject(cn) Then CloseConn cn
-    If lockAcquired Then ReleaseMachineLock machineId
-
-    If Err.Number <> 0 Then
-        guardReason = "fail_runtime_error"
-        LogMsg LOG_LEVEL_ERROR, "MainStatusAggregation", _
-               "Runtime error number=" & CStr(Err.Number) & _
-               " description=" & S(Err.Description)
-        Err.Clear
-    End If
-
-    On Error GoTo 0
-
-    completedAt = Now
-    totalElapsedMs = ElapsedMs(startTimer)
-    LogMsg LOG_LEVEL_WARN, "MainStatusAggregation", _
-           "runtime_guard machine=" & machineId & _
-           " started=" & TS3(startedAt) & _
-           " ended=" & TS3(completedAt) & _
-           " elapsed_ms=" & totalElapsedMs & _
-           " reason=" & guardReason & _
-           " no_recent_short_circuit_eligible=" & CStr(noRecentShortCircuitEligible) & _
-           " no_recent_short_circuit_applied=" & CStr(noRecentShortCircuitActive)
-    Exit Sub
-End Sub
-
-Private Function TryAcquireMachineLock(ByVal machineId)
-    If g_machineLocks.Exists(machineId) Then
-        TryAcquireMachineLock = False
+    If ShouldRun(machineId, "1D", THROTTLE_1D_MINUTES) Then
+        targetPeriod = "1D"
+        lookback = 1440
+    ElseIf ShouldRun(machineId, "7D", THROTTLE_7D_MINUTES) Then
+        targetPeriod = "7D"
+        lookback = 10080
+    ElseIf ShouldRun(machineId, "30D", THROTTLE_30D_MINUTES) Then
+        targetPeriod = "30D"
+        lookback = 43200
     Else
-        g_machineLocks.Add machineId, True
-        TryAcquireMachineLock = True
+        LogMsg LOG_LEVEL_INFO, "MainStatusAggregation", "skip machine=" & machineId & " reason=throttled"
+        Exit Sub
     End If
-End Function
 
-Private Sub ReleaseMachineLock(ByVal machineId)
-    If g_machineLocks.Exists(machineId) Then
-        g_machineLocks.Remove machineId
+    Set cn = OpenConnection()
+    If cn Is Nothing Then
+        LogMsg LOG_LEVEL_ERROR, "MainStatusAggregation", "skip machine=" & machineId & " reason=no_sql_connection"
+        Exit Sub
     End If
+
+    runtimeCatalog = GetRuntimeCatalog()
+    LogMsg LOG_LEVEL_INFO, "MainStatusAggregation", "process machine=" & machineId & " period=" & targetPeriod
+
+    AggregatePeriod cn, runtimeCatalog, machineId, targetPeriod, lookback
+
+    CloseConn cn
 End Sub

@@ -1176,8 +1176,8 @@ Private Function GetStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal m
         End If
 
         If batchOk = 1 Then
-            If currentDictReady = 0 Then GoTo SkipBestSelection
-            hasBestDict = IsObject(bestDict)
+            If currentDictReady <> 0 Then
+                hasBestDict = IsObject(bestDict)
             If Not hasBestDict Then
                 Set bestDict = CopyStatusFractions(currentDict)
                 bestNumericCount = numericCount
@@ -1202,6 +1202,7 @@ Private Function GetStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal m
                     selectedIdx = idx
                     selectedPath = "batch"
                 End If
+            End If
             End If
         End If
 SkipBestSelection:

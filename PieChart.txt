@@ -859,26 +859,26 @@ Private Function ExecuteStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByV
                  "FROM @StatusDiag d WHERE d.status_alias='" & CStr(aliases(idx)) & "';" & vbCrLf
     Next
     sqlText = sqlText & "SELECT " & _
-              "MAX(CASE WHEN status_alias='a' THEN frac END) AS a," & _
-              "MAX(CASE WHEN status_alias='h' THEN frac END) AS h," & _
-              "MAX(CASE WHEN status_alias='r' THEN frac END) AS r," & _
-              "MAX(CASE WHEN status_alias='w' THEN frac END) AS w," & _
-              "MAX(CASE WHEN status_alias='i' THEN frac END) AS i," & _
-              "MAX(CASE WHEN status_alias='a' THEN inserted_rows END) AS a_rows," & _
-              "MAX(CASE WHEN status_alias='h' THEN inserted_rows END) AS h_rows," & _
-              "MAX(CASE WHEN status_alias='r' THEN inserted_rows END) AS r_rows," & _
-              "MAX(CASE WHEN status_alias='w' THEN inserted_rows END) AS w_rows," & _
-              "MAX(CASE WHEN status_alias='i' THEN inserted_rows END) AS i_rows," & _
-              "MAX(CASE WHEN status_alias='a' THEN is_numeric END) AS a_num," & _
-              "MAX(CASE WHEN status_alias='h' THEN is_numeric END) AS h_num," & _
-              "MAX(CASE WHEN status_alias='r' THEN is_numeric END) AS r_num," & _
-              "MAX(CASE WHEN status_alias='w' THEN is_numeric END) AS w_num," & _
-              "MAX(CASE WHEN status_alias='i' THEN is_numeric END) AS i_num," & _
-              "MAX(CASE WHEN status_alias='a' THEN elapsed_ms END) AS a_ms," & _
-              "MAX(CASE WHEN status_alias='h' THEN elapsed_ms END) AS h_ms," & _
-              "MAX(CASE WHEN status_alias='r' THEN elapsed_ms END) AS r_ms," & _
-              "MAX(CASE WHEN status_alias='w' THEN elapsed_ms END) AS w_ms," & _
-              "MAX(CASE WHEN status_alias='i' THEN elapsed_ms END) AS i_ms " & _
+              "MAX(CASE WHEN s.status_alias='a' THEN s.frac END) AS a," & _
+              "MAX(CASE WHEN s.status_alias='h' THEN s.frac END) AS h," & _
+              "MAX(CASE WHEN s.status_alias='r' THEN s.frac END) AS r," & _
+              "MAX(CASE WHEN s.status_alias='w' THEN s.frac END) AS w," & _
+              "MAX(CASE WHEN s.status_alias='i' THEN s.frac END) AS i," & _
+              "MAX(CASE WHEN d.status_alias='a' THEN d.inserted_rows END) AS a_rows," & _
+              "MAX(CASE WHEN d.status_alias='h' THEN d.inserted_rows END) AS h_rows," & _
+              "MAX(CASE WHEN d.status_alias='r' THEN d.inserted_rows END) AS r_rows," & _
+              "MAX(CASE WHEN d.status_alias='w' THEN d.inserted_rows END) AS w_rows," & _
+              "MAX(CASE WHEN d.status_alias='i' THEN d.inserted_rows END) AS i_rows," & _
+              "MAX(CASE WHEN d.status_alias='a' THEN d.is_numeric END) AS a_num," & _
+              "MAX(CASE WHEN d.status_alias='h' THEN d.is_numeric END) AS h_num," & _
+              "MAX(CASE WHEN d.status_alias='r' THEN d.is_numeric END) AS r_num," & _
+              "MAX(CASE WHEN d.status_alias='w' THEN d.is_numeric END) AS w_num," & _
+              "MAX(CASE WHEN d.status_alias='i' THEN d.is_numeric END) AS i_num," & _
+              "MAX(CASE WHEN d.status_alias='a' THEN d.elapsed_ms END) AS a_ms," & _
+              "MAX(CASE WHEN d.status_alias='h' THEN d.elapsed_ms END) AS h_ms," & _
+              "MAX(CASE WHEN d.status_alias='r' THEN d.elapsed_ms END) AS r_ms," & _
+              "MAX(CASE WHEN d.status_alias='w' THEN d.elapsed_ms END) AS w_ms," & _
+              "MAX(CASE WHEN d.status_alias='i' THEN d.elapsed_ms END) AS i_ms " & _
               "FROM @StatusDiag d LEFT JOIN @Status s ON s.status_alias=d.status_alias;"
 
     On Error Resume Next

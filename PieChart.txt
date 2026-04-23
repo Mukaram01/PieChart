@@ -33,6 +33,10 @@ Const SQL_TIMEOUT_SECONDS_LONG_AGG = 90
 Const NORMAL_AGG_TIMEOUT_BUDGET_MS_1D = 35000
 Const NORMAL_AGG_TIMEOUT_BUDGET_MS_7D = 70000
 Const NORMAL_AGG_TIMEOUT_BUDGET_MS_30D = 110000
+Const MIN_QUERY_START_BUDGET_MS = 1500
+Const LONG_WINDOW_SAFETY_RESERVE_MS = 5000
+Const MIN_PRACTICAL_QUERY_TIMEOUT_SECONDS = 2
+Const AGG_BUDGET_LOG_OVERHEAD_MS = 250
 Const MAX_RETRY_ATTEMPTS     = 2
 Const RETRY_BACKOFF_MS       = 250
 Const RETRY_BACKOFF_TIMEOUT_MS = 1250
@@ -1082,9 +1086,15 @@ Private Function GetAggCommandTimeoutSeconds(ByVal periodKey)
 End Function
 
 Private Function GetAggCommandTimeoutSecondsCapped(ByVal periodKey, ByVal remainingBudgetMs)
-    Dim baselineTimeoutSeconds, budgetLimitedSeconds, cappedTimeoutSeconds
+    Dim baselineTimeoutSeconds, budgetLimitedSeconds, cappedTimeoutSeconds, effectiveBudgetMs
     baselineTimeoutSeconds = GetAggCommandTimeoutSeconds(periodKey)
-    budgetLimitedSeconds = Int(CDbl(remainingBudgetMs) / 1000)
+    effectiveBudgetMs = remainingBudgetMs
+    Select Case UCase(CStr(periodKey))
+        Case "7D", "30D"
+            effectiveBudgetMs = effectiveBudgetMs - LONG_WINDOW_SAFETY_RESERVE_MS
+    End Select
+    If effectiveBudgetMs < 0 Then effectiveBudgetMs = 0
+    budgetLimitedSeconds = Int(CDbl(effectiveBudgetMs) / 1000)
 
     If budgetLimitedSeconds < 1 Then budgetLimitedSeconds = 1
 
@@ -1129,6 +1139,16 @@ Private Function ExecuteStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByV
     cappedTimeoutSecondsOut = GetAggCommandTimeoutSecondsCapped(periodKey, remainingBudgetMs)
     baselineTimeoutSeconds = baselineTimeoutSecondsOut
     cappedTimeoutSeconds = cappedTimeoutSecondsOut
+    If cappedTimeoutSeconds < MIN_PRACTICAL_QUERY_TIMEOUT_SECONDS Then
+        LogMsg LOG_LEVEL_WARN, "GetStatusFractionsBatch", _
+               "agg_timeout_cap_below_practical_threshold machine=" & machineId & _
+               " window=" & periodKey & _
+               " agg=" & aggExpr & _
+               " timeout_baseline_s=" & baselineTimeoutSeconds & _
+               " timeout_capped_s=" & cappedTimeoutSeconds & _
+               " practical_threshold_s=" & MIN_PRACTICAL_QUERY_TIMEOUT_SECONDS & _
+               " budget_remaining_ms=" & remainingBudgetMs
+    End If
 
     Set outDict = CreateObject("Scripting.Dictionary")
     outDict.Add "Aborted", 0
@@ -1545,6 +1565,7 @@ Private Function GetStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal m
     Dim tagMap, allowFallbackAggs, selectedPath
     Dim persistedAggAtStart
     Dim aggBudgetStart, aggBudgetUsedMs, aggBudgetRemainingMs, aggBudgetStopReason, aggBudgetLimitMs
+    Dim aggBudgetUsedMsReported, aggBudgetOverLimitMs
     Dim queryFailureKind, timeoutLikeFailure, skipFallbackScanDueTimeout
     Dim baselineTimeoutSeconds, cappedTimeoutSeconds
 
@@ -1580,6 +1601,18 @@ Private Function GetStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal m
         aggExpr = CStr(aggs(idx))
         baselineTimeoutSeconds = GetAggCommandTimeoutSeconds(periodKey)
         cappedTimeoutSeconds = GetAggCommandTimeoutSecondsCapped(periodKey, aggBudgetRemainingMs)
+        If aggBudgetRemainingMs < MIN_QUERY_START_BUDGET_MS Then
+            aggBudgetStopReason = "insufficient_remaining_budget_to_start_trial"
+            LogMsg LOG_LEVEL_WARN, "GetStatusFractionsBatch", _
+                   "agg_budget_guard_stop machine=" & machineId & _
+                   " window=" & periodKey & _
+                   " catalog=" & runtimeCatalog & _
+                   " agg=" & aggExpr & _
+                   " budget_remaining_ms=" & aggBudgetRemainingMs & _
+                   " min_start_budget_ms=" & MIN_QUERY_START_BUDGET_MS & _
+                   " budget_stop_reason=insufficient_remaining_budget_to_start_trial"
+            Exit For
+        End If
         Set currentDict = ExecuteStatusFractionsBatch(cn, runtimeCatalog, machineId, periodKey, t1, t2, aggExpr, tagMap, aggBudgetRemainingMs, numericCount, insertedStatusCount, allNullNoNumeric, batchOk, queryFailureKind, timeoutLikeFailure, baselineTimeoutSeconds, cappedTimeoutSeconds)
         hasCurrentDict = IsObject(currentDict)
         currentDictReady = 0
@@ -1721,6 +1754,21 @@ SkipBestSelection:
     aggBudgetUsedMs = ElapsedMs(aggBudgetStart)
     aggBudgetRemainingMs = aggBudgetLimitMs - aggBudgetUsedMs
     If aggBudgetRemainingMs < 0 Then aggBudgetRemainingMs = 0
+    aggBudgetOverLimitMs = aggBudgetUsedMs - aggBudgetLimitMs
+    aggBudgetUsedMsReported = aggBudgetUsedMs
+    If aggBudgetUsedMsReported > (aggBudgetLimitMs + AGG_BUDGET_LOG_OVERHEAD_MS) Then
+        aggBudgetUsedMsReported = aggBudgetLimitMs + AGG_BUDGET_LOG_OVERHEAD_MS
+    End If
+    If aggBudgetOverLimitMs > AGG_BUDGET_LOG_OVERHEAD_MS Then
+        LogMsg LOG_LEVEL_WARN, "GetStatusFractionsBatch", _
+               "agg_budget_over_limit machine=" & machineId & _
+               " window=" & periodKey & _
+               " catalog=" & runtimeCatalog & _
+               " budget_used_ms_raw=" & aggBudgetUsedMs & _
+               " budget_limit_ms=" & aggBudgetLimitMs & _
+               " allowed_overhead_ms=" & AGG_BUDGET_LOG_OVERHEAD_MS & _
+               " over_limit_ms=" & aggBudgetOverLimitMs
+    End If
 
     LogMsg LOG_LEVEL_INFO, "GetStatusFractionsBatch", _
            "agg_trials machine=" & machineId & _
@@ -1732,7 +1780,7 @@ SkipBestSelection:
            " fast_fail=" & fastFailApplied & _
            " data_path=" & selectedPath & _
            " startup_or_cached_agg=" & persistedAggAtStart & _
-           " budget_used_ms=" & aggBudgetUsedMs & _
+           " budget_used_ms=" & aggBudgetUsedMsReported & _
            " budget_limit_ms=" & aggBudgetLimitMs & _
            " budget_remaining_ms=" & aggBudgetRemainingMs & _
            " budget_stop_reason=" & aggBudgetStopReason & _

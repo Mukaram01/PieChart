@@ -1033,6 +1033,7 @@ End Function
 Private Function GetStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal periodKey, ByVal t1, ByVal t2)
     Dim aggs, idx, aggExpr
     Dim currentDict, bestDict
+    Dim hasCurrentDict, hasBestDict, currentDictReady
     Dim numericCount, bestNumericCount, insertedStatusCount, allNullNoNumeric, batchOk
     Dim currentSum, bestSum
     Dim selectedAgg, selectedIdx, aggTrialSummary, currentTrial, fastFailApplied, fallbackUsed, zeroInsertedWarnLogged
@@ -1052,27 +1053,43 @@ Private Function GetStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal m
     queryFailureCount = 0
     allowFallbackAggs = 0
     selectedPath = "no_data"
+    Set bestDict = Nothing
 
     For idx = 0 To UBound(aggs)
         If idx > 0 And allowFallbackAggs = 0 And queryFailureCount = 0 Then Exit For
 
         aggExpr = CStr(aggs(idx))
         Set currentDict = ExecuteStatusFractionsBatch(cn, runtimeCatalog, machineId, periodKey, t1, t2, aggExpr, tagMap, numericCount, insertedStatusCount, allNullNoNumeric, batchOk)
-        If batchOk = 1 And Not (currentDict Is Nothing) Then
-            currentSum = SumStatusFractions(currentDict)
-            currentTrial = aggExpr & "{ok=1,numeric=" & numericCount & ",inserted=" & insertedStatusCount & ",sum=" & currentSum & "}"
-            If idx = 0 Then
-                If numericCount > 0 Then
-                    Set bestDict = CopyStatusFractions(currentDict)
-                    bestNumericCount = numericCount
-                    bestSum = currentSum
-                    selectedAgg = aggExpr
-                    selectedIdx = idx
-                    selectedPath = "batch"
-                    Exit For
+        hasCurrentDict = IsObject(currentDict)
+        currentDictReady = 0
+        If batchOk = 1 Then
+            If hasCurrentDict Then
+                If Not (currentDict Is Nothing) Then
+                    currentDictReady = 1
+                    currentSum = SumStatusFractions(currentDict)
+                    currentTrial = aggExpr & "{ok=1,numeric=" & numericCount & ",inserted=" & insertedStatusCount & ",sum=" & currentSum & "}"
+                    If idx = 0 Then
+                        If numericCount > 0 Then
+                            Set bestDict = CopyStatusFractions(currentDict)
+                            bestNumericCount = numericCount
+                            bestSum = currentSum
+                            selectedAgg = aggExpr
+                            selectedIdx = idx
+                            selectedPath = "batch"
+                            Exit For
+                        Else
+                            allowFallbackAggs = 1
+                        End If
+                    End If
                 Else
-                    allowFallbackAggs = 1
+                    currentSum = 0
+                    currentTrial = aggExpr & "{ok=0,query_failure=1}"
+                    queryFailureCount = queryFailureCount + 1
                 End If
+            Else
+                currentSum = 0
+                currentTrial = aggExpr & "{ok=0,query_failure=1}"
+                queryFailureCount = queryFailureCount + 1
             End If
         Else
             currentSum = 0
@@ -1105,22 +1122,36 @@ Private Function GetStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal m
             End If
         End If
 
-        If batchOk = 1 And (bestDict Is Nothing) Then
-            Set bestDict = CopyStatusFractions(currentDict)
-            bestNumericCount = numericCount
-            bestSum = currentSum
-            selectedAgg = aggExpr
-            selectedIdx = idx
-            selectedPath = "batch"
-        ElseIf batchOk = 1 And ((numericCount > bestNumericCount) Or _
-               (numericCount = bestNumericCount And currentSum > bestSum And bestSum <= 0)) Then
-            Set bestDict = CopyStatusFractions(currentDict)
-            bestNumericCount = numericCount
-            bestSum = currentSum
-            selectedAgg = aggExpr
-            selectedIdx = idx
-            selectedPath = "batch"
+        If batchOk = 1 Then
+            If currentDictReady = 0 Then GoTo SkipBestSelection
+            hasBestDict = IsObject(bestDict)
+            If Not hasBestDict Then
+                Set bestDict = CopyStatusFractions(currentDict)
+                bestNumericCount = numericCount
+                bestSum = currentSum
+                selectedAgg = aggExpr
+                selectedIdx = idx
+                selectedPath = "batch"
+            Else
+                If bestDict Is Nothing Then
+                    Set bestDict = CopyStatusFractions(currentDict)
+                    bestNumericCount = numericCount
+                    bestSum = currentSum
+                    selectedAgg = aggExpr
+                    selectedIdx = idx
+                    selectedPath = "batch"
+                ElseIf (numericCount > bestNumericCount) Or _
+                       (numericCount = bestNumericCount And currentSum > bestSum And bestSum <= 0) Then
+                    Set bestDict = CopyStatusFractions(currentDict)
+                    bestNumericCount = numericCount
+                    bestSum = currentSum
+                    selectedAgg = aggExpr
+                    selectedIdx = idx
+                    selectedPath = "batch"
+                End If
+            End If
         End If
+SkipBestSelection:
 
         If batchOk = 1 And idx = 0 And allNullNoNumeric = 1 Then
             fastFailApplied = 1
@@ -1148,24 +1179,35 @@ Private Function GetStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal m
            " fast_fail=" & fastFailApplied & _
            " data_path=" & selectedPath
 
-    If Not (bestDict Is Nothing) And bestNumericCount = 0 Then
-        LogMsg LOG_LEVEL_WARN, "GetStatusFractionsBatch", _
-               "all_aggs_non_numeric machine=" & machineId & _
-               " catalog=" & runtimeCatalog & _
-               " window=" & periodKey & _
-               " sql_from=" & TS3(t1) & _
-               " sql_to=" & TS3(t2)
+    If IsObject(bestDict) Then
+        If Not (bestDict Is Nothing) Then
+            If bestNumericCount = 0 Then
+                LogMsg LOG_LEVEL_WARN, "GetStatusFractionsBatch", _
+                       "all_aggs_non_numeric machine=" & machineId & _
+                       " catalog=" & runtimeCatalog & _
+                       " window=" & periodKey & _
+                       " sql_from=" & TS3(t1) & _
+                       " sql_to=" & TS3(t2)
+            End If
+        End If
     End If
 
-    If bestDict Is Nothing And queryFailureCount = (UBound(aggs) + 1) Then
-        Set bestDict = ExecuteStatusFractionsSingleFallback(cn, runtimeCatalog, machineId, periodKey, t1, t2, tagMap, numericCount)
-        If Not (bestDict Is Nothing) Then
-            bestNumericCount = numericCount
-            bestSum = SumStatusFractions(bestDict)
-            selectedAgg = "single_status_path"
-            selectedIdx = -1
-            fallbackUsed = 1
-            selectedPath = "fallback_single"
+    hasBestDict = IsObject(bestDict)
+    If hasBestDict Then
+        If bestDict Is Nothing Then
+            If queryFailureCount = (UBound(aggs) + 1) Then
+                Set bestDict = ExecuteStatusFractionsSingleFallback(cn, runtimeCatalog, machineId, periodKey, t1, t2, tagMap, numericCount)
+                If IsObject(bestDict) Then
+                    If Not (bestDict Is Nothing) Then
+                        bestNumericCount = numericCount
+                        bestSum = SumStatusFractions(bestDict)
+                        selectedAgg = "single_status_path"
+                        selectedIdx = -1
+                        fallbackUsed = 1
+                        selectedPath = "fallback_single"
+                    End If
+                End If
+            End If
         End If
     End If
 

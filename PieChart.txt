@@ -945,8 +945,8 @@ End Function
 Private Function ExecuteStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal periodKey, ByVal t1, ByVal t2, ByVal aggExpr, ByVal tagMap, ByRef hasNumericCount, ByRef insertedStatusCount, ByRef allNullNoNumeric, ByRef batchOk)
     Dim cmd, rs, sqlText, startedAt, completedAt, startTimer, elapsedMsValue, infoMsg
     Dim statuses, aliases, idx, statusName, tagFull, cpCall
-    Dim outDict, fieldValue, diagRows, diagNumeric, diagElapsedMs
-    Dim aliasKey, statusLabel, insertedRowsValue, isNumericValue, insertedFlag, numericFlag, statusElapsedMs
+    Dim outDict, fieldValue, diagRows, diagNumeric, diagElapsedMs, diagErrNum, diagErrMsg
+    Dim aliasKey, statusLabel, insertedRowsValue, isNumericValue, insertedFlag, numericFlag, statusElapsedMs, errNumberValue, errMessageValue
     Dim valA, valH, valR, valW, valI
     Dim cacheKey, cacheEntry
 
@@ -970,6 +970,8 @@ Private Function ExecuteStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByV
     Set diagRows = CreateObject("Scripting.Dictionary")
     Set diagNumeric = CreateObject("Scripting.Dictionary")
     Set diagElapsedMs = CreateObject("Scripting.Dictionary")
+    Set diagErrNum = CreateObject("Scripting.Dictionary")
+    Set diagErrMsg = CreateObject("Scripting.Dictionary")
 
     cacheKey = BuildBatchCacheKey(runtimeCatalog, machineId, periodKey, t1, t2, aggExpr)
     If g_batchResultCache.Exists(cacheKey) Then
@@ -998,43 +1000,87 @@ Private Function ExecuteStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByV
     End If
 
     sqlText = "DECLARE @Status TABLE (status_alias NVARCHAR(1), frac FLOAT);" & vbCrLf
-    sqlText = sqlText & "DECLARE @StatusDiag TABLE (status_alias NVARCHAR(1), inserted_rows INT, is_numeric INT, elapsed_ms INT);" & vbCrLf
+    sqlText = sqlText & "DECLARE @StatusDiag TABLE (" & _
+              "status_alias NVARCHAR(1) NOT NULL, " & _
+              "inserted_rows INT NOT NULL, " & _
+              "is_numeric INT NOT NULL, " & _
+              "elapsed_ms INT NULL, " & _
+              "error_number INT NULL, " & _
+              "error_severity INT NULL, " & _
+              "error_state INT NULL, " & _
+              "error_procedure NVARCHAR(128) NULL, " & _
+              "error_line INT NULL, " & _
+              "error_message NVARCHAR(4000) NULL);" & vbCrLf
+    sqlText = sqlText & "INSERT INTO @StatusDiag (status_alias, inserted_rows, is_numeric, elapsed_ms, error_number, error_severity, error_state, error_procedure, error_line, error_message) VALUES " & _
+              "('a',0,0,NULL,NULL,NULL,NULL,NULL,NULL,NULL)," & _
+              "('h',0,0,NULL,NULL,NULL,NULL,NULL,NULL,NULL)," & _
+              "('r',0,0,NULL,NULL,NULL,NULL,NULL,NULL,NULL)," & _
+              "('w',0,0,NULL,NULL,NULL,NULL,NULL,NULL,NULL)," & _
+              "('i',0,0,NULL,NULL,NULL,NULL,NULL,NULL,NULL);" & vbCrLf
     sqlText = sqlText & "DECLARE @cpStart DATETIME2(3);" & vbCrLf
+    sqlText = sqlText & "DECLARE @insertedRows INT;" & vbCrLf
     For idx = 0 To UBound(statuses)
         statusName = CStr(statuses(idx))
         tagFull = CStr(tagMap(statusName))
         cpCall = BuildCpTagStatisticExLiteral(runtimeCatalog, tagFull, t1, t2, aggExpr)
         sqlText = sqlText & "SET @cpStart = SYSDATETIME();" & vbCrLf
-        sqlText = sqlText & "INSERT INTO @Status (frac) EXEC " & cpCall & ";" & vbCrLf
-        sqlText = sqlText & "INSERT INTO @StatusDiag (status_alias, inserted_rows, is_numeric, elapsed_ms) VALUES ('" & CStr(aliases(idx)) & "', @@ROWCOUNT, 0, DATEDIFF(MILLISECOND, @cpStart, SYSDATETIME()));" & vbCrLf
-        sqlText = sqlText & "UPDATE @Status SET status_alias='" & CStr(aliases(idx)) & "' WHERE status_alias IS NULL;" & vbCrLf
-        sqlText = sqlText & "UPDATE d SET is_numeric = CASE " & _
-                 "WHEN d.inserted_rows > 0 AND EXISTS (SELECT 1 FROM @Status s WHERE s.status_alias=d.status_alias AND TRY_CONVERT(FLOAT, s.frac) IS NOT NULL) " & _
-                 "THEN 1 ELSE 0 END " & _
+        sqlText = sqlText & "BEGIN TRY" & vbCrLf
+        sqlText = sqlText & "  SET @insertedRows = 0;" & vbCrLf
+        sqlText = sqlText & "  INSERT INTO @Status (frac) EXEC " & cpCall & ";" & vbCrLf
+        sqlText = sqlText & "  SET @insertedRows = @@ROWCOUNT;" & vbCrLf
+        sqlText = sqlText & "  UPDATE @Status SET status_alias='" & CStr(aliases(idx)) & "' WHERE status_alias IS NULL;" & vbCrLf
+        sqlText = sqlText & "  UPDATE d SET " & _
+                 "inserted_rows = @insertedRows, " & _
+                 "is_numeric = CASE WHEN @insertedRows > 0 AND EXISTS (SELECT 1 FROM @Status s WHERE s.status_alias=d.status_alias AND TRY_CONVERT(FLOAT, s.frac) IS NOT NULL) THEN 1 ELSE 0 END, " & _
+                 "elapsed_ms = DATEDIFF(MILLISECOND, @cpStart, SYSDATETIME()), " & _
+                 "error_number = NULL, error_severity = NULL, error_state = NULL, error_procedure = NULL, error_line = NULL, error_message = NULL " & _
                  "FROM @StatusDiag d WHERE d.status_alias='" & CStr(aliases(idx)) & "';" & vbCrLf
+        sqlText = sqlText & "END TRY" & vbCrLf
+        sqlText = sqlText & "BEGIN CATCH" & vbCrLf
+        sqlText = sqlText & "  UPDATE d SET " & _
+                 "inserted_rows = 0, " & _
+                 "is_numeric = 0, " & _
+                 "elapsed_ms = DATEDIFF(MILLISECOND, @cpStart, SYSDATETIME()), " & _
+                 "error_number = ERROR_NUMBER(), " & _
+                 "error_severity = ERROR_SEVERITY(), " & _
+                 "error_state = ERROR_STATE(), " & _
+                 "error_procedure = ERROR_PROCEDURE(), " & _
+                 "error_line = ERROR_LINE(), " & _
+                 "error_message = ERROR_MESSAGE() " & _
+                 "FROM @StatusDiag d WHERE d.status_alias='" & CStr(aliases(idx)) & "';" & vbCrLf
+        sqlText = sqlText & "END CATCH" & vbCrLf
     Next
     sqlText = sqlText & "SELECT " & _
-              "MAX(CASE WHEN s.status_alias='a' THEN s.frac END) AS a," & _
-              "MAX(CASE WHEN s.status_alias='h' THEN s.frac END) AS h," & _
-              "MAX(CASE WHEN s.status_alias='r' THEN s.frac END) AS r," & _
-              "MAX(CASE WHEN s.status_alias='w' THEN s.frac END) AS w," & _
-              "MAX(CASE WHEN s.status_alias='i' THEN s.frac END) AS i," & _
-              "MAX(CASE WHEN d.status_alias='a' THEN d.inserted_rows END) AS a_rows," & _
-              "MAX(CASE WHEN d.status_alias='h' THEN d.inserted_rows END) AS h_rows," & _
-              "MAX(CASE WHEN d.status_alias='r' THEN d.inserted_rows END) AS r_rows," & _
-              "MAX(CASE WHEN d.status_alias='w' THEN d.inserted_rows END) AS w_rows," & _
-              "MAX(CASE WHEN d.status_alias='i' THEN d.inserted_rows END) AS i_rows," & _
-              "MAX(CASE WHEN d.status_alias='a' THEN d.is_numeric END) AS a_num," & _
-              "MAX(CASE WHEN d.status_alias='h' THEN d.is_numeric END) AS h_num," & _
-              "MAX(CASE WHEN d.status_alias='r' THEN d.is_numeric END) AS r_num," & _
-              "MAX(CASE WHEN d.status_alias='w' THEN d.is_numeric END) AS w_num," & _
-              "MAX(CASE WHEN d.status_alias='i' THEN d.is_numeric END) AS i_num," & _
-              "MAX(CASE WHEN d.status_alias='a' THEN d.elapsed_ms END) AS a_ms," & _
-              "MAX(CASE WHEN d.status_alias='h' THEN d.elapsed_ms END) AS h_ms," & _
-              "MAX(CASE WHEN d.status_alias='r' THEN d.elapsed_ms END) AS r_ms," & _
-              "MAX(CASE WHEN d.status_alias='w' THEN d.elapsed_ms END) AS w_ms," & _
-              "MAX(CASE WHEN d.status_alias='i' THEN d.elapsed_ms END) AS i_ms " & _
-              "FROM @StatusDiag d LEFT JOIN @Status s ON s.status_alias=d.status_alias;"
+              "(SELECT MAX(s.frac) FROM @Status s WHERE s.status_alias='a') AS a," & _
+              "(SELECT MAX(s.frac) FROM @Status s WHERE s.status_alias='h') AS h," & _
+              "(SELECT MAX(s.frac) FROM @Status s WHERE s.status_alias='r') AS r," & _
+              "(SELECT MAX(s.frac) FROM @Status s WHERE s.status_alias='w') AS w," & _
+              "(SELECT MAX(s.frac) FROM @Status s WHERE s.status_alias='i') AS i," & _
+              "(SELECT d.inserted_rows FROM @StatusDiag d WHERE d.status_alias='a') AS a_rows," & _
+              "(SELECT d.inserted_rows FROM @StatusDiag d WHERE d.status_alias='h') AS h_rows," & _
+              "(SELECT d.inserted_rows FROM @StatusDiag d WHERE d.status_alias='r') AS r_rows," & _
+              "(SELECT d.inserted_rows FROM @StatusDiag d WHERE d.status_alias='w') AS w_rows," & _
+              "(SELECT d.inserted_rows FROM @StatusDiag d WHERE d.status_alias='i') AS i_rows," & _
+              "(SELECT d.is_numeric FROM @StatusDiag d WHERE d.status_alias='a') AS a_num," & _
+              "(SELECT d.is_numeric FROM @StatusDiag d WHERE d.status_alias='h') AS h_num," & _
+              "(SELECT d.is_numeric FROM @StatusDiag d WHERE d.status_alias='r') AS r_num," & _
+              "(SELECT d.is_numeric FROM @StatusDiag d WHERE d.status_alias='w') AS w_num," & _
+              "(SELECT d.is_numeric FROM @StatusDiag d WHERE d.status_alias='i') AS i_num," & _
+              "(SELECT d.elapsed_ms FROM @StatusDiag d WHERE d.status_alias='a') AS a_ms," & _
+              "(SELECT d.elapsed_ms FROM @StatusDiag d WHERE d.status_alias='h') AS h_ms," & _
+              "(SELECT d.elapsed_ms FROM @StatusDiag d WHERE d.status_alias='r') AS r_ms," & _
+              "(SELECT d.elapsed_ms FROM @StatusDiag d WHERE d.status_alias='w') AS w_ms," & _
+              "(SELECT d.elapsed_ms FROM @StatusDiag d WHERE d.status_alias='i') AS i_ms," & _
+              "(SELECT d.error_number FROM @StatusDiag d WHERE d.status_alias='a') AS a_err_num," & _
+              "(SELECT d.error_number FROM @StatusDiag d WHERE d.status_alias='h') AS h_err_num," & _
+              "(SELECT d.error_number FROM @StatusDiag d WHERE d.status_alias='r') AS r_err_num," & _
+              "(SELECT d.error_number FROM @StatusDiag d WHERE d.status_alias='w') AS w_err_num," & _
+              "(SELECT d.error_number FROM @StatusDiag d WHERE d.status_alias='i') AS i_err_num," & _
+              "(SELECT d.error_message FROM @StatusDiag d WHERE d.status_alias='a') AS a_err_msg," & _
+              "(SELECT d.error_message FROM @StatusDiag d WHERE d.status_alias='h') AS h_err_msg," & _
+              "(SELECT d.error_message FROM @StatusDiag d WHERE d.status_alias='r') AS r_err_msg," & _
+              "(SELECT d.error_message FROM @StatusDiag d WHERE d.status_alias='w') AS w_err_msg," & _
+              "(SELECT d.error_message FROM @StatusDiag d WHERE d.status_alias='i') AS i_err_msg;"
 
     On Error Resume Next
     Set cmd = CreateObject("ADODB.Command")
@@ -1061,6 +1107,8 @@ Private Function ExecuteStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByV
                     diagRows("a") = 0: diagRows("h") = 0: diagRows("r") = 0: diagRows("w") = 0: diagRows("i") = 0
                     diagNumeric("a") = 0: diagNumeric("h") = 0: diagNumeric("r") = 0: diagNumeric("w") = 0: diagNumeric("i") = 0
                     diagElapsedMs("a") = 0: diagElapsedMs("h") = 0: diagElapsedMs("r") = 0: diagElapsedMs("w") = 0: diagElapsedMs("i") = 0
+                    diagErrNum("a") = 0: diagErrNum("h") = 0: diagErrNum("r") = 0: diagErrNum("w") = 0: diagErrNum("i") = 0
+                    diagErrMsg("a") = "": diagErrMsg("h") = "": diagErrMsg("r") = "": diagErrMsg("w") = "": diagErrMsg("i") = ""
 
                     If rs.Fields.Count >= 20 Then
                         insertedRowsValue = rs.Fields("a_rows").Value: If IsNumeric(insertedRowsValue) Then diagRows("a") = CLng(insertedRowsValue)
@@ -1080,6 +1128,19 @@ Private Function ExecuteStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByV
                         statusElapsedMs = rs.Fields("r_ms").Value: If IsNumeric(statusElapsedMs) Then diagElapsedMs("r") = CLng(statusElapsedMs)
                         statusElapsedMs = rs.Fields("w_ms").Value: If IsNumeric(statusElapsedMs) Then diagElapsedMs("w") = CLng(statusElapsedMs)
                         statusElapsedMs = rs.Fields("i_ms").Value: If IsNumeric(statusElapsedMs) Then diagElapsedMs("i") = CLng(statusElapsedMs)
+                    End If
+                    If rs.Fields.Count >= 30 Then
+                        errNumberValue = rs.Fields("a_err_num").Value: If IsNumeric(errNumberValue) Then diagErrNum("a") = CLng(errNumberValue)
+                        errNumberValue = rs.Fields("h_err_num").Value: If IsNumeric(errNumberValue) Then diagErrNum("h") = CLng(errNumberValue)
+                        errNumberValue = rs.Fields("r_err_num").Value: If IsNumeric(errNumberValue) Then diagErrNum("r") = CLng(errNumberValue)
+                        errNumberValue = rs.Fields("w_err_num").Value: If IsNumeric(errNumberValue) Then diagErrNum("w") = CLng(errNumberValue)
+                        errNumberValue = rs.Fields("i_err_num").Value: If IsNumeric(errNumberValue) Then diagErrNum("i") = CLng(errNumberValue)
+
+                        errMessageValue = rs.Fields("a_err_msg").Value: If Not IsNull(errMessageValue) Then diagErrMsg("a") = CStr(errMessageValue)
+                        errMessageValue = rs.Fields("h_err_msg").Value: If Not IsNull(errMessageValue) Then diagErrMsg("h") = CStr(errMessageValue)
+                        errMessageValue = rs.Fields("r_err_msg").Value: If Not IsNull(errMessageValue) Then diagErrMsg("r") = CStr(errMessageValue)
+                        errMessageValue = rs.Fields("w_err_msg").Value: If Not IsNull(errMessageValue) Then diagErrMsg("w") = CStr(errMessageValue)
+                        errMessageValue = rs.Fields("i_err_msg").Value: If Not IsNull(errMessageValue) Then diagErrMsg("i") = CStr(errMessageValue)
                     End If
                     batchOk = 1
                 End If
@@ -1103,10 +1164,14 @@ Private Function ExecuteStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByV
         insertedFlag = 0
         numericFlag = 0
         statusElapsedMs = 0
+        errNumberValue = 0
+        errMessageValue = ""
 
         If diagRows.Exists(aliasKey) Then insertedRowsValue = CLng(diagRows(aliasKey))
         If diagNumeric.Exists(aliasKey) Then isNumericValue = CLng(diagNumeric(aliasKey))
         If diagElapsedMs.Exists(aliasKey) Then statusElapsedMs = CLng(diagElapsedMs(aliasKey))
+        If diagErrNum.Exists(aliasKey) Then errNumberValue = CLng(diagErrNum(aliasKey))
+        If diagErrMsg.Exists(aliasKey) Then errMessageValue = CStr(diagErrMsg(aliasKey))
         If insertedRowsValue > 0 Then insertedFlag = 1
         If isNumericValue <> 0 Then numericFlag = 1
         If insertedFlag = 1 Then insertedStatusCount = insertedStatusCount + 1
@@ -1121,7 +1186,9 @@ Private Function ExecuteStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByV
                " inserted=" & insertedFlag & _
                " inserted_rows=" & insertedRowsValue & _
                " is_numeric=" & numericFlag & _
-               " elapsed_ms=" & statusElapsedMs
+               " elapsed_ms=" & statusElapsedMs & _
+               " err_num=" & errNumberValue & _
+               " err_msg=" & errMessageValue
     Next
     If hasNumericCount = 0 And insertedStatusCount = 5 Then allNullNoNumeric = 1
 
@@ -1229,7 +1296,11 @@ Private Function GetStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal m
                             bestSum = currentSum
                             selectedAgg = aggExpr
                             selectedIdx = idx
-                            selectedPath = "batch"
+                            If numericCount < 5 Then
+                                selectedPath = "batch_degraded"
+                            Else
+                                selectedPath = "batch"
+                            End If
                             Exit For
                         Else
                             allowFallbackAggs = 1
@@ -1285,7 +1356,11 @@ Private Function GetStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal m
                 bestSum = currentSum
                 selectedAgg = aggExpr
                 selectedIdx = idx
-                selectedPath = "batch"
+                If numericCount < 5 Then
+                    selectedPath = "batch_degraded"
+                Else
+                    selectedPath = "batch"
+                End If
             Else
                 If bestDict Is Nothing Then
                     Set bestDict = CopyStatusFractions(currentDict)
@@ -1293,7 +1368,11 @@ Private Function GetStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal m
                     bestSum = currentSum
                     selectedAgg = aggExpr
                     selectedIdx = idx
-                    selectedPath = "batch"
+                    If numericCount < 5 Then
+                        selectedPath = "batch_degraded"
+                    Else
+                        selectedPath = "batch"
+                    End If
                 ElseIf (numericCount > bestNumericCount) Or _
                        (numericCount = bestNumericCount And currentSum > bestSum And bestSum <= 0) Then
                     Set bestDict = CopyStatusFractions(currentDict)
@@ -1301,7 +1380,11 @@ Private Function GetStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal m
                     bestSum = currentSum
                     selectedAgg = aggExpr
                     selectedIdx = idx
-                    selectedPath = "batch"
+                    If numericCount < 5 Then
+                        selectedPath = "batch_degraded"
+                    Else
+                        selectedPath = "batch"
+                    End If
                 End If
             End If
             End If
@@ -1390,6 +1473,15 @@ SkipBestSelection:
            " numeric=" & bestNumericCount & _
            " sum=" & bestSum & _
            " data_path=" & selectedPath
+
+    If bestNumericCount > 0 And bestNumericCount < 5 Then
+        LogMsg LOG_LEVEL_WARN, "GetStatusFractionsBatch", _
+               "partial_numeric_statuses_treated_as_degraded_usable machine=" & machineId & _
+               " window=" & periodKey & _
+               " catalog=" & runtimeCatalog & _
+               " agg=" & selectedAgg & _
+               " numeric=" & bestNumericCount
+    End If
 
     If Len(selectedAgg) > 0 Then
         PersistBatchAggWinner machineId, runtimeCatalog, selectedAgg, "batch_execute"

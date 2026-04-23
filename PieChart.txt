@@ -76,6 +76,7 @@ Const VALIDATE_RETRY_HARD_FAIL_MINUTES = 2
 Const VALIDATE_RETRY_NORMAL_MINUTES = 180
 Const STARTUP_VALIDATION_BLOCK_WRITES_ON_PROBE_FAIL = False
 Const VALIDATE_BAD_AGG_COOLDOWN_MINUTES = 20
+Const STARTUP_NO_RECENT_SHORT_CIRCUIT = True
 
 Const adCmdText              = 1
 Const adStateOpen            = 1
@@ -1973,6 +1974,30 @@ Private Sub NormalizeFractionsToPct(ByVal runFrac, ByVal haltFrac, ByVal abortFr
     Loop
 End Sub
 
+Private Sub WriteNoRecentFallbackOutputs(ByVal machineId, ByVal periodKey, ByVal reason)
+    Dim tagPct, tagPie
+
+    On Error Resume Next
+
+    ' Keep main status percentages at zero for no-data windows.
+    tagPct = OutTagName(machineId, periodKey, "Running", False): WriteTag tagPct, 0
+    tagPct = OutTagName(machineId, periodKey, "Halted",  False): WriteTag tagPct, 0
+    tagPct = OutTagName(machineId, periodKey, "Aborted", False): WriteTag tagPct, 0
+
+    ' Match invalid/no-data rendering behavior: deterministic fallback pie split.
+    tagPie = OutTagName(machineId, periodKey, "Running", True): WriteTag tagPie, 34
+    tagPie = OutTagName(machineId, periodKey, "Halted",  True): WriteTag tagPie, 33
+    tagPie = OutTagName(machineId, periodKey, "Aborted", True): WriteTag tagPie, 33
+
+    LogMsg LOG_LEVEL_WARN, "NoRecentFallback", _
+           "no_recent_output_fallback_written machine=" & machineId & _
+           " period=" & periodKey & _
+           " reason=" & reason & _
+           " fallback_render_path=True"
+
+    On Error GoTo 0
+End Sub
+
 ' ─────────────────────────────────────────────────────────────────────
 ' Aggregate one period (writes Aborted/Halted/Running only)
 ' ─────────────────────────────────────────────────────────────────────
@@ -2204,6 +2229,7 @@ Public Sub MainStatusAggregation(ByVal machineId)
     Dim guardReason, lockAcquired, canRun
     Dim skipLowerPriority, windowElapsedMs
     Dim validationState, validationReason, validationLookbackMinutes
+    Dim noRecentShortCircuitActive
 
     ' WinCC VBScript does not support label-based handlers (On Error GoTo FAIL).
     On Error Resume Next
@@ -2214,6 +2240,7 @@ Public Sub MainStatusAggregation(ByVal machineId)
     lockAcquired = False
     canRun = True
     skipLowerPriority = False
+    noRecentShortCircuitActive = False
     Set cn = Nothing
 
     InitGlobals
@@ -2288,11 +2315,20 @@ Public Sub MainStatusAggregation(ByVal machineId)
             guardReason = "skip_startup_validation_failed"
             canRun = False
         ElseIf validationState = VALIDATE_STATE_NO_RECENT Then
-            LogMsg LOG_LEVEL_WARN, "MainStatusAggregation", _
-                   "startup_validation_warning machine=" & machineId & _
-                   " reason=" & validationReason & _
-                   " lookback_min=" & validationLookbackMinutes & _
-                   " action=proceed_with_aggregation"
+            If STARTUP_NO_RECENT_SHORT_CIRCUIT Then
+                noRecentShortCircuitActive = True
+                LogMsg LOG_LEVEL_WARN, "MainStatusAggregation", _
+                       "startup_no_recent_rows_short_circuit machine=" & machineId & _
+                       " reason=" & validationReason & _
+                       " lookback_min=" & validationLookbackMinutes & _
+                       " action=skip_db_window_aggregation_and_write_fallback_outputs"
+            Else
+                LogMsg LOG_LEVEL_WARN, "MainStatusAggregation", _
+                       "startup_validation_warning machine=" & machineId & _
+                       " reason=" & validationReason & _
+                       " lookback_min=" & validationLookbackMinutes & _
+                       " action=proceed_with_aggregation"
+            End If
         ElseIf validationReason = "degraded_probe_fail" Then
             LogMsg LOG_LEVEL_WARN, "MainStatusAggregation", _
                    "startup_validation_degraded machine=" & machineId & _
@@ -2313,65 +2349,83 @@ Public Sub MainStatusAggregation(ByVal machineId)
     ' If any period exceeds threshold, skip lower-priority windows for responsiveness.
     If canRun Then
         If due1D Then
-            tTo = nowDT: tFrom = DateAdd("d", -1, tTo)
-            Err.Clear
-            skipLowerPriority = RunWindowWithGuard(cn, rtCat, machineId, "1D", tFrom, tTo, windowElapsedMs)
-            If Err.Number <> 0 Then
-                LogMsg LOG_LEVEL_ERROR, "MainStatusAggregation", _
-                       "window_error machine=" & machineId & _
-                       " period=1D err=" & S(Err.Description)
-                Err.Clear
-            Else
-                If skipLowerPriority Then
-                    LogMsg LOG_LEVEL_WARN, "MainStatusAggregation", _
-                           "window_slow machine=" & machineId & _
-                           " period=1D elapsed_ms=" & windowElapsedMs & _
-                           " threshold_ms=" & WINDOW_EXEC_WARN_THRESHOLD_MS
-                End If
+            If noRecentShortCircuitActive Then
+                WriteNoRecentFallbackOutputs machineId, "1D", validationReason
                 g_lastRunByMachinePeriod(machineId & "|1D") = nowDT
-                guardReason = "ran_1D"
+                guardReason = "startup_no_recent_short_circuit_1D"
+            Else
+                tTo = nowDT: tFrom = DateAdd("d", -1, tTo)
+                Err.Clear
+                skipLowerPriority = RunWindowWithGuard(cn, rtCat, machineId, "1D", tFrom, tTo, windowElapsedMs)
+                If Err.Number <> 0 Then
+                    LogMsg LOG_LEVEL_ERROR, "MainStatusAggregation", _
+                           "window_error machine=" & machineId & _
+                           " period=1D err=" & S(Err.Description)
+                    Err.Clear
+                Else
+                    If skipLowerPriority Then
+                        LogMsg LOG_LEVEL_WARN, "MainStatusAggregation", _
+                               "window_slow machine=" & machineId & _
+                               " period=1D elapsed_ms=" & windowElapsedMs & _
+                               " threshold_ms=" & WINDOW_EXEC_WARN_THRESHOLD_MS
+                    End If
+                    g_lastRunByMachinePeriod(machineId & "|1D") = nowDT
+                    guardReason = "ran_1D"
+                End If
             End If
         End If
 
         If due7D And (Not skipLowerPriority) Then
-            tTo = nowDT: tFrom = DateAdd("d", -7, tTo)
-            Err.Clear
-            skipLowerPriority = RunWindowWithGuard(cn, rtCat, machineId, "7D", tFrom, tTo, windowElapsedMs)
-            If Err.Number <> 0 Then
-                LogMsg LOG_LEVEL_ERROR, "MainStatusAggregation", _
-                       "window_error machine=" & machineId & _
-                       " period=7D err=" & S(Err.Description)
-                Err.Clear
-            Else
-                If skipLowerPriority Then
-                    LogMsg LOG_LEVEL_WARN, "MainStatusAggregation", _
-                           "window_slow machine=" & machineId & _
-                           " period=7D elapsed_ms=" & windowElapsedMs & _
-                           " threshold_ms=" & WINDOW_EXEC_WARN_THRESHOLD_MS
-                End If
+            If noRecentShortCircuitActive Then
+                WriteNoRecentFallbackOutputs machineId, "7D", validationReason
                 g_lastRunByMachinePeriod(machineId & "|7D") = nowDT
-                guardReason = "ran_7D"
+                guardReason = "startup_no_recent_short_circuit_7D"
+            Else
+                tTo = nowDT: tFrom = DateAdd("d", -7, tTo)
+                Err.Clear
+                skipLowerPriority = RunWindowWithGuard(cn, rtCat, machineId, "7D", tFrom, tTo, windowElapsedMs)
+                If Err.Number <> 0 Then
+                    LogMsg LOG_LEVEL_ERROR, "MainStatusAggregation", _
+                           "window_error machine=" & machineId & _
+                           " period=7D err=" & S(Err.Description)
+                    Err.Clear
+                Else
+                    If skipLowerPriority Then
+                        LogMsg LOG_LEVEL_WARN, "MainStatusAggregation", _
+                               "window_slow machine=" & machineId & _
+                               " period=7D elapsed_ms=" & windowElapsedMs & _
+                               " threshold_ms=" & WINDOW_EXEC_WARN_THRESHOLD_MS
+                    End If
+                    g_lastRunByMachinePeriod(machineId & "|7D") = nowDT
+                    guardReason = "ran_7D"
+                End If
             End If
         End If
 
         If due30D And (Not skipLowerPriority) Then
-            tTo = nowDT: tFrom = DateAdd("d", -30, tTo)
-            Err.Clear
-            skipLowerPriority = RunWindowWithGuard(cn, rtCat, machineId, "30D", tFrom, tTo, windowElapsedMs)
-            If Err.Number <> 0 Then
-                LogMsg LOG_LEVEL_ERROR, "MainStatusAggregation", _
-                       "window_error machine=" & machineId & _
-                       " period=30D err=" & S(Err.Description)
-                Err.Clear
-            Else
-                If skipLowerPriority Then
-                    LogMsg LOG_LEVEL_WARN, "MainStatusAggregation", _
-                           "window_slow machine=" & machineId & _
-                           " period=30D elapsed_ms=" & windowElapsedMs & _
-                           " threshold_ms=" & WINDOW_EXEC_WARN_THRESHOLD_MS
-                End If
+            If noRecentShortCircuitActive Then
+                WriteNoRecentFallbackOutputs machineId, "30D", validationReason
                 g_lastRunByMachinePeriod(machineId & "|30D") = nowDT
-                guardReason = "ran_30D"
+                guardReason = "startup_no_recent_short_circuit_30D"
+            Else
+                tTo = nowDT: tFrom = DateAdd("d", -30, tTo)
+                Err.Clear
+                skipLowerPriority = RunWindowWithGuard(cn, rtCat, machineId, "30D", tFrom, tTo, windowElapsedMs)
+                If Err.Number <> 0 Then
+                    LogMsg LOG_LEVEL_ERROR, "MainStatusAggregation", _
+                           "window_error machine=" & machineId & _
+                           " period=30D err=" & S(Err.Description)
+                    Err.Clear
+                Else
+                    If skipLowerPriority Then
+                        LogMsg LOG_LEVEL_WARN, "MainStatusAggregation", _
+                               "window_slow machine=" & machineId & _
+                               " period=30D elapsed_ms=" & windowElapsedMs & _
+                               " threshold_ms=" & WINDOW_EXEC_WARN_THRESHOLD_MS
+                    End If
+                    g_lastRunByMachinePeriod(machineId & "|30D") = nowDT
+                    guardReason = "ran_30D"
+                End If
             End If
         End If
     End If

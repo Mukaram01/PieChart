@@ -949,6 +949,7 @@ Private Function ExecuteStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByV
     Dim aliasKey, statusLabel, insertedRowsValue, isNumericValue, insertedFlag, numericFlag, statusElapsedMs, errNumberValue, errMessageValue
     Dim valA, valH, valR, valW, valI
     Dim cacheKey, cacheEntry
+    Dim queryFailureKind, queryFailureDetail, hasUsableRow, parseFieldFailure
 
     startedAt = Now
     startTimer = Timer
@@ -972,6 +973,18 @@ Private Function ExecuteStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByV
     Set diagElapsedMs = CreateObject("Scripting.Dictionary")
     Set diagErrNum = CreateObject("Scripting.Dictionary")
     Set diagErrMsg = CreateObject("Scripting.Dictionary")
+    queryFailureKind = "none"
+    queryFailureDetail = ""
+    hasUsableRow = 0
+    parseFieldFailure = 0
+    For idx = 0 To UBound(aliases)
+        aliasKey = CStr(aliases(idx))
+        diagRows(aliasKey) = 0
+        diagNumeric(aliasKey) = 0
+        diagElapsedMs(aliasKey) = 0
+        diagErrNum(aliasKey) = 0
+        diagErrMsg(aliasKey) = ""
+    Next
 
     cacheKey = BuildBatchCacheKey(runtimeCatalog, machineId, periodKey, t1, t2, aggExpr)
     If g_batchResultCache.Exists(cacheKey) Then
@@ -1094,63 +1107,79 @@ Private Function ExecuteStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByV
     End If
 
     Set rs = cmd.Execute
-    If Err.Number = 0 Then
-        If Not (rs Is Nothing) Then
-            If Not rs.EOF Then
-                If rs.Fields.Count >= 5 Then
-                    fieldValue = rs.Fields("a").Value: If IsNumeric(fieldValue) Then outDict("Aborted") = CDbl(fieldValue): hasNumericCount = hasNumericCount + 1
-                    fieldValue = rs.Fields("h").Value: If IsNumeric(fieldValue) Then outDict("Halted") = CDbl(fieldValue): hasNumericCount = hasNumericCount + 1
-                    fieldValue = rs.Fields("r").Value: If IsNumeric(fieldValue) Then outDict("Running") = CDbl(fieldValue): hasNumericCount = hasNumericCount + 1
-                    fieldValue = rs.Fields("w").Value: If IsNumeric(fieldValue) Then outDict("Waiting") = CDbl(fieldValue): hasNumericCount = hasNumericCount + 1
-                    fieldValue = rs.Fields("i").Value: If IsNumeric(fieldValue) Then outDict("Interrupted") = CDbl(fieldValue): hasNumericCount = hasNumericCount + 1
-
-                    diagRows("a") = 0: diagRows("h") = 0: diagRows("r") = 0: diagRows("w") = 0: diagRows("i") = 0
-                    diagNumeric("a") = 0: diagNumeric("h") = 0: diagNumeric("r") = 0: diagNumeric("w") = 0: diagNumeric("i") = 0
-                    diagElapsedMs("a") = 0: diagElapsedMs("h") = 0: diagElapsedMs("r") = 0: diagElapsedMs("w") = 0: diagElapsedMs("i") = 0
-                    diagErrNum("a") = 0: diagErrNum("h") = 0: diagErrNum("r") = 0: diagErrNum("w") = 0: diagErrNum("i") = 0
-                    diagErrMsg("a") = "": diagErrMsg("h") = "": diagErrMsg("r") = "": diagErrMsg("w") = "": diagErrMsg("i") = ""
-
-                    If rs.Fields.Count >= 20 Then
-                        insertedRowsValue = rs.Fields("a_rows").Value: If IsNumeric(insertedRowsValue) Then diagRows("a") = CLng(insertedRowsValue)
-                        insertedRowsValue = rs.Fields("h_rows").Value: If IsNumeric(insertedRowsValue) Then diagRows("h") = CLng(insertedRowsValue)
-                        insertedRowsValue = rs.Fields("r_rows").Value: If IsNumeric(insertedRowsValue) Then diagRows("r") = CLng(insertedRowsValue)
-                        insertedRowsValue = rs.Fields("w_rows").Value: If IsNumeric(insertedRowsValue) Then diagRows("w") = CLng(insertedRowsValue)
-                        insertedRowsValue = rs.Fields("i_rows").Value: If IsNumeric(insertedRowsValue) Then diagRows("i") = CLng(insertedRowsValue)
-
-                        isNumericValue = rs.Fields("a_num").Value: If IsNumeric(isNumericValue) Then diagNumeric("a") = CLng(isNumericValue)
-                        isNumericValue = rs.Fields("h_num").Value: If IsNumeric(isNumericValue) Then diagNumeric("h") = CLng(isNumericValue)
-                        isNumericValue = rs.Fields("r_num").Value: If IsNumeric(isNumericValue) Then diagNumeric("r") = CLng(isNumericValue)
-                        isNumericValue = rs.Fields("w_num").Value: If IsNumeric(isNumericValue) Then diagNumeric("w") = CLng(isNumericValue)
-                        isNumericValue = rs.Fields("i_num").Value: If IsNumeric(isNumericValue) Then diagNumeric("i") = CLng(isNumericValue)
-
-                        statusElapsedMs = rs.Fields("a_ms").Value: If IsNumeric(statusElapsedMs) Then diagElapsedMs("a") = CLng(statusElapsedMs)
-                        statusElapsedMs = rs.Fields("h_ms").Value: If IsNumeric(statusElapsedMs) Then diagElapsedMs("h") = CLng(statusElapsedMs)
-                        statusElapsedMs = rs.Fields("r_ms").Value: If IsNumeric(statusElapsedMs) Then diagElapsedMs("r") = CLng(statusElapsedMs)
-                        statusElapsedMs = rs.Fields("w_ms").Value: If IsNumeric(statusElapsedMs) Then diagElapsedMs("w") = CLng(statusElapsedMs)
-                        statusElapsedMs = rs.Fields("i_ms").Value: If IsNumeric(statusElapsedMs) Then diagElapsedMs("i") = CLng(statusElapsedMs)
-                    End If
-                    If rs.Fields.Count >= 30 Then
-                        errNumberValue = rs.Fields("a_err_num").Value: If IsNumeric(errNumberValue) Then diagErrNum("a") = CLng(errNumberValue)
-                        errNumberValue = rs.Fields("h_err_num").Value: If IsNumeric(errNumberValue) Then diagErrNum("h") = CLng(errNumberValue)
-                        errNumberValue = rs.Fields("r_err_num").Value: If IsNumeric(errNumberValue) Then diagErrNum("r") = CLng(errNumberValue)
-                        errNumberValue = rs.Fields("w_err_num").Value: If IsNumeric(errNumberValue) Then diagErrNum("w") = CLng(errNumberValue)
-                        errNumberValue = rs.Fields("i_err_num").Value: If IsNumeric(errNumberValue) Then diagErrNum("i") = CLng(errNumberValue)
-
-                        errMessageValue = rs.Fields("a_err_msg").Value: If Not IsNull(errMessageValue) Then diagErrMsg("a") = CStr(errMessageValue)
-                        errMessageValue = rs.Fields("h_err_msg").Value: If Not IsNull(errMessageValue) Then diagErrMsg("h") = CStr(errMessageValue)
-                        errMessageValue = rs.Fields("r_err_msg").Value: If Not IsNull(errMessageValue) Then diagErrMsg("r") = CStr(errMessageValue)
-                        errMessageValue = rs.Fields("w_err_msg").Value: If Not IsNull(errMessageValue) Then diagErrMsg("w") = CStr(errMessageValue)
-                        errMessageValue = rs.Fields("i_err_msg").Value: If Not IsNull(errMessageValue) Then diagErrMsg("i") = CStr(errMessageValue)
-                    End If
-                    batchOk = 1
-                End If
-            End If
-            rs.Close
-        End If
-    Else
-        LogMsg LOG_LEVEL_WARN, "GetStatusFractionsBatch", "Batch query failed; no fractions returned. machine=" & machineId & " window=" & periodKey & " agg=" & aggExpr & " err=" & S(Err.Description)
+    If Err.Number <> 0 Then
+        queryFailureKind = "db_query_failed"
+        queryFailureDetail = S(Err.Description)
         Err.Clear
+    ElseIf (rs Is Nothing) Then
+        queryFailureKind = "empty_result"
+        queryFailureDetail = "recordset_is_nothing"
+    ElseIf rs.EOF Then
+        queryFailureKind = "empty_result"
+        queryFailureDetail = "recordset_eof"
+    ElseIf rs.Fields.Count < 5 Then
+        queryFailureKind = "parse_failure"
+        queryFailureDetail = "fields_lt_5"
+    Else
+        hasUsableRow = 1
+
+        fieldValue = rs.Fields("a").Value
+        If Err.Number <> 0 Then parseFieldFailure = 1 ElseIf IsNumeric(fieldValue) Then outDict("Aborted") = CDbl(fieldValue): hasNumericCount = hasNumericCount + 1
+        Err.Clear
+        fieldValue = rs.Fields("h").Value
+        If Err.Number <> 0 Then parseFieldFailure = 1 ElseIf IsNumeric(fieldValue) Then outDict("Halted") = CDbl(fieldValue): hasNumericCount = hasNumericCount + 1
+        Err.Clear
+        fieldValue = rs.Fields("r").Value
+        If Err.Number <> 0 Then parseFieldFailure = 1 ElseIf IsNumeric(fieldValue) Then outDict("Running") = CDbl(fieldValue): hasNumericCount = hasNumericCount + 1
+        Err.Clear
+        fieldValue = rs.Fields("w").Value
+        If Err.Number <> 0 Then parseFieldFailure = 1 ElseIf IsNumeric(fieldValue) Then outDict("Waiting") = CDbl(fieldValue): hasNumericCount = hasNumericCount + 1
+        Err.Clear
+        fieldValue = rs.Fields("i").Value
+        If Err.Number <> 0 Then parseFieldFailure = 1 ElseIf IsNumeric(fieldValue) Then outDict("Interrupted") = CDbl(fieldValue): hasNumericCount = hasNumericCount + 1
+        Err.Clear
+
+        If rs.Fields.Count >= 20 Then
+            insertedRowsValue = rs.Fields("a_rows").Value: If IsNumeric(insertedRowsValue) Then diagRows("a") = CLng(insertedRowsValue)
+            insertedRowsValue = rs.Fields("h_rows").Value: If IsNumeric(insertedRowsValue) Then diagRows("h") = CLng(insertedRowsValue)
+            insertedRowsValue = rs.Fields("r_rows").Value: If IsNumeric(insertedRowsValue) Then diagRows("r") = CLng(insertedRowsValue)
+            insertedRowsValue = rs.Fields("w_rows").Value: If IsNumeric(insertedRowsValue) Then diagRows("w") = CLng(insertedRowsValue)
+            insertedRowsValue = rs.Fields("i_rows").Value: If IsNumeric(insertedRowsValue) Then diagRows("i") = CLng(insertedRowsValue)
+
+            isNumericValue = rs.Fields("a_num").Value: If IsNumeric(isNumericValue) Then diagNumeric("a") = CLng(isNumericValue)
+            isNumericValue = rs.Fields("h_num").Value: If IsNumeric(isNumericValue) Then diagNumeric("h") = CLng(isNumericValue)
+            isNumericValue = rs.Fields("r_num").Value: If IsNumeric(isNumericValue) Then diagNumeric("r") = CLng(isNumericValue)
+            isNumericValue = rs.Fields("w_num").Value: If IsNumeric(isNumericValue) Then diagNumeric("w") = CLng(isNumericValue)
+            isNumericValue = rs.Fields("i_num").Value: If IsNumeric(isNumericValue) Then diagNumeric("i") = CLng(isNumericValue)
+
+            statusElapsedMs = rs.Fields("a_ms").Value: If IsNumeric(statusElapsedMs) Then diagElapsedMs("a") = CLng(statusElapsedMs)
+            statusElapsedMs = rs.Fields("h_ms").Value: If IsNumeric(statusElapsedMs) Then diagElapsedMs("h") = CLng(statusElapsedMs)
+            statusElapsedMs = rs.Fields("r_ms").Value: If IsNumeric(statusElapsedMs) Then diagElapsedMs("r") = CLng(statusElapsedMs)
+            statusElapsedMs = rs.Fields("w_ms").Value: If IsNumeric(statusElapsedMs) Then diagElapsedMs("w") = CLng(statusElapsedMs)
+            statusElapsedMs = rs.Fields("i_ms").Value: If IsNumeric(statusElapsedMs) Then diagElapsedMs("i") = CLng(statusElapsedMs)
+        End If
+        If rs.Fields.Count >= 30 Then
+            errNumberValue = rs.Fields("a_err_num").Value: If IsNumeric(errNumberValue) Then diagErrNum("a") = CLng(errNumberValue)
+            errNumberValue = rs.Fields("h_err_num").Value: If IsNumeric(errNumberValue) Then diagErrNum("h") = CLng(errNumberValue)
+            errNumberValue = rs.Fields("r_err_num").Value: If IsNumeric(errNumberValue) Then diagErrNum("r") = CLng(errNumberValue)
+            errNumberValue = rs.Fields("w_err_num").Value: If IsNumeric(errNumberValue) Then diagErrNum("w") = CLng(errNumberValue)
+            errNumberValue = rs.Fields("i_err_num").Value: If IsNumeric(errNumberValue) Then diagErrNum("i") = CLng(errNumberValue)
+
+            errMessageValue = rs.Fields("a_err_msg").Value: If Not IsNull(errMessageValue) Then diagErrMsg("a") = CStr(errMessageValue)
+            errMessageValue = rs.Fields("h_err_msg").Value: If Not IsNull(errMessageValue) Then diagErrMsg("h") = CStr(errMessageValue)
+            errMessageValue = rs.Fields("r_err_msg").Value: If Not IsNull(errMessageValue) Then diagErrMsg("r") = CStr(errMessageValue)
+            errMessageValue = rs.Fields("w_err_msg").Value: If Not IsNull(errMessageValue) Then diagErrMsg("w") = CStr(errMessageValue)
+            errMessageValue = rs.Fields("i_err_msg").Value: If Not IsNull(errMessageValue) Then diagErrMsg("i") = CStr(errMessageValue)
+        End If
+        If parseFieldFailure <> 0 Then
+            queryFailureKind = "parse_failure"
+            queryFailureDetail = "field_access_error"
+        Else
+            batchOk = 1
+        End If
     End If
+
+    If Not (rs Is Nothing) Then rs.Close
     On Error GoTo 0
 
     Set rs = Nothing
@@ -1217,6 +1246,21 @@ Private Function ExecuteStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByV
         LogMsg LOG_LEVEL_INFO, "GetStatusFractionsBatch", infoMsg
         Set ExecuteStatusFractionsBatch = outDict
     Else
+        If queryFailureKind = "none" Then
+            If hasUsableRow = 0 Then
+                queryFailureKind = "empty_result"
+                queryFailureDetail = "no_usable_result_row"
+            Else
+                queryFailureKind = "parse_failure"
+                queryFailureDetail = "non_numeric_or_invalid_fields"
+            End If
+        End If
+        LogMsg LOG_LEVEL_WARN, "GetStatusFractionsBatch", _
+               "batch_result_event machine=" & machineId & _
+               " window=" & periodKey & _
+               " agg=" & aggExpr & _
+               " event=" & queryFailureKind & _
+               " detail=" & queryFailureDetail
         LogMsg LOG_LEVEL_WARN, "GetStatusFractionsBatch", _
                "batch_result_invalid machine=" & machineId & _
                " window=" & periodKey & _
@@ -1226,7 +1270,13 @@ Private Function ExecuteStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByV
                " started=" & TS3(startedAt) & _
                " ended=" & TS3(completedAt) & _
                " elapsed_ms=" & elapsedMsValue & _
-               " reason=no_usable_result_row"
+               " reason=" & queryFailureKind
+        LogMsg LOG_LEVEL_WARN, "GetStatusFractionsBatch", _
+               "degraded_period_record machine=" & machineId & _
+               " window=" & periodKey & _
+               " agg=" & aggExpr & _
+               " cause=" & queryFailureKind & _
+               " output=invalid_input_mode"
         Set ExecuteStatusFractionsBatch = Nothing
     End If
 

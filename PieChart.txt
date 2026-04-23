@@ -65,6 +65,7 @@ Const VALIDATE_STATE_OK = 2
 Const VALIDATE_RETRY_HARD_FAIL_MINUTES = 2
 Const VALIDATE_RETRY_NORMAL_MINUTES = 180
 Const STARTUP_VALIDATION_BLOCK_WRITES_ON_PROBE_FAIL = False
+Const VALIDATE_BAD_AGG_COOLDOWN_MINUTES = 20
 
 Const adCmdText              = 1
 Const adStateOpen            = 1
@@ -92,6 +93,7 @@ Dim g_machineValidationDone
 Dim g_machineValidationState
 Dim g_machineValidationReason
 Dim g_machineValidationLastTs
+Dim g_validationBadAggUntil
 Dim g_batchResultCache
 Dim g_statusTagFullNameCache
 Dim g_lastAggUsed
@@ -125,6 +127,7 @@ Private Sub InitGlobals()
     Set g_machineValidationState = CreateObject("Scripting.Dictionary")
     Set g_machineValidationReason = CreateObject("Scripting.Dictionary")
     Set g_machineValidationLastTs = CreateObject("Scripting.Dictionary")
+    Set g_validationBadAggUntil = CreateObject("Scripting.Dictionary")
     Set g_batchResultCache = CreateObject("Scripting.Dictionary")
     Set g_statusTagFullNameCache = CreateObject("Scripting.Dictionary")
 
@@ -257,6 +260,48 @@ Private Function IsTimeoutLikeError(ByVal errDesc)
                          (InStr(lowered, "time out") > 0) Or _
                          (InStr(lowered, "expired") > 0)
 End Function
+
+Private Function IsProviderInternalLikeError(ByVal errDesc, ByVal errSource)
+    Dim loweredDesc, loweredSource
+    loweredDesc = LCase(S(errDesc))
+    loweredSource = LCase(S(errSource))
+
+    IsProviderInternalLikeError = (InStr(loweredDesc, "provider") > 0 And InStr(loweredDesc, "internal") > 0) Or _
+                                  (InStr(loweredDesc, "internal provider") > 0) Or _
+                                  (InStr(loweredDesc, "severe error") > 0) Or _
+                                  (InStr(loweredDesc, "communication link failure") > 0) Or _
+                                  (InStr(loweredDesc, "transport-level") > 0) Or _
+                                  (InStr(loweredSource, "provider") > 0 And InStr(loweredSource, "oledb") > 0)
+End Function
+
+Private Function ShouldStopAggFallbackForError(ByVal errDesc, ByVal errSource)
+    ShouldStopAggFallbackForError = IsTimeoutLikeError(errDesc) Or IsProviderInternalLikeError(errDesc, errSource)
+End Function
+
+Private Function BuildValidationBadAggKey(ByVal machineId, ByVal statusName, ByVal aggExpr)
+    BuildValidationBadAggKey = machineId & "|" & statusName & "|" & aggExpr
+End Function
+
+Private Function IsValidationBadAggOnCooldown(ByVal machineId, ByVal statusName, ByVal aggExpr)
+    Dim cacheKey, untilTs
+    cacheKey = BuildValidationBadAggKey(machineId, statusName, aggExpr)
+    IsValidationBadAggOnCooldown = False
+
+    If Not g_validationBadAggUntil.Exists(cacheKey) Then Exit Function
+    untilTs = CDate(g_validationBadAggUntil(cacheKey))
+    If DateDiff("s", Now(), untilTs) > 0 Then
+        IsValidationBadAggOnCooldown = True
+    Else
+        g_validationBadAggUntil.Remove cacheKey
+    End If
+End Function
+
+Private Sub MarkValidationBadAggCooldown(ByVal machineId, ByVal statusName, ByVal aggExpr)
+    Dim cacheKey, untilTs
+    cacheKey = BuildValidationBadAggKey(machineId, statusName, aggExpr)
+    untilTs = DateAdd("n", VALIDATE_BAD_AGG_COOLDOWN_MINUTES, Now())
+    g_validationBadAggUntil(cacheKey) = untilTs
+End Sub
 
 ' ─────────────────────────────────────────────────────────────────────
 ' cp_TagStatisticEx (short retry, null-safe)
@@ -517,6 +562,7 @@ Private Function ValidateMachineCountTags(ByVal cn, ByVal runtimeCatalog, ByVal 
     Dim aggIdx, aggCount, statusProbeSucceeded, statusHadRows, lastErrDesc
     Dim errNumber, errSource, sqlTextOut, lastErrNumber, lastErrSource, lastSqlText
     Dim cacheTs, elapsedMins, retryIntervalMins, priorState, priorReason
+    Dim attemptedAggCount, cooldownSkipCount, stopReason
 
     If g_machineValidationDone.Exists(machineId) Then
         priorState = CLng(g_machineValidationState(machineId))
@@ -571,41 +617,46 @@ Private Function ValidateMachineCountTags(ByVal cn, ByVal runtimeCatalog, ByVal 
         lastErrNumber = 0
         lastErrSource = ""
         lastSqlText = ""
+        attemptedAggCount = 0
+        cooldownSkipCount = 0
+        stopReason = "all_aggs_failed"
 
         For aggIdx = 0 To UBound(aggs)
             aggExpr = CStr(aggs(aggIdx))
-            probeOk = ProbeCountTagArchive(cn, runtimeCatalog, tagFull, tFrom, tTo, aggExpr, insertedRows, hasNumeric, elapsedMsValue, errDesc, errNumber, errSource, sqlTextOut)
-            If probeOk Then
-                statusProbeSucceeded = True
-                hasArchiveData = (insertedRows > 0)
-                If hasArchiveData Then statusHadRows = True
-                LogMsg LOG_LEVEL_INFO, "StartupValidate", _
-                       "machine=" & machineId & _
-                       " status=" & statusName & _
-                       " tag_full=" & tagFull & _
-                       " agg=" & aggExpr & _
-                       " data_exists=" & CStr(hasArchiveData) & _
-                       " inserted_rows=" & insertedRows & _
-                       " has_numeric=" & hasNumeric & _
-                       " lookback_min=" & lookbackMinutes & _
-                       " elapsed_ms=" & elapsedMsValue
-                Exit For
+            If IsValidationBadAggOnCooldown(machineId, statusName, aggExpr) Then
+                cooldownSkipCount = cooldownSkipCount + 1
+                If cooldownSkipCount = aggCount Then
+                    stopReason = "all_aggs_on_cooldown"
+                End If
             Else
-                lastErrDesc = errDesc
-                lastErrNumber = errNumber
-                lastErrSource = errSource
-                lastSqlText = sqlTextOut
-                LogMsg LOG_LEVEL_WARN, "StartupValidate", _
-                       "machine=" & machineId & _
-                       " status=" & statusName & _
-                       " tag_full=" & tagFull & _
-                       " agg=" & aggExpr & _
-                       " data_exists=False" & _
-                       " probe_failed=1" & _
-                       " provider_err_num=" & CStr(errNumber) & _
-                       " provider_err_source=" & errSource & _
-                       " provider_err_desc=" & errDesc & _
-                       " probe_sql=" & sqlTextOut
+                attemptedAggCount = attemptedAggCount + 1
+                probeOk = ProbeCountTagArchive(cn, runtimeCatalog, tagFull, tFrom, tTo, aggExpr, insertedRows, hasNumeric, elapsedMsValue, errDesc, errNumber, errSource, sqlTextOut)
+                If probeOk Then
+                    statusProbeSucceeded = True
+                    hasArchiveData = (insertedRows > 0)
+                    If hasArchiveData Then statusHadRows = True
+                    LogMsg LOG_LEVEL_INFO, "StartupValidate", _
+                           "machine=" & machineId & _
+                           " status=" & statusName & _
+                           " tag_full=" & tagFull & _
+                           " agg=" & aggExpr & _
+                           " data_exists=" & CStr(hasArchiveData) & _
+                           " inserted_rows=" & insertedRows & _
+                           " has_numeric=" & hasNumeric & _
+                           " lookback_min=" & lookbackMinutes & _
+                           " elapsed_ms=" & elapsedMsValue
+                    Exit For
+                Else
+                    MarkValidationBadAggCooldown machineId, statusName, aggExpr
+                    lastErrDesc = errDesc
+                    lastErrNumber = errNumber
+                    lastErrSource = errSource
+                    lastSqlText = sqlTextOut
+                    If ShouldStopAggFallbackForError(errDesc, errSource) Then
+                        stopReason = "timeout_or_provider_internal"
+                        Exit For
+                    End If
+                End If
             End If
         Next
 
@@ -624,7 +675,9 @@ Private Function ValidateMachineCountTags(ByVal cn, ByVal runtimeCatalog, ByVal 
                    " provider_err_source=" & lastErrSource & _
                    " provider_err_desc=" & lastErrDesc & _
                    " probe_sql=" & lastSqlText & _
-                   " fallback_aggs_attempted=" & aggCount
+                   " fallback_aggs_attempted=" & attemptedAggCount & _
+                   " fallback_aggs_skipped_cooldown=" & cooldownSkipCount & _
+                   " fallback_stop_reason=" & stopReason
         End If
     Next
 

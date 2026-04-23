@@ -1803,6 +1803,7 @@ Private Sub GetCombinedFractions(ByVal cn, ByVal runtimeCatalog, ByVal machineId
     Dim a, h, r, w, i, total, statusFractions
 
     ' Initialise outputs so callers always receive well-defined values
+    a = 0 : h = 0 : r = 0 : w = 0 : i = 0 : total = 0
     fRun = 0 : fHalt = 0 : fAbort = 0
     inputValid = False
 
@@ -1983,14 +1984,55 @@ Private Sub AggregatePeriod(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByV
     Dim inputValid
     Dim usedFallbackPie
     Dim zeroTotalRenderMode
+    Dim procName, branchContext
+    Dim hasAggregateError, aggErrNumber, aggErrDescription
 
-    LogMsg LOG_LEVEL_INFO, "Aggregate", machineId & " " & periodKey & "  " & TS3(startDt) & " -> " & TS3(endDt)
+    procName = "AggregatePeriod"
+    branchContext = "init"
+    hasAggregateError = False
+    aggErrNumber = 0
+    aggErrDescription = ""
 
+    fRun = 0 : fHalt = 0 : fAbort = 0
+    pctRun = 0 : pctHalt = 0 : pctAbort = 0
+    tagPct = "" : tagPie = "" : pieVal = 0
+    totalPct = 0
+    inputValid = False
     usedFallbackPie = False
     zeroTotalRenderMode = "preserve_zero"
 
+    On Error Resume Next
+    branchContext = "log_start"
+    LogMsg LOG_LEVEL_INFO, "Aggregate", machineId & " " & periodKey & "  " & TS3(startDt) & " -> " & TS3(endDt)
+    If Err.Number <> 0 Then
+        hasAggregateError = True
+        aggErrNumber = Err.Number
+        aggErrDescription = Err.Description
+        Err.Clear
+    End If
+
+    branchContext = "combined_fractions"
     Call GetCombinedFractions(cn, runtimeCatalog, machineId, periodKey, startDt, endDt, fRun, fHalt, fAbort, inputValid)
-    If Not inputValid Then
+    If Err.Number <> 0 Then
+        hasAggregateError = True
+        aggErrNumber = Err.Number
+        aggErrDescription = Err.Description
+        Err.Clear
+    End If
+
+    If hasAggregateError Or (Not inputValid) Then
+        If hasAggregateError Then
+            LogMsg LOG_LEVEL_ERROR, "Aggregate", _
+                   "aggregate_internal_error procedure=" & procName & _
+                   " branch=" & branchContext & _
+                   " machineId=" & machineId & _
+                   " periodKey=" & periodKey & _
+                   " runtimeCatalog=" & runtimeCatalog & _
+                   " err_number=" & S(aggErrNumber) & _
+                   " err_description=" & S(aggErrDescription)
+        End If
+
+        branchContext = "invalid_or_error_fallback"
         LogMsg LOG_LEVEL_WARN, "Aggregate", _
                "aggregate_input_invalid machineId=" & machineId & _
                " periodKey=" & periodKey & _
@@ -2004,12 +2046,35 @@ Private Sub AggregatePeriod(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByV
         usedFallbackPie = True
         zeroTotalRenderMode = "fallback"
     Else
+        branchContext = "normalize"
         NormalizeFractionsToPct fRun, fHalt, fAbort, pctRun, pctHalt, pctAbort
-        totalPct = pctRun + pctHalt + pctAbort
+        If Err.Number <> 0 Then
+            hasAggregateError = True
+            aggErrNumber = Err.Number
+            aggErrDescription = Err.Description
+            Err.Clear
+        End If
 
-        If totalPct = 0 And RENDER_ZERO_TOTAL_AS_FALLBACK_PIE Then
+        If hasAggregateError Then
+            LogMsg LOG_LEVEL_ERROR, "Aggregate", _
+                   "aggregate_internal_error procedure=" & procName & _
+                   " branch=" & branchContext & _
+                   " machineId=" & machineId & _
+                   " periodKey=" & periodKey & _
+                   " runtimeCatalog=" & runtimeCatalog & _
+                   " err_number=" & S(aggErrNumber) & _
+                   " err_description=" & S(aggErrDescription)
+            pctRun = 0: pctHalt = 0: pctAbort = 0
+            totalPct = 0
             usedFallbackPie = True
             zeroTotalRenderMode = "fallback"
+        Else
+            totalPct = pctRun + pctHalt + pctAbort
+
+            If totalPct = 0 And RENDER_ZERO_TOTAL_AS_FALLBACK_PIE Then
+                usedFallbackPie = True
+                zeroTotalRenderMode = "fallback"
+            End If
         End If
     End If
 
@@ -2025,15 +2090,23 @@ Private Sub AggregatePeriod(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByV
            " zero_total_render_mode=" & zeroTotalRenderMode
 
     ' main % (can be 0)
+    branchContext = "write_main_percentages"
     tagPct = OutTagName(machineId, periodKey, "Running", False): WriteTag tagPct, pctRun
     tagPct = OutTagName(machineId, periodKey, "Halted",  False): WriteTag tagPct, pctHalt
     tagPct = OutTagName(machineId, periodKey, "Aborted", False): WriteTag tagPct, pctAbort
+    If Err.Number <> 0 Then
+        hasAggregateError = True
+        aggErrNumber = Err.Number
+        aggErrDescription = Err.Description
+        Err.Clear
+    End If
 
     ' pie chart output strategy:
     ' 1) invalid/no-data input -> deterministic fallback split for rendering.
     ' 2) valid input -> zero-total behavior is controlled by
     '    RENDER_ZERO_TOTAL_AS_FALLBACK_PIE (fallback split vs preserved zeroes).
     If usedFallbackPie Then
+        branchContext = "write_fallback_pie"
         tagPie = OutTagName(machineId, periodKey, "Running", True): WriteTag tagPie, 34
         tagPie = OutTagName(machineId, periodKey, "Halted",  True): WriteTag tagPie, 33
         tagPie = OutTagName(machineId, periodKey, "Aborted", True): WriteTag tagPie, 33
@@ -2045,6 +2118,7 @@ Private Sub AggregatePeriod(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByV
                " fallback_render_path=True" & _
                " zero_total_render_mode=" & zeroTotalRenderMode
     Else
+        branchContext = "write_standard_pie"
         pieVal = pctRun:   If pieVal < 1 And totalPct > 0 Then pieVal = 1
         tagPie = OutTagName(machineId, periodKey, "Running", True): WriteTag tagPie, pieVal
 
@@ -2064,6 +2138,23 @@ Private Sub AggregatePeriod(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByV
                    " zero_total_render_mode=" & zeroTotalRenderMode
         End If
     End If
+    If Err.Number <> 0 Then
+        hasAggregateError = True
+        aggErrNumber = Err.Number
+        aggErrDescription = Err.Description
+        Err.Clear
+    End If
+
+    If hasAggregateError Then
+        LogMsg LOG_LEVEL_ERROR, "Aggregate", _
+               "aggregate_internal_error procedure=" & procName & _
+               " branch=" & branchContext & _
+               " machineId=" & machineId & _
+               " periodKey=" & periodKey & _
+               " runtimeCatalog=" & runtimeCatalog & _
+               " err_number=" & S(aggErrNumber) & _
+               " err_description=" & S(aggErrDescription)
+    End If
 
     LogMsg LOG_LEVEL_INFO, "Aggregate", _
            "zero_total_render_mode=" & zeroTotalRenderMode & _
@@ -2071,6 +2162,7 @@ Private Sub AggregatePeriod(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByV
            " period=" & periodKey
 
     LogMsg LOG_LEVEL_INFO, "Aggregate", "writes_completed machine=" & machineId & " period=" & periodKey
+    On Error GoTo 0
 End Sub
 
 Private Function ShouldRun(ByVal lastRun, ByVal throttleMin)
@@ -2083,10 +2175,21 @@ End Function
 
 Private Function RunWindowWithGuard(ByVal cn, ByVal rtCat, ByVal machineId, ByVal periodKey, ByVal tFrom, ByVal tTo, ByRef windowElapsedMs)
     Dim windowTimer
+    windowElapsedMs = 0
     windowTimer = Timer
+    On Error Resume Next
     AggregatePeriod cn, rtCat, machineId, periodKey, tFrom, tTo
     windowElapsedMs = ElapsedMs(windowTimer)
+    If Err.Number <> 0 Then
+        LogMsg LOG_LEVEL_ERROR, "RunWindowWithGuard", _
+               "window_guard_error machine=" & machineId & _
+               " period=" & periodKey & _
+               " err=" & S(Err.Description)
+        Err.Clear
+        windowElapsedMs = 0
+    End If
     RunWindowWithGuard = (windowElapsedMs > WINDOW_EXEC_WARN_THRESHOLD_MS)
+    On Error GoTo 0
 End Function
 
 ' ─────────────────────────────────────────────────────────────────────

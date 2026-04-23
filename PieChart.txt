@@ -1081,6 +1081,20 @@ Private Function GetAggCommandTimeoutSeconds(ByVal periodKey)
     End Select
 End Function
 
+Private Function GetAggCommandTimeoutSecondsCapped(ByVal periodKey, ByVal remainingBudgetMs)
+    Dim baselineTimeoutSeconds, budgetLimitedSeconds, cappedTimeoutSeconds
+    baselineTimeoutSeconds = GetAggCommandTimeoutSeconds(periodKey)
+    budgetLimitedSeconds = Int(CDbl(remainingBudgetMs) / 1000)
+
+    If budgetLimitedSeconds < 1 Then budgetLimitedSeconds = 1
+
+    cappedTimeoutSeconds = baselineTimeoutSeconds
+    If budgetLimitedSeconds < cappedTimeoutSeconds Then cappedTimeoutSeconds = budgetLimitedSeconds
+    If cappedTimeoutSeconds < 1 Then cappedTimeoutSeconds = 1
+
+    GetAggCommandTimeoutSecondsCapped = cappedTimeoutSeconds
+End Function
+
 Private Function GetAggTimeoutBudgetMs(ByVal periodKey)
     Select Case UCase(CStr(periodKey))
         Case "7D"
@@ -1092,7 +1106,7 @@ Private Function GetAggTimeoutBudgetMs(ByVal periodKey)
     End Select
 End Function
 
-Private Function ExecuteStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal periodKey, ByVal t1, ByVal t2, ByVal aggExpr, ByVal tagMap, ByRef hasNumericCount, ByRef insertedStatusCount, ByRef allNullNoNumeric, ByRef batchOk, ByRef queryFailureKindOut, ByRef timeoutLikeFailureOut)
+Private Function ExecuteStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal periodKey, ByVal t1, ByVal t2, ByVal aggExpr, ByVal tagMap, ByVal remainingBudgetMs, ByRef hasNumericCount, ByRef insertedStatusCount, ByRef allNullNoNumeric, ByRef batchOk, ByRef queryFailureKindOut, ByRef timeoutLikeFailureOut, ByRef baselineTimeoutSecondsOut, ByRef cappedTimeoutSecondsOut)
     Dim cmd, rs, sqlText, startedAt, completedAt, startTimer, elapsedMsValue, infoMsg
     Dim statuses, aliases, idx, statusName, tagFull, cpCall
     Dim outDict, fieldValue, diagRows, diagNumeric, diagElapsedMs, diagErrNum, diagErrMsg
@@ -1101,6 +1115,7 @@ Private Function ExecuteStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByV
     Dim cacheKey, cacheEntry
     Dim queryFailureKind, queryFailureDetail, hasUsableRow, parseFieldFailure
     Dim foundDataRecordset
+    Dim baselineTimeoutSeconds, cappedTimeoutSeconds
 
     startedAt = Now
     startTimer = Timer
@@ -1110,6 +1125,10 @@ Private Function ExecuteStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByV
     batchOk = 0
     queryFailureKindOut = "none"
     timeoutLikeFailureOut = 0
+    baselineTimeoutSecondsOut = GetAggCommandTimeoutSeconds(periodKey)
+    cappedTimeoutSecondsOut = GetAggCommandTimeoutSecondsCapped(periodKey, remainingBudgetMs)
+    baselineTimeoutSeconds = baselineTimeoutSecondsOut
+    cappedTimeoutSeconds = cappedTimeoutSecondsOut
 
     Set outDict = CreateObject("Scripting.Dictionary")
     outDict.Add "Aborted", 0
@@ -1261,7 +1280,7 @@ Private Function ExecuteStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByV
     On Error Resume Next
     Set cmd = CreateObject("ADODB.Command")
     Set cmd.ActiveConnection = cn
-    cmd.CommandTimeout = GetAggCommandTimeoutSeconds(periodKey)
+    cmd.CommandTimeout = cappedTimeoutSeconds
     cmd.CommandType = adCmdText
     cmd.CommandText = sqlText
 
@@ -1462,7 +1481,10 @@ Private Function ExecuteStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByV
                " window=" & periodKey & _
                " agg=" & aggExpr & _
                " event=" & queryFailureKind & _
-               " detail=" & queryFailureDetail
+               " detail=" & queryFailureDetail & _
+               " timeout_baseline_s=" & baselineTimeoutSeconds & _
+               " timeout_capped_s=" & cappedTimeoutSeconds & _
+               " budget_remaining_ms=" & remainingBudgetMs
         LogMsg LOG_LEVEL_WARN, "GetStatusFractionsBatch", _
                "batch_result_invalid machine=" & machineId & _
                " window=" & periodKey & _
@@ -1524,6 +1546,7 @@ Private Function GetStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal m
     Dim persistedAggAtStart
     Dim aggBudgetStart, aggBudgetUsedMs, aggBudgetRemainingMs, aggBudgetStopReason, aggBudgetLimitMs
     Dim queryFailureKind, timeoutLikeFailure, skipFallbackScanDueTimeout
+    Dim baselineTimeoutSeconds, cappedTimeoutSeconds
 
     aggs = GetAggExprListForMachineCatalog(runtimeCatalog, machineId)
     persistedAggAtStart = GetPersistedBatchAgg(machineId, runtimeCatalog)
@@ -1555,7 +1578,9 @@ Private Function GetStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal m
         If idx > 0 And allowFallbackAggs = 0 And queryFailureCount = 0 Then Exit For
 
         aggExpr = CStr(aggs(idx))
-        Set currentDict = ExecuteStatusFractionsBatch(cn, runtimeCatalog, machineId, periodKey, t1, t2, aggExpr, tagMap, numericCount, insertedStatusCount, allNullNoNumeric, batchOk, queryFailureKind, timeoutLikeFailure)
+        baselineTimeoutSeconds = GetAggCommandTimeoutSeconds(periodKey)
+        cappedTimeoutSeconds = GetAggCommandTimeoutSecondsCapped(periodKey, aggBudgetRemainingMs)
+        Set currentDict = ExecuteStatusFractionsBatch(cn, runtimeCatalog, machineId, periodKey, t1, t2, aggExpr, tagMap, aggBudgetRemainingMs, numericCount, insertedStatusCount, allNullNoNumeric, batchOk, queryFailureKind, timeoutLikeFailure, baselineTimeoutSeconds, cappedTimeoutSeconds)
         hasCurrentDict = IsObject(currentDict)
         currentDictReady = 0
         If batchOk = 1 Then
@@ -1563,7 +1588,7 @@ Private Function GetStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal m
                 If Not (currentDict Is Nothing) Then
                     currentDictReady = 1
                     currentSum = SumStatusFractions(currentDict)
-                    currentTrial = aggExpr & "{ok=1,numeric=" & numericCount & ",inserted=" & insertedStatusCount & ",sum=" & currentSum & "}"
+                    currentTrial = aggExpr & "{ok=1,numeric=" & numericCount & ",inserted=" & insertedStatusCount & ",sum=" & currentSum & ",timeout_base_s=" & baselineTimeoutSeconds & ",timeout_cap_s=" & cappedTimeoutSeconds & ",budget_remaining_ms=" & aggBudgetRemainingMs & "}"
                     If idx = 0 Then
                         If numericCount > 0 Then
                             Set bestDict = CopyStatusFractions(currentDict)
@@ -1583,17 +1608,17 @@ Private Function GetStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal m
                     End If
                 Else
                     currentSum = 0
-                    currentTrial = aggExpr & "{ok=0,query_failure=1}"
+                    currentTrial = aggExpr & "{ok=0,query_failure=1,timeout_base_s=" & baselineTimeoutSeconds & ",timeout_cap_s=" & cappedTimeoutSeconds & ",budget_remaining_ms=" & aggBudgetRemainingMs & "}"
                     queryFailureCount = queryFailureCount + 1
                 End If
             Else
                 currentSum = 0
-                currentTrial = aggExpr & "{ok=0,query_failure=1}"
+                currentTrial = aggExpr & "{ok=0,query_failure=1,timeout_base_s=" & baselineTimeoutSeconds & ",timeout_cap_s=" & cappedTimeoutSeconds & ",budget_remaining_ms=" & aggBudgetRemainingMs & "}"
                 queryFailureCount = queryFailureCount + 1
             End If
         Else
             currentSum = 0
-            currentTrial = aggExpr & "{ok=0,query_failure=1}"
+            currentTrial = aggExpr & "{ok=0,query_failure=1,timeout_base_s=" & baselineTimeoutSeconds & ",timeout_cap_s=" & cappedTimeoutSeconds & ",budget_remaining_ms=" & aggBudgetRemainingMs & "}"
             queryFailureCount = queryFailureCount + 1
             If idx = 0 And timeoutLikeFailure <> 0 Then
                 skipFallbackScanDueTimeout = 1
@@ -1606,6 +1631,9 @@ Private Function GetStatusFractionsBatch(ByVal cn, ByVal runtimeCatalog, ByVal m
                    " reason=" & queryFailureKind & _
                    " sql_from=" & TS3(t1) & _
                    " sql_to=" & TS3(t2) & _
+                   " timeout_baseline_s=" & baselineTimeoutSeconds & _
+                   " timeout_capped_s=" & cappedTimeoutSeconds & _
+                   " budget_remaining_ms=" & aggBudgetRemainingMs & _
                    " fallback_scan_skipped_due_timeout=" & skipFallbackScanDueTimeout
             If idx = 0 And timeoutLikeFailure <> 0 Then
                 aggBudgetStopReason = "first_agg_timeout_like_failure"

@@ -3,15 +3,20 @@
 ' ======================================================================
 Option Explicit
 
+Const SCRIPT_VERSION = "PieChart-simplified-v3-global-cooldown-result-classification"
+
 Const DEFAULT_PROVIDER = "MSOLEDBSQL"
 Const FALLBACK_PROVIDER = "SQLNCLI11"
 Const SQL_INSTANCE = ".\WinCC"
 Const INITIAL_CATALOG = "master"
-Const SQL_TIMEOUT_SECONDS = 45
+Const SQL_TIMEOUT_SECONDS_1D = 12
+Const SQL_TIMEOUT_SECONDS_7D = 20
+Const SQL_TIMEOUT_SECONDS_30D = 25
+Const GLOBAL_MIN_SECONDS_BETWEEN_MACHINE_RUNS = 120
 Const WINDOW_EXEC_WARN_THRESHOLD_MS = 15000
 
-Const THROTTLE_1D_MINUTES = 30
-Const THROTTLE_7D_MINUTES = 360
+Const THROTTLE_1D_MINUTES = 60
+Const THROTTLE_7D_MINUTES = 720
 Const THROTTLE_30D_MINUTES = 1440
 
 Const COUNT_TAG_PREFIX_JOINER = "\"
@@ -28,6 +33,7 @@ Const LOG_LEVEL_INFO = 3
 Const CURRENT_LOG_LEVEL = 3
 
 Dim g_lastRunByMachinePeriod
+Dim g_lastGlobalAggregationRun
 Dim G_MACHINES
 Dim g_inited
 
@@ -41,36 +47,6 @@ Private Function S(ByVal v)
             S = ""
             Err.Clear
         End If
-    End If
-    On Error GoTo 0
-End Function
-
-Private Function TS3(ByVal dt)
-    TS3 = Year(dt) & "-" & Right("0" & Month(dt),2) & "-" & Right("0" & Day(dt),2) & _
-          " " & Right("0" & Hour(dt),2) & ":" & Right("0" & Minute(dt),2) & ":" & Right("0" & Second(dt),2) & ".000"
-End Function
-
-Private Function ElapsedMs(ByVal timerStart)
-    Dim timerEnd
-    timerEnd = Timer
-    If timerEnd < timerStart Then timerEnd = timerEnd + 86400
-    ElapsedMs = CLng((timerEnd - timerStart) * 1000)
-End Function
-
-Private Sub LogMsg(ByVal level, ByVal src, ByVal msg)
-    If level > CURRENT_LOG_LEVEL Then Exit Sub
-    On Error Resume Next
-    HMIRuntime.Trace FormatDateTime(Now(), vbShortDate) & " " & _
-                     FormatDateTime(Now(), vbLongTime) & " [PieChart/" & src & "] " & S(msg) & vbCrLf
-    On Error GoTo 0
-End Sub
-
-Private Function IsMaster()
-    On Error Resume Next
-    IsMaster = (CLng(HMIRuntime.Tags("@RM_MASTER").Read) = 1)
-    If Err.Number <> 0 Then
-        IsMaster = True
-        Err.Clear
     End If
     On Error GoTo 0
 End Function
@@ -92,8 +68,18 @@ Private Sub InitGlobals()
     G_MACHINES.Add "MNA_0411", "Mazak_MNA_0411"
 
     g_inited = True
-    LogMsg LOG_LEVEL_INFO, "InitGlobals", "initialized"
+    LogMsg LOG_LEVEL_INFO, "InitGlobals", "initialized version=" & SCRIPT_VERSION
 End Sub
+
+Private Function IsMaster()
+    On Error Resume Next
+    IsMaster = (CLng(HMIRuntime.Tags("@RM_MASTER").Read) = 1)
+    If Err.Number <> 0 Then
+        IsMaster = True
+        Err.Clear
+    End If
+    On Error GoTo 0
+End Function
 
 Private Function OpenConnection()
     On Error Resume Next
@@ -104,7 +90,7 @@ Private Function OpenConnection()
     cn.Open "Provider=" & prov & ";Data Source=" & SQL_INSTANCE & ";Initial Catalog=" & INITIAL_CATALOG & ";Integrated Security=SSPI;"
 
     If Err.Number <> 0 Then
-        LogMsg LOG_LEVEL_WARN, "InitGlobals", "provider_fallback=" & FALLBACK_PROVIDER & " reason=" & S(Err.Description)
+        LogMsg LOG_LEVEL_WARN, "OpenConnection", "provider_fallback=" & FALLBACK_PROVIDER & " reason=" & S(Err.Description)
         Err.Clear
         prov = FALLBACK_PROVIDER
         Set cn = CreateObject("ADODB.Connection")
@@ -112,7 +98,7 @@ Private Function OpenConnection()
     End If
 
     If Err.Number <> 0 Then
-        LogMsg LOG_LEVEL_ERROR, "InitGlobals", "sql_open_failed=" & S(Err.Description)
+        LogMsg LOG_LEVEL_ERROR, "OpenConnection", "sql_open_failed=" & S(Err.Description)
         Set cn = Nothing
         Err.Clear
     End If
@@ -145,7 +131,27 @@ Private Function GetRuntimeCatalog()
     On Error GoTo 0
 End Function
 
-Private Sub WriteTag(ByVal tagName, ByVal value)
+Private Function TS3(ByVal dt)
+    TS3 = Year(dt) & "-" & Right("0" & Month(dt),2) & "-" & Right("0" & Day(dt),2) & _
+          " " & Right("0" & Hour(dt),2) & ":" & Right("0" & Minute(dt),2) & ":" & Right("0" & Second(dt),2) & ".000"
+End Function
+
+Private Function ElapsedMs(ByVal timerStart)
+    Dim timerEnd
+    timerEnd = Timer
+    If timerEnd < timerStart Then timerEnd = timerEnd + 86400
+    ElapsedMs = CLng((timerEnd - timerStart) * 1000)
+End Function
+
+Private Sub LogMsg(ByVal level, ByVal src, ByVal msg)
+    If level > CURRENT_LOG_LEVEL Then Exit Sub
+    On Error Resume Next
+    HMIRuntime.Trace FormatDateTime(Now(), vbShortDate) & " " & _
+                     FormatDateTime(Now(), vbLongTime) & " [PieChart/" & src & "] " & S(msg) & vbCrLf
+    On Error GoTo 0
+End Sub
+
+Private Sub WriteNumericOutputTag(ByVal tagName, ByVal value)
     On Error Resume Next
     HMIRuntime.Tags(tagName).Write CDbl(value)
     If Err.Number <> 0 Then
@@ -168,6 +174,19 @@ Private Function ShouldRun(ByVal machineId, ByVal periodKey, ByVal throttleMinut
     ShouldRun = (minsSince >= throttleMinutes)
 End Function
 
+Private Function GetCommandTimeoutSeconds(ByVal periodKey)
+    Select Case UCase(CStr(periodKey))
+        Case "1D"
+            GetCommandTimeoutSeconds = SQL_TIMEOUT_SECONDS_1D
+        Case "7D"
+            GetCommandTimeoutSeconds = SQL_TIMEOUT_SECONDS_7D
+        Case "30D"
+            GetCommandTimeoutSeconds = SQL_TIMEOUT_SECONDS_30D
+        Case Else
+            GetCommandTimeoutSeconds = SQL_TIMEOUT_SECONDS_1D
+    End Select
+End Function
+
 Private Function BuildCountTagFullName(ByVal machineId, ByVal statusName)
     Dim basePrefix, baseCore
     basePrefix = G_MACHINES(machineId)
@@ -179,39 +198,50 @@ End Function
 
 Private Function ReadSingleFraction(ByVal cn, ByVal runtimeCatalog, ByVal tagFullName, ByVal tFrom, ByVal tTo, ByVal machineId, ByVal periodKey, ByVal statusName)
     Dim cmd, rs, sqlText, safeTag, t0, ms
+    Dim timeoutSeconds
     Dim v
+    Dim resultClass
 
     ReadSingleFraction = Empty
     safeTag = Replace(tagFullName, "'", "''")
     sqlText = "cp_TagStatisticEx '" & runtimeCatalog & "','TAG:R,''" & safeTag & "'',''" & TS3(tFrom) & "'',''" & TS3(tTo) & "''','" & FIXED_AGG_EXPR & "'"
+    timeoutSeconds = GetCommandTimeoutSeconds(periodKey)
+    resultClass = "error"
 
     t0 = Timer
     On Error Resume Next
     Set cmd = CreateObject("ADODB.Command")
     Set cmd.ActiveConnection = cn
     cmd.CommandType = adCmdText
-    cmd.CommandTimeout = SQL_TIMEOUT_SECONDS
+    cmd.CommandTimeout = timeoutSeconds
     cmd.CommandText = sqlText
     Set rs = cmd.Execute
     ms = ElapsedMs(t0)
 
     If Err.Number <> 0 Then
-        LogMsg LOG_LEVEL_WARN, "cp_TagStatisticEx", "machine=" & machineId & " period=" & periodKey & " status=" & statusName & " elapsed_ms=" & ms & " ok=false err=" & S(Err.Description)
+        resultClass = "error"
         Err.Clear
+    ElseIf (rs Is Nothing) Then
+        resultClass = "empty"
+    ElseIf rs.EOF Then
+        resultClass = "empty"
     Else
-        If Not (rs Is Nothing) Then
-            If Not rs.EOF Then
-                v = rs.Fields(0).Value
-                If IsNumeric(v) Then
-                    If CDbl(v) >= 0 And CDbl(v) <= 1 Then
-                        ReadSingleFraction = CDbl(v)
-                    End If
-                End If
-            End If
-            rs.Close
+        v = rs.Fields(0).Value
+        If Not IsNumeric(v) Then
+            resultClass = "non_numeric"
+        ElseIf CDbl(v) < 0 Or CDbl(v) > 1 Then
+            resultClass = "out_of_range"
+        Else
+            ReadSingleFraction = CDbl(v)
+            resultClass = "valid"
         End If
-        LogMsg LOG_LEVEL_INFO, "cp_TagStatisticEx", "machine=" & machineId & " period=" & periodKey & " status=" & statusName & " elapsed_ms=" & ms & " ok=true"
     End If
+
+    If Not (rs Is Nothing) Then
+        rs.Close
+    End If
+
+    LogMsg LOG_LEVEL_INFO, "cp_TagStatisticEx", "machine=" & machineId & " period=" & periodKey & " status=" & statusName & " elapsed_ms=" & ms & " timeout_s=" & timeoutSeconds & " result=" & resultClass
     On Error GoTo 0
 
     Set rs = Nothing
@@ -227,17 +257,39 @@ Private Sub GetCombinedFractions(ByVal cn, ByVal runtimeCatalog, ByVal machineId
     fAbort = 0
 
     a = ReadSingleFraction(cn, runtimeCatalog, BuildCountTagFullName(machineId, "Aborted"), tFrom, tTo, machineId, periodKey, "Aborted")
-    h = ReadSingleFraction(cn, runtimeCatalog, BuildCountTagFullName(machineId, "Halted"), tFrom, tTo, machineId, periodKey, "Halted")
-    r = ReadSingleFraction(cn, runtimeCatalog, BuildCountTagFullName(machineId, "Running"), tFrom, tTo, machineId, periodKey, "Running")
-    w = ReadSingleFraction(cn, runtimeCatalog, BuildCountTagFullName(machineId, "Waiting"), tFrom, tTo, machineId, periodKey, "Waiting")
-    i = ReadSingleFraction(cn, runtimeCatalog, BuildCountTagFullName(machineId, "Interrupted"), tFrom, tTo, machineId, periodKey, "Interrupted")
-
-    If IsNumeric(a) And IsNumeric(h) And IsNumeric(r) And IsNumeric(w) And IsNumeric(i) Then
-        fAbort = CDbl(a) + CDbl(w)
-        fHalt = CDbl(h) + CDbl(i)
-        fRun = CDbl(r)
-        inputValid = True
+    If Not IsNumeric(a) Then
+        LogMsg LOG_LEVEL_WARN, "GetCombinedFractions", "machine=" & machineId & " period=" & periodKey & " failed_status=Aborted reason=missing_or_invalid_status_fraction"
+        Exit Sub
     End If
+
+    h = ReadSingleFraction(cn, runtimeCatalog, BuildCountTagFullName(machineId, "Halted"), tFrom, tTo, machineId, periodKey, "Halted")
+    If Not IsNumeric(h) Then
+        LogMsg LOG_LEVEL_WARN, "GetCombinedFractions", "machine=" & machineId & " period=" & periodKey & " failed_status=Halted reason=missing_or_invalid_status_fraction"
+        Exit Sub
+    End If
+
+    r = ReadSingleFraction(cn, runtimeCatalog, BuildCountTagFullName(machineId, "Running"), tFrom, tTo, machineId, periodKey, "Running")
+    If Not IsNumeric(r) Then
+        LogMsg LOG_LEVEL_WARN, "GetCombinedFractions", "machine=" & machineId & " period=" & periodKey & " failed_status=Running reason=missing_or_invalid_status_fraction"
+        Exit Sub
+    End If
+
+    w = ReadSingleFraction(cn, runtimeCatalog, BuildCountTagFullName(machineId, "Waiting"), tFrom, tTo, machineId, periodKey, "Waiting")
+    If Not IsNumeric(w) Then
+        LogMsg LOG_LEVEL_WARN, "GetCombinedFractions", "machine=" & machineId & " period=" & periodKey & " failed_status=Waiting reason=missing_or_invalid_status_fraction"
+        Exit Sub
+    End If
+
+    i = ReadSingleFraction(cn, runtimeCatalog, BuildCountTagFullName(machineId, "Interrupted"), tFrom, tTo, machineId, periodKey, "Interrupted")
+    If Not IsNumeric(i) Then
+        LogMsg LOG_LEVEL_WARN, "GetCombinedFractions", "machine=" & machineId & " period=" & periodKey & " failed_status=Interrupted reason=missing_or_invalid_status_fraction"
+        Exit Sub
+    End If
+
+    fAbort = CDbl(a) + CDbl(w)
+    fHalt = CDbl(h) + CDbl(i)
+    fRun = CDbl(r)
+    inputValid = True
 End Sub
 
 Private Sub NormalizeFractionsToPct(ByVal fRun, ByVal fHalt, ByVal fAbort, ByRef pRun, ByRef pHalt, ByRef pAbort)
@@ -269,7 +321,7 @@ Private Sub AggregatePeriod(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByV
     Dim tFrom, tTo, t0, elapsed
     Dim fRun, fHalt, fAbort, inputValid
     Dim pRun, pHalt, pAbort
-    Dim base
+    Dim base, totalCombined
 
     t0 = Timer
     tTo = Now()
@@ -281,27 +333,33 @@ Private Sub AggregatePeriod(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByV
 
     If inputValid Then
         NormalizeFractionsToPct fRun, fHalt, fAbort, pRun, pHalt, pAbort
+        totalCombined = CDbl(fRun) + CDbl(fHalt) + CDbl(fAbort)
     Else
         pRun = 0
         pHalt = 0
         pAbort = 0
+        totalCombined = 0
     End If
 
     base = machineId & "_" & periodKey & "_Machine_"
 
-    WriteTag base & "Running_Percentage", pRun
-    WriteTag base & "Halted_Percentage", pHalt
-    WriteTag base & "Aborted_Percentage", pAbort
+    WriteNumericOutputTag base & "Running_Percentage", pRun
+    WriteNumericOutputTag base & "Halted_Percentage", pHalt
+    WriteNumericOutputTag base & "Aborted_Percentage", pAbort
 
-    WriteTag base & "Running_Percentage_PieChart", PieVal(pRun)
-    WriteTag base & "Halted_Percentage_PieChart", PieVal(pHalt)
-    WriteTag base & "Aborted_Percentage_PieChart", PieVal(pAbort)
+    WriteNumericOutputTag base & "Running_Percentage_PieChart", PieVal(pRun)
+    WriteNumericOutputTag base & "Halted_Percentage_PieChart", PieVal(pHalt)
+    WriteNumericOutputTag base & "Aborted_Percentage_PieChart", PieVal(pAbort)
 
     elapsed = ElapsedMs(t0)
     If inputValid Then
-        LogMsg LOG_LEVEL_INFO, "Aggregate", "end machine=" & machineId & " period=" & periodKey & " result=valid run=" & pRun & " halt=" & pHalt & " abort=" & pAbort & " elapsed_ms=" & elapsed
+        If totalCombined > 0 Then
+            LogMsg LOG_LEVEL_INFO, "Aggregate", "end machine=" & machineId & " period=" & periodKey & " result=valid_nonzero run=" & pRun & " halt=" & pHalt & " abort=" & pAbort & " elapsed_ms=" & elapsed
+        Else
+            LogMsg LOG_LEVEL_WARN, "Aggregate", "end machine=" & machineId & " period=" & periodKey & " result=valid_zero_total run=0 halt=0 abort=0 elapsed_ms=" & elapsed
+        End If
     Else
-        LogMsg LOG_LEVEL_WARN, "Aggregate", "end machine=" & machineId & " period=" & periodKey & " result=zero_no_data elapsed_ms=" & elapsed
+        LogMsg LOG_LEVEL_WARN, "Aggregate", "end machine=" & machineId & " period=" & periodKey & " result=zero_no_data run=0 halt=0 abort=0 elapsed_ms=" & elapsed
     End If
 
     If elapsed > WINDOW_EXEC_WARN_THRESHOLD_MS Then
@@ -314,6 +372,7 @@ End Sub
 Public Sub MainStatusAggregation(ByVal machineId)
     Dim cn, runtimeCatalog
     Dim targetPeriod, lookback
+    Dim secondsSinceLastGlobal
 
     InitGlobals
 
@@ -341,6 +400,14 @@ Public Sub MainStatusAggregation(ByVal machineId)
         Exit Sub
     End If
 
+    If Not IsEmpty(g_lastGlobalAggregationRun) Then
+        secondsSinceLastGlobal = DateDiff("s", CDate(g_lastGlobalAggregationRun), Now())
+        If secondsSinceLastGlobal < GLOBAL_MIN_SECONDS_BETWEEN_MACHINE_RUNS Then
+            LogMsg LOG_LEVEL_INFO, "MainStatusAggregation", "skip machine=" & machineId & " reason=global_cooldown cooldown_seconds=" & GLOBAL_MIN_SECONDS_BETWEEN_MACHINE_RUNS & " seconds_since_last_run=" & secondsSinceLastGlobal
+            Exit Sub
+        End If
+    End If
+
     Set cn = OpenConnection()
     If cn Is Nothing Then
         LogMsg LOG_LEVEL_ERROR, "MainStatusAggregation", "skip machine=" & machineId & " reason=no_sql_connection"
@@ -348,8 +415,9 @@ Public Sub MainStatusAggregation(ByVal machineId)
     End If
 
     runtimeCatalog = GetRuntimeCatalog()
-    LogMsg LOG_LEVEL_INFO, "MainStatusAggregation", "process machine=" & machineId & " period=" & targetPeriod
+    LogMsg LOG_LEVEL_INFO, "MainStatusAggregation", "process machine=" & machineId & " period=" & targetPeriod & " version=" & SCRIPT_VERSION
 
+    g_lastGlobalAggregationRun = Now()
     AggregatePeriod cn, runtimeCatalog, machineId, targetPeriod, lookback
 
     CloseConn cn

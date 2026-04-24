@@ -3,7 +3,7 @@
 ' ======================================================================
 Option Explicit
 
-Const SCRIPT_VERSION = "PieChart-simplified-v5-hard-failfast-stateful-result"
+Const SCRIPT_VERSION = "PieChart-simplified-v6-rollup-backed-7d-30d"
 
 Const DEFAULT_PROVIDER = "MSOLEDBSQL"
 Const FALLBACK_PROVIDER = "SQLNCLI11"
@@ -14,6 +14,7 @@ Const SQL_TIMEOUT_SECONDS_7D = 15
 Const SQL_TIMEOUT_SECONDS_30D = 15
 Const GLOBAL_MIN_SECONDS_BETWEEN_MACHINE_RUNS = 120
 Const WINDOW_EXEC_WARN_THRESHOLD_MS = 15000
+Const MAX_ROLLUP_BACKFILL_DAYS_PER_INVOCATION = 2
 
 Const THROTTLE_1D_MINUTES = 60
 Const THROTTLE_7D_MINUTES = 1440
@@ -139,6 +140,18 @@ End Function
 Private Function TS3(ByVal dt)
     TS3 = Year(dt) & "-" & Right("0" & Month(dt),2) & "-" & Right("0" & Day(dt),2) & _
           " " & Right("0" & Hour(dt),2) & ":" & Right("0" & Minute(dt),2) & ":" & Right("0" & Second(dt),2) & ".000"
+End Function
+
+Private Function TSDate(ByVal dt)
+    TSDate = Year(dt) & "-" & Right("0" & Month(dt),2) & "-" & Right("0" & Day(dt),2)
+End Function
+
+Private Function SqlQ(ByVal v)
+    SqlQ = "'" & Replace(CStr(v), "'", "''") & "'"
+End Function
+
+Private Function BracketIdent(ByVal s)
+    BracketIdent = "[" & Replace(CStr(s), "]", "]]") & "]"
 End Function
 
 Private Function ElapsedMs(ByVal timerStart)
@@ -381,6 +394,202 @@ Private Sub GetCombinedFractions(ByVal cn, ByVal runtimeCatalog, ByVal machineId
     inputValid = True
 End Sub
 
+Private Sub EnsureDailyRollupTable(ByVal cn, ByVal runtimeCatalog)
+    Dim cmd, sqlText, dbName
+    dbName = BracketIdent(runtimeCatalog)
+    sqlText = "IF OBJECT_ID(N'" & runtimeCatalog & ".dbo.PieChartDailyRollup', N'U') IS NULL " & _
+              "BEGIN " & _
+              "CREATE TABLE " & dbName & ".dbo.PieChartDailyRollup(" & _
+              "machine_id NVARCHAR(32) NOT NULL," & _
+              "summary_date DATE NOT NULL," & _
+              "aborted_frac FLOAT NOT NULL," & _
+              "halted_frac FLOAT NOT NULL," & _
+              "running_frac FLOAT NOT NULL," & _
+              "waiting_frac FLOAT NOT NULL," & _
+              "interrupted_frac FLOAT NOT NULL," & _
+              "created_at DATETIME NOT NULL," & _
+              "updated_at DATETIME NOT NULL," & _
+              "CONSTRAINT PK_PieChartDailyRollup PRIMARY KEY CLUSTERED(machine_id, summary_date)" & _
+              "); END"
+
+    On Error Resume Next
+    Set cmd = CreateObject("ADODB.Command")
+    Set cmd.ActiveConnection = cn
+    cmd.CommandType = adCmdText
+    cmd.CommandTimeout = SQL_TIMEOUT_SECONDS_1D
+    cmd.CommandText = sqlText
+    cmd.Execute
+    If Err.Number <> 0 Then
+        LogMsg LOG_LEVEL_WARN, "Rollup", "table_ensure_failed err=" & S(Err.Description)
+        Err.Clear
+    Else
+        LogMsg LOG_LEVEL_INFO, "Rollup", "table_ensured catalog=" & runtimeCatalog & " table=dbo.PieChartDailyRollup"
+    End If
+    On Error GoTo 0
+    Set cmd = Nothing
+End Sub
+
+Private Function DailyRollupRowExists(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal dayDate)
+    Dim cmd, rs, sqlText, dbName
+    dbName = BracketIdent(runtimeCatalog)
+    sqlText = "SELECT TOP 1 1 FROM " & dbName & ".dbo.PieChartDailyRollup WHERE machine_id=" & SqlQ(machineId) & " AND summary_date=CONVERT(date," & SqlQ(TSDate(dayDate)) & ")"
+    DailyRollupRowExists = False
+
+    On Error Resume Next
+    Set cmd = CreateObject("ADODB.Command")
+    Set cmd.ActiveConnection = cn
+    cmd.CommandType = adCmdText
+    cmd.CommandTimeout = SQL_TIMEOUT_SECONDS_1D
+    cmd.CommandText = sqlText
+    Set rs = cmd.Execute
+    If Err.Number = 0 Then
+        If Not (rs Is Nothing) Then
+            If Not rs.EOF Then DailyRollupRowExists = True
+        End If
+    Else
+        Err.Clear
+    End If
+    On Error GoTo 0
+
+    If Not (rs Is Nothing) Then rs.Close
+    Set rs = Nothing
+    Set cmd = Nothing
+End Function
+
+Private Sub UpsertDailyRollupForDate(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal dayDate)
+    Dim dFrom, dTo
+    Dim a, h, r, w, i
+    Dim sA, sH, sR, sW, sI
+    Dim eA, eH, eR, eW, eI
+    Dim cmd, sqlText, dbName
+
+    dFrom = DateSerial(Year(dayDate), Month(dayDate), Day(dayDate))
+    dTo = DateAdd("d", 1, dFrom)
+    LogMsg LOG_LEVEL_INFO, "Rollup", "backfill_day_started machine=" & machineId & " day=" & TSDate(dFrom)
+
+    ReadSingleFraction cn, runtimeCatalog, BuildCountTagFullName(machineId, "Aborted"), dFrom, dTo, machineId, "1D", "Aborted", a, sA, eA
+    ReadSingleFraction cn, runtimeCatalog, BuildCountTagFullName(machineId, "Halted"), dFrom, dTo, machineId, "1D", "Halted", h, sH, eH
+    ReadSingleFraction cn, runtimeCatalog, BuildCountTagFullName(machineId, "Running"), dFrom, dTo, machineId, "1D", "Running", r, sR, eR
+    ReadSingleFraction cn, runtimeCatalog, BuildCountTagFullName(machineId, "Waiting"), dFrom, dTo, machineId, "1D", "Waiting", w, sW, eW
+    ReadSingleFraction cn, runtimeCatalog, BuildCountTagFullName(machineId, "Interrupted"), dFrom, dTo, machineId, "1D", "Interrupted", i, sI, eI
+
+    If sA <> "valid" Or sH <> "valid" Or sR <> "valid" Or sW <> "valid" Or sI <> "valid" Then
+        LogMsg LOG_LEVEL_WARN, "Rollup", "backfill_day_failure machine=" & machineId & " day=" & TSDate(dFrom) & " states=Aborted:" & sA & ",Halted:" & sH & ",Running:" & sR & ",Waiting:" & sW & ",Interrupted:" & sI
+        Exit Sub
+    End If
+
+    dbName = BracketIdent(runtimeCatalog)
+    sqlText = "MERGE " & dbName & ".dbo.PieChartDailyRollup AS tgt " & _
+              "USING (SELECT " & SqlQ(machineId) & " AS machine_id, CONVERT(date," & SqlQ(TSDate(dFrom)) & ") AS summary_date) AS src " & _
+              "ON tgt.machine_id=src.machine_id AND tgt.summary_date=src.summary_date " & _
+              "WHEN MATCHED THEN UPDATE SET aborted_frac=" & Replace(CStr(CDbl(a)), ",", ".") & ", halted_frac=" & Replace(CStr(CDbl(h)), ",", ".") & ", running_frac=" & Replace(CStr(CDbl(r)), ",", ".") & ", waiting_frac=" & Replace(CStr(CDbl(w)), ",", ".") & ", interrupted_frac=" & Replace(CStr(CDbl(i)), ",", ".") & ", updated_at=GETDATE() " & _
+              "WHEN NOT MATCHED THEN INSERT(machine_id, summary_date, aborted_frac, halted_frac, running_frac, waiting_frac, interrupted_frac, created_at, updated_at) VALUES(" & SqlQ(machineId) & ", CONVERT(date," & SqlQ(TSDate(dFrom)) & ")," & Replace(CStr(CDbl(a)), ",", ".") & "," & Replace(CStr(CDbl(h)), ",", ".") & "," & Replace(CStr(CDbl(r)), ",", ".") & "," & Replace(CStr(CDbl(w)), ",", ".") & "," & Replace(CStr(CDbl(i)), ",", ".") & ",GETDATE(),GETDATE());"
+
+    On Error Resume Next
+    Set cmd = CreateObject("ADODB.Command")
+    Set cmd.ActiveConnection = cn
+    cmd.CommandType = adCmdText
+    cmd.CommandTimeout = SQL_TIMEOUT_SECONDS_1D
+    cmd.CommandText = sqlText
+    cmd.Execute
+    If Err.Number <> 0 Then
+        LogMsg LOG_LEVEL_WARN, "Rollup", "backfill_day_failure machine=" & machineId & " day=" & TSDate(dFrom) & " err=" & S(Err.Description)
+        Err.Clear
+    Else
+        LogMsg LOG_LEVEL_INFO, "Rollup", "backfill_day_success machine=" & machineId & " day=" & TSDate(dFrom)
+    End If
+    On Error GoTo 0
+    Set cmd = Nothing
+End Sub
+
+Private Sub EnsureRecentDailyRollups(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal daysNeeded)
+    Dim startDay, endDay, d
+    Dim missingTotal, backfilled
+    startDay = DateAdd("d", -CLng(daysNeeded), Date())
+    endDay = DateAdd("d", -1, Date())
+    missingTotal = 0
+    backfilled = 0
+
+    d = startDay
+    Do While d <= endDay
+        If Not DailyRollupRowExists(cn, runtimeCatalog, machineId, d) Then
+            missingTotal = missingTotal + 1
+            If backfilled < MAX_ROLLUP_BACKFILL_DAYS_PER_INVOCATION Then
+                UpsertDailyRollupForDate cn, runtimeCatalog, machineId, d
+                backfilled = backfilled + 1
+            End If
+        End If
+        d = DateAdd("d", 1, d)
+    Loop
+
+    If missingTotal > backfilled Then
+        LogMsg LOG_LEVEL_WARN, "Rollup", "partial_backfill machine=" & machineId & " days_needed=" & daysNeeded & " missing_total=" & missingTotal & " backfilled_now=" & backfilled & " cap=" & MAX_ROLLUP_BACKFILL_DAYS_PER_INVOCATION
+    End If
+End Sub
+
+Private Sub ReadWindowFractionsFromDailyRollup(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal daysCount, ByRef fRun, ByRef fHalt, ByRef fAbort, ByRef inputValid, ByRef failureKind, ByRef failureDetail)
+    Dim startDay, endExclusive
+    Dim cmd, rs, sqlText, dbName
+    Dim rowCount, sumAbort, sumHalt, sumRun, sumWait, sumInt
+
+    inputValid = False
+    failureKind = ""
+    failureDetail = ""
+    fRun = 0
+    fHalt = 0
+    fAbort = 0
+    rowCount = 0
+    sumAbort = 0
+    sumHalt = 0
+    sumRun = 0
+    sumWait = 0
+    sumInt = 0
+    startDay = DateAdd("d", -CLng(daysCount), Date())
+    endExclusive = Date()
+    dbName = BracketIdent(runtimeCatalog)
+    sqlText = "SELECT summary_date, aborted_frac, halted_frac, running_frac, waiting_frac, interrupted_frac FROM " & dbName & ".dbo.PieChartDailyRollup WHERE machine_id=" & SqlQ(machineId) & " AND summary_date>=CONVERT(date," & SqlQ(TSDate(startDay)) & ") AND summary_date<CONVERT(date," & SqlQ(TSDate(endExclusive)) & ") ORDER BY summary_date ASC"
+
+    On Error Resume Next
+    Set cmd = CreateObject("ADODB.Command")
+    Set cmd.ActiveConnection = cn
+    cmd.CommandType = adCmdText
+    cmd.CommandTimeout = SQL_TIMEOUT_SECONDS_1D
+    cmd.CommandText = sqlText
+    Set rs = cmd.Execute
+    If Err.Number <> 0 Then
+        failureKind = "rollup_missing"
+        failureDetail = "insufficient_daily_rows"
+        LogMsg LOG_LEVEL_WARN, "Rollup", "window_read_failure machine=" & machineId & " days=" & daysCount & " err=" & S(Err.Description)
+        Err.Clear
+    Else
+        Do While Not rs.EOF
+            rowCount = rowCount + 1
+            sumAbort = sumAbort + CDbl(rs.Fields(1).Value)
+            sumHalt = sumHalt + CDbl(rs.Fields(2).Value)
+            sumRun = sumRun + CDbl(rs.Fields(3).Value)
+            sumWait = sumWait + CDbl(rs.Fields(4).Value)
+            sumInt = sumInt + CDbl(rs.Fields(5).Value)
+            rs.MoveNext
+        Loop
+        If rowCount < CLng(daysCount) Then
+            failureKind = "rollup_missing"
+            failureDetail = "insufficient_daily_rows"
+            LogMsg LOG_LEVEL_WARN, "Rollup", "rollup_missing machine=" & machineId & " days=" & daysCount & " rows=" & rowCount
+        Else
+            fAbort = CDbl(sumAbort) + CDbl(sumWait)
+            fHalt = CDbl(sumHalt) + CDbl(sumInt)
+            fRun = CDbl(sumRun)
+            inputValid = True
+            LogMsg LOG_LEVEL_INFO, "Rollup", "window_read_success machine=" & machineId & " days=" & daysCount & " rows=" & rowCount
+        End If
+    End If
+    On Error GoTo 0
+
+    If Not (rs Is Nothing) Then rs.Close
+    Set rs = Nothing
+    Set cmd = Nothing
+End Sub
+
 Private Sub NormalizeFractionsToPct(ByVal fRun, ByVal fHalt, ByVal fAbort, ByRef pRun, ByRef pHalt, ByRef pAbort)
     Dim tot
     tot = CDbl(fRun) + CDbl(fHalt) + CDbl(fAbort)
@@ -421,7 +630,24 @@ Private Sub AggregatePeriod(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByV
 
     LogMsg LOG_LEVEL_INFO, "Aggregate", "start machine=" & machineId & " period=" & periodKey & " from=" & TS3(tFrom) & " to=" & TS3(tTo)
 
-    GetCombinedFractions cn, runtimeCatalog, machineId, tFrom, tTo, periodKey, fRun, fHalt, fAbort, inputValid, failureKind, failedStatus, failureDetail
+    If UCase(CStr(periodKey)) = "1D" Then
+        GetCombinedFractions cn, runtimeCatalog, machineId, tFrom, tTo, periodKey, fRun, fHalt, fAbort, inputValid, failureKind, failedStatus, failureDetail
+    ElseIf UCase(CStr(periodKey)) = "7D" Then
+        EnsureDailyRollupTable cn, runtimeCatalog
+        EnsureRecentDailyRollups cn, runtimeCatalog, machineId, 7
+        ReadWindowFractionsFromDailyRollup cn, runtimeCatalog, machineId, 7, fRun, fHalt, fAbort, inputValid, failureKind, failureDetail
+        failedStatus = ""
+    ElseIf UCase(CStr(periodKey)) = "30D" Then
+        EnsureDailyRollupTable cn, runtimeCatalog
+        EnsureRecentDailyRollups cn, runtimeCatalog, machineId, 30
+        ReadWindowFractionsFromDailyRollup cn, runtimeCatalog, machineId, 30, fRun, fHalt, fAbort, inputValid, failureKind, failureDetail
+        failedStatus = ""
+    Else
+        inputValid = False
+        failureKind = "invalid_input"
+        failedStatus = ""
+        failureDetail = "unknown_period"
+    End If
 
     If inputValid Then
         NormalizeFractionsToPct fRun, fHalt, fAbort, pRun, pHalt, pAbort

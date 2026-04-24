@@ -3,7 +3,7 @@
 ' ======================================================================
 Option Explicit
 
-Const SCRIPT_VERSION = "PieChart-simplified-v4-failfast-longwindow-cooldown"
+Const SCRIPT_VERSION = "PieChart-simplified-v5-hard-failfast-stateful-result"
 
 Const DEFAULT_PROVIDER = "MSOLEDBSQL"
 Const FALLBACK_PROVIDER = "SQLNCLI11"
@@ -216,19 +216,17 @@ Private Function BuildCountTagFullName(ByVal machineId, ByVal statusName)
     BuildCountTagFullName = basePrefix & COUNT_TAG_PREFIX_JOINER & baseCore & COUNT_TAG_SUFFIX
 End Function
 
-Private Function ReadSingleFraction(ByVal cn, ByVal runtimeCatalog, ByVal tagFullName, ByVal tFrom, ByVal tTo, ByVal machineId, ByVal periodKey, ByVal statusName)
+Private Sub ReadSingleFraction(ByVal cn, ByVal runtimeCatalog, ByVal tagFullName, ByVal tFrom, ByVal tTo, ByVal machineId, ByVal periodKey, ByVal statusName, ByRef fractionOut, ByRef resultState, ByRef errText)
     Dim cmd, rs, sqlText, safeTag, t0, ms
     Dim timeoutSeconds
     Dim v
-    Dim resultClass
-    Dim errText
 
-    ReadSingleFraction = Empty
+    fractionOut = 0
+    resultState = "error"
+    errText = ""
     safeTag = Replace(tagFullName, "'", "''")
     sqlText = "cp_TagStatisticEx '" & runtimeCatalog & "','TAG:R,''" & safeTag & "'',''" & TS3(tFrom) & "'',''" & TS3(tTo) & "''','" & FIXED_AGG_EXPR & "'"
     timeoutSeconds = GetCommandTimeoutSeconds(periodKey)
-    resultClass = "error"
-    errText = ""
 
     t0 = Timer
     On Error Resume Next
@@ -241,22 +239,26 @@ Private Function ReadSingleFraction(ByVal cn, ByVal runtimeCatalog, ByVal tagFul
     ms = ElapsedMs(t0)
 
     If Err.Number <> 0 Then
-        resultClass = "error"
+        resultState = "error"
         errText = S(Err.Description)
         Err.Clear
     ElseIf (rs Is Nothing) Then
-        resultClass = "empty"
+        resultState = "empty"
     ElseIf rs.EOF Then
-        resultClass = "empty"
+        resultState = "empty"
     Else
         v = rs.Fields(0).Value
-        If Not IsNumeric(v) Then
-            resultClass = "non_numeric"
+        If IsNull(v) Or IsEmpty(v) Then
+            resultState = "empty"
+        ElseIf Len(Trim(S(v))) = 0 Then
+            resultState = "empty"
+        ElseIf Not IsNumeric(v) Then
+            resultState = "non_numeric"
         ElseIf CDbl(v) < 0 Or CDbl(v) > 1 Then
-            resultClass = "out_of_range"
+            resultState = "out_of_range"
         Else
-            ReadSingleFraction = CDbl(v)
-            resultClass = "valid"
+            fractionOut = CDbl(v)
+            resultState = "valid"
         End If
     End If
 
@@ -264,72 +266,112 @@ Private Function ReadSingleFraction(ByVal cn, ByVal runtimeCatalog, ByVal tagFul
         rs.Close
     End If
 
-    If resultClass = "error" Then
-        LogMsg LOG_LEVEL_INFO, "cp_TagStatisticEx", "machine=" & machineId & " period=" & periodKey & " status=" & statusName & " elapsed_ms=" & ms & " timeout_s=" & timeoutSeconds & " result=" & resultClass & " err=" & errText
+    If resultState = "error" Then
+        LogMsg LOG_LEVEL_INFO, "cp_TagStatisticEx", "machine=" & machineId & " period=" & periodKey & " status=" & statusName & " elapsed_ms=" & ms & " timeout_s=" & timeoutSeconds & " result=" & resultState & " err=" & errText
     Else
-        LogMsg LOG_LEVEL_INFO, "cp_TagStatisticEx", "machine=" & machineId & " period=" & periodKey & " status=" & statusName & " elapsed_ms=" & ms & " timeout_s=" & timeoutSeconds & " result=" & resultClass
+        LogMsg LOG_LEVEL_INFO, "cp_TagStatisticEx", "machine=" & machineId & " period=" & periodKey & " status=" & statusName & " elapsed_ms=" & ms & " timeout_s=" & timeoutSeconds & " result=" & resultState
     End If
     On Error GoTo 0
 
     Set rs = Nothing
     Set cmd = Nothing
-End Function
+End Sub
 
-Private Sub GetCombinedFractions(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal tFrom, ByVal tTo, ByVal periodKey, ByRef fRun, ByRef fHalt, ByRef fAbort, ByRef inputValid)
+Private Sub GetCombinedFractions(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal tFrom, ByVal tTo, ByVal periodKey, ByRef fRun, ByRef fHalt, ByRef fAbort, ByRef inputValid, ByRef failureKind, ByRef failedStatus, ByRef failureDetail)
     Dim a, h, r, w, i
+    Dim stateA, stateH, stateR, stateW, stateI
+    Dim errA, errH, errR, errW, errI
 
     inputValid = False
+    failureKind = ""
+    failedStatus = ""
+    failureDetail = ""
     fRun = 0
     fHalt = 0
     fAbort = 0
 
-    a = ReadSingleFraction(cn, runtimeCatalog, BuildCountTagFullName(machineId, "Aborted"), tFrom, tTo, machineId, periodKey, "Aborted")
-    If Not IsNumeric(a) Then
+    ReadSingleFraction cn, runtimeCatalog, BuildCountTagFullName(machineId, "Aborted"), tFrom, tTo, machineId, periodKey, "Aborted", a, stateA, errA
+    If stateA <> "valid" Then
         inputValid = False
+        If stateA = "error" Then
+            failureKind = "query_error"
+        Else
+            failureKind = "invalid_input"
+        End If
+        failedStatus = "Aborted"
+        failureDetail = stateA
         fRun = 0
         fHalt = 0
         fAbort = 0
-        LogMsg LOG_LEVEL_WARN, "GetCombinedFractions", "machine=" & machineId & " period=" & periodKey & " failed_status=Aborted reason=missing_or_invalid_status_fraction"
+        LogMsg LOG_LEVEL_WARN, "GetCombinedFractions", "machine=" & machineId & " period=" & periodKey & " failed_status=" & failedStatus & " failure_kind=" & failureKind & " failure_detail=" & failureDetail
         Exit Sub
     End If
 
-    h = ReadSingleFraction(cn, runtimeCatalog, BuildCountTagFullName(machineId, "Halted"), tFrom, tTo, machineId, periodKey, "Halted")
-    If Not IsNumeric(h) Then
+    ReadSingleFraction cn, runtimeCatalog, BuildCountTagFullName(machineId, "Halted"), tFrom, tTo, machineId, periodKey, "Halted", h, stateH, errH
+    If stateH <> "valid" Then
         inputValid = False
+        If stateH = "error" Then
+            failureKind = "query_error"
+        Else
+            failureKind = "invalid_input"
+        End If
+        failedStatus = "Halted"
+        failureDetail = stateH
         fRun = 0
         fHalt = 0
         fAbort = 0
-        LogMsg LOG_LEVEL_WARN, "GetCombinedFractions", "machine=" & machineId & " period=" & periodKey & " failed_status=Halted reason=missing_or_invalid_status_fraction"
+        LogMsg LOG_LEVEL_WARN, "GetCombinedFractions", "machine=" & machineId & " period=" & periodKey & " failed_status=" & failedStatus & " failure_kind=" & failureKind & " failure_detail=" & failureDetail
         Exit Sub
     End If
 
-    r = ReadSingleFraction(cn, runtimeCatalog, BuildCountTagFullName(machineId, "Running"), tFrom, tTo, machineId, periodKey, "Running")
-    If Not IsNumeric(r) Then
+    ReadSingleFraction cn, runtimeCatalog, BuildCountTagFullName(machineId, "Running"), tFrom, tTo, machineId, periodKey, "Running", r, stateR, errR
+    If stateR <> "valid" Then
         inputValid = False
+        If stateR = "error" Then
+            failureKind = "query_error"
+        Else
+            failureKind = "invalid_input"
+        End If
+        failedStatus = "Running"
+        failureDetail = stateR
         fRun = 0
         fHalt = 0
         fAbort = 0
-        LogMsg LOG_LEVEL_WARN, "GetCombinedFractions", "machine=" & machineId & " period=" & periodKey & " failed_status=Running reason=missing_or_invalid_status_fraction"
+        LogMsg LOG_LEVEL_WARN, "GetCombinedFractions", "machine=" & machineId & " period=" & periodKey & " failed_status=" & failedStatus & " failure_kind=" & failureKind & " failure_detail=" & failureDetail
         Exit Sub
     End If
 
-    w = ReadSingleFraction(cn, runtimeCatalog, BuildCountTagFullName(machineId, "Waiting"), tFrom, tTo, machineId, periodKey, "Waiting")
-    If Not IsNumeric(w) Then
+    ReadSingleFraction cn, runtimeCatalog, BuildCountTagFullName(machineId, "Waiting"), tFrom, tTo, machineId, periodKey, "Waiting", w, stateW, errW
+    If stateW <> "valid" Then
         inputValid = False
+        If stateW = "error" Then
+            failureKind = "query_error"
+        Else
+            failureKind = "invalid_input"
+        End If
+        failedStatus = "Waiting"
+        failureDetail = stateW
         fRun = 0
         fHalt = 0
         fAbort = 0
-        LogMsg LOG_LEVEL_WARN, "GetCombinedFractions", "machine=" & machineId & " period=" & periodKey & " failed_status=Waiting reason=missing_or_invalid_status_fraction"
+        LogMsg LOG_LEVEL_WARN, "GetCombinedFractions", "machine=" & machineId & " period=" & periodKey & " failed_status=" & failedStatus & " failure_kind=" & failureKind & " failure_detail=" & failureDetail
         Exit Sub
     End If
 
-    i = ReadSingleFraction(cn, runtimeCatalog, BuildCountTagFullName(machineId, "Interrupted"), tFrom, tTo, machineId, periodKey, "Interrupted")
-    If Not IsNumeric(i) Then
+    ReadSingleFraction cn, runtimeCatalog, BuildCountTagFullName(machineId, "Interrupted"), tFrom, tTo, machineId, periodKey, "Interrupted", i, stateI, errI
+    If stateI <> "valid" Then
         inputValid = False
+        If stateI = "error" Then
+            failureKind = "query_error"
+        Else
+            failureKind = "invalid_input"
+        End If
+        failedStatus = "Interrupted"
+        failureDetail = stateI
         fRun = 0
         fHalt = 0
         fAbort = 0
-        LogMsg LOG_LEVEL_WARN, "GetCombinedFractions", "machine=" & machineId & " period=" & periodKey & " failed_status=Interrupted reason=missing_or_invalid_status_fraction"
+        LogMsg LOG_LEVEL_WARN, "GetCombinedFractions", "machine=" & machineId & " period=" & periodKey & " failed_status=" & failedStatus & " failure_kind=" & failureKind & " failure_detail=" & failureDetail
         Exit Sub
     End If
 
@@ -370,6 +412,8 @@ Private Sub AggregatePeriod(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByV
     Dim pRun, pHalt, pAbort
     Dim base, totalCombined
     Dim failureCooldownMinutes, failureUntil, failureKey
+    Dim failureKind, failedStatus, failureDetail
+    Dim resultLabel, stampNormalThrottle
 
     t0 = Timer
     tTo = Now()
@@ -377,16 +421,25 @@ Private Sub AggregatePeriod(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByV
 
     LogMsg LOG_LEVEL_INFO, "Aggregate", "start machine=" & machineId & " period=" & periodKey & " from=" & TS3(tFrom) & " to=" & TS3(tTo)
 
-    GetCombinedFractions cn, runtimeCatalog, machineId, tFrom, tTo, periodKey, fRun, fHalt, fAbort, inputValid
+    GetCombinedFractions cn, runtimeCatalog, machineId, tFrom, tTo, periodKey, fRun, fHalt, fAbort, inputValid, failureKind, failedStatus, failureDetail
 
     If inputValid Then
         NormalizeFractionsToPct fRun, fHalt, fAbort, pRun, pHalt, pAbort
         totalCombined = CDbl(fRun) + CDbl(fHalt) + CDbl(fAbort)
+        If totalCombined > 0 Then
+            resultLabel = "valid_nonzero"
+        Else
+            resultLabel = "valid_zero_total"
+        End If
     Else
+        fRun = 0
+        fHalt = 0
+        fAbort = 0
         pRun = 0
         pHalt = 0
         pAbort = 0
         totalCombined = 0
+        resultLabel = "zero_no_data"
     End If
 
     base = machineId & "_" & periodKey & "_Machine_"
@@ -401,27 +454,40 @@ Private Sub AggregatePeriod(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByV
 
     elapsed = ElapsedMs(t0)
     If inputValid Then
-        If totalCombined > 0 Then
+        If resultLabel = "valid_nonzero" Then
             LogMsg LOG_LEVEL_INFO, "Aggregate", "end machine=" & machineId & " period=" & periodKey & " result=valid_nonzero run=" & pRun & " halt=" & pHalt & " abort=" & pAbort & " elapsed_ms=" & elapsed
         Else
             LogMsg LOG_LEVEL_WARN, "Aggregate", "end machine=" & machineId & " period=" & periodKey & " result=valid_zero_total run=0 halt=0 abort=0 elapsed_ms=" & elapsed
         End If
     Else
-        failureCooldownMinutes = GetFailureCooldownMinutes(periodKey)
+        If failureKind = "query_error" Then
+            failureCooldownMinutes = GetFailureCooldownMinutes(periodKey)
+        Else
+            failureCooldownMinutes = 0
+        End If
         If failureCooldownMinutes > 0 Then
             failureUntil = DateAdd("n", failureCooldownMinutes, Now())
             failureKey = BuildMachinePeriodKey(machineId, periodKey)
             g_periodFailureCooldownUntil(failureKey) = failureUntil
             LogMsg LOG_LEVEL_WARN, "Aggregate", "set_failure_cooldown machine=" & machineId & " period=" & periodKey & " cooldown_until=" & TS3(failureUntil)
         End If
-        LogMsg LOG_LEVEL_WARN, "Aggregate", "end machine=" & machineId & " period=" & periodKey & " result=zero_no_data run=0 halt=0 abort=0 elapsed_ms=" & elapsed
+        LogMsg LOG_LEVEL_WARN, "Aggregate", "end machine=" & machineId & " period=" & periodKey & " result=zero_no_data run=0 halt=0 abort=0 failure_kind=" & failureKind & " failed_status=" & failedStatus & " failure_detail=" & failureDetail & " elapsed_ms=" & elapsed
     End If
 
     If elapsed > WINDOW_EXEC_WARN_THRESHOLD_MS Then
         LogMsg LOG_LEVEL_WARN, "Aggregate", "slow_period machine=" & machineId & " period=" & periodKey & " elapsed_ms=" & elapsed
     End If
 
-    g_lastRunByMachinePeriod(BuildMachinePeriodKey(machineId, periodKey)) = Now()
+    stampNormalThrottle = False
+    If resultLabel = "valid_nonzero" Or resultLabel = "valid_zero_total" Then
+        stampNormalThrottle = True
+    ElseIf resultLabel = "zero_no_data" And failureKind <> "query_error" Then
+        stampNormalThrottle = True
+    End If
+
+    If stampNormalThrottle Then
+        g_lastRunByMachinePeriod(BuildMachinePeriodKey(machineId, periodKey)) = Now()
+    End If
 End Sub
 
 Public Sub MainStatusAggregation(ByVal machineId)

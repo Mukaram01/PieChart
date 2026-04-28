@@ -43,6 +43,44 @@ The script computes aggregates for three period keys:
 - `7D`
 - `30D`
 
+### Operational behavior for 1D / 7D / 30D
+- `1D` reads machine status values directly from the WinCC archive query path.
+- `7D` reads from `dbo.PieChartDailyRollup` and targets 7 daily rows.
+- `30D` reads from `dbo.PieChartDailyRollup` and targets 30 daily rows.
+- `7D` can still publish real percentages when at least 5 rows are available (partial window mode).
+- `30D` can still publish real percentages when at least 21 rows are available (partial window mode).
+- If the row count is below those minimums, the script writes zero/no-data outputs and logs `insufficient_rollup_rows`.
+- Missing rollup rows are backfilled gradually by capped maintenance each invocation so runtime work stays bounded.
+- Period selection is round-robin among due jobs, so `30D` is not permanently starved behind `1D`/`7D`.
+
+### Rollup diagnostics query
+Use this query to verify rollup completeness per machine:
+
+```sql
+USE [CC_SLSGLO_xxxxxxxx];
+GO
+
+DECLARE @Today date = CONVERT(date, GETDATE());
+
+SELECT
+    machine_id,
+    SUM(CASE
+            WHEN summary_date >= DATEADD(day, -7, @Today)
+             AND summary_date < @Today
+            THEN 1 ELSE 0
+        END) AS rows_last_7_days,
+    SUM(CASE
+            WHEN summary_date >= DATEADD(day, -30, @Today)
+             AND summary_date < @Today
+            THEN 1 ELSE 0
+        END) AS rows_last_30_days,
+    MIN(summary_date) AS first_rollup_day,
+    MAX(summary_date) AS last_rollup_day
+FROM dbo.PieChartDailyRollup
+GROUP BY machine_id
+ORDER BY machine_id;
+```
+
 ### Throttle constants
 Execution throttling is configured by:
 

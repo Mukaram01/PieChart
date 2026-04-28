@@ -3,7 +3,7 @@
 ' ======================================================================
 Option Explicit
 
-Const SCRIPT_VERSION = "PieChart-simplified-v6-rollup-backed-7d-30d"
+Const SCRIPT_VERSION = "PieChart-simplified-v7-fair-scheduler-rollup-maintenance"
 
 Const DEFAULT_PROVIDER = "MSOLEDBSQL"
 Const FALLBACK_PROVIDER = "SQLNCLI11"
@@ -39,6 +39,8 @@ Const CURRENT_LOG_LEVEL = 3
 Dim g_lastRunByMachinePeriod
 Dim g_lastGlobalAggregationRun
 Dim g_periodFailureCooldownUntil
+Dim g_nextPeriodIndexByMachine
+Dim g_initializedScriptVersion
 Dim G_MACHINES
 Dim g_inited
 
@@ -57,24 +59,35 @@ Private Function S(ByVal v)
 End Function
 
 Private Sub InitGlobals()
-    If g_inited Then Exit Sub
+    If Not g_inited Then
+        Set g_lastRunByMachinePeriod = CreateObject("Scripting.Dictionary")
+        Set g_periodFailureCooldownUntil = CreateObject("Scripting.Dictionary")
+        Set g_nextPeriodIndexByMachine = CreateObject("Scripting.Dictionary")
+        Set G_MACHINES = CreateObject("Scripting.Dictionary")
 
-    Set g_lastRunByMachinePeriod = CreateObject("Scripting.Dictionary")
-    Set g_periodFailureCooldownUntil = CreateObject("Scripting.Dictionary")
-    Set G_MACHINES = CreateObject("Scripting.Dictionary")
+        G_MACHINES.Add "MNA_0269", "DMG_Mori1_MNA_0269"
+        G_MACHINES.Add "MNA_0270", "DMG_Mori2_MNA_0270"
+        G_MACHINES.Add "MNA_0332", "DMG_Mori3_MNA_0332"
+        G_MACHINES.Add "MNA_0164", "Wheelabrator_MNP_0164"
+        G_MACHINES.Add "MNA_0085", "Droop_Rein_1_MNA_0085_LM33H"
+        G_MACHINES.Add "MNA_0087", "Droop_Rein_4_MNA_0087_LM33F"
+        G_MACHINES.Add "MNA_0235", "WFL_M120_MNA_0235"
+        G_MACHINES.Add "MNA_0237", "WFL_M50_MNA_0237"
+        G_MACHINES.Add "MNA_0411", "Mazak_MNA_0411"
 
-    G_MACHINES.Add "MNA_0269", "DMG_Mori1_MNA_0269"
-    G_MACHINES.Add "MNA_0270", "DMG_Mori2_MNA_0270"
-    G_MACHINES.Add "MNA_0332", "DMG_Mori3_MNA_0332"
-    G_MACHINES.Add "MNA_0164", "Wheelabrator_MNP_0164"
-    G_MACHINES.Add "MNA_0085", "Droop_Rein_1_MNA_0085_LM33H"
-    G_MACHINES.Add "MNA_0087", "Droop_Rein_4_MNA_0087_LM33F"
-    G_MACHINES.Add "MNA_0235", "WFL_M120_MNA_0235"
-    G_MACHINES.Add "MNA_0237", "WFL_M50_MNA_0237"
-    G_MACHINES.Add "MNA_0411", "Mazak_MNA_0411"
+        g_inited = True
+        g_initializedScriptVersion = SCRIPT_VERSION
+        LogMsg LOG_LEVEL_INFO, "InitGlobals", "initialized version=" & SCRIPT_VERSION
+        Exit Sub
+    End If
 
-    g_inited = True
-    LogMsg LOG_LEVEL_INFO, "InitGlobals", "initialized version=" & SCRIPT_VERSION
+    If S(g_initializedScriptVersion) <> SCRIPT_VERSION Then
+        g_lastRunByMachinePeriod.RemoveAll
+        g_periodFailureCooldownUntil.RemoveAll
+        g_nextPeriodIndexByMachine.RemoveAll
+        g_initializedScriptVersion = SCRIPT_VERSION
+        LogMsg LOG_LEVEL_INFO, "MainStatusAggregation", "scheduler_state_reset version=" & SCRIPT_VERSION
+    End If
 End Sub
 
 Private Function IsMaster()
@@ -527,10 +540,49 @@ Private Sub EnsureRecentDailyRollups(ByVal cn, ByVal runtimeCatalog, ByVal machi
     End If
 End Sub
 
+Private Sub RunRollupMaintenance(ByVal cn, ByVal runtimeCatalog, ByVal machineId)
+    Dim startDay, endDay, d
+    Dim missingTotal, backfilled
+
+    LogMsg LOG_LEVEL_INFO, "Rollup", "rollup_backfill_started machine=" & machineId
+
+    On Error Resume Next
+    EnsureDailyRollupTable cn, runtimeCatalog
+
+    startDay = DateAdd("d", -30, Date())
+    endDay = DateAdd("d", -1, Date())
+    missingTotal = 0
+    backfilled = 0
+
+    d = startDay
+    Do While d <= endDay
+        If Not DailyRollupRowExists(cn, runtimeCatalog, machineId, d) Then
+            missingTotal = missingTotal + 1
+            If backfilled < MAX_ROLLUP_BACKFILL_DAYS_PER_INVOCATION Then
+                UpsertDailyRollupForDate cn, runtimeCatalog, machineId, d
+                backfilled = backfilled + 1
+            End If
+        End If
+        d = DateAdd("d", 1, d)
+    Loop
+
+    If Err.Number <> 0 Then
+        LogMsg LOG_LEVEL_WARN, "Rollup", "rollup_backfill_failure machine=" & machineId & " err=" & S(Err.Description)
+        Err.Clear
+    Else
+        If missingTotal > backfilled Then
+            LogMsg LOG_LEVEL_WARN, "Rollup", "rollup_backfill_limited machine=" & machineId & " missing=" & missingTotal & " filled_now=" & backfilled & " cap=" & MAX_ROLLUP_BACKFILL_DAYS_PER_INVOCATION
+        End If
+        LogMsg LOG_LEVEL_INFO, "Rollup", "rollup_backfill_success machine=" & machineId & " missing=" & missingTotal & " filled_now=" & backfilled
+    End If
+    On Error GoTo 0
+End Sub
+
 Private Sub ReadWindowFractionsFromDailyRollup(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal daysCount, ByRef fRun, ByRef fHalt, ByRef fAbort, ByRef inputValid, ByRef failureKind, ByRef failureDetail)
     Dim startDay, endExclusive
     Dim cmd, rs, sqlText, dbName
     Dim rowCount, sumAbort, sumHalt, sumRun, sumWait, sumInt
+    Dim minRows
 
     inputValid = False
     failureKind = ""
@@ -548,6 +600,14 @@ Private Sub ReadWindowFractionsFromDailyRollup(ByVal cn, ByVal runtimeCatalog, B
     endExclusive = Date()
     dbName = BracketIdent(runtimeCatalog)
     sqlText = "SELECT summary_date, aborted_frac, halted_frac, running_frac, waiting_frac, interrupted_frac FROM " & dbName & ".dbo.PieChartDailyRollup WHERE machine_id=" & SqlQ(machineId) & " AND summary_date>=CONVERT(date," & SqlQ(TSDate(startDay)) & ") AND summary_date<CONVERT(date," & SqlQ(TSDate(endExclusive)) & ") ORDER BY summary_date ASC"
+
+    If CLng(daysCount) = 7 Then
+        minRows = 5
+    ElseIf CLng(daysCount) = 30 Then
+        minRows = 21
+    Else
+        minRows = CLng(daysCount)
+    End If
 
     On Error Resume Next
     Set cmd = CreateObject("ADODB.Command")
@@ -571,16 +631,20 @@ Private Sub ReadWindowFractionsFromDailyRollup(ByVal cn, ByVal runtimeCatalog, B
             sumInt = sumInt + CDbl(rs.Fields(5).Value)
             rs.MoveNext
         Loop
-        If rowCount < CLng(daysCount) Then
+        If rowCount < CLng(minRows) Then
             failureKind = "rollup_missing"
             failureDetail = "insufficient_daily_rows"
-            LogMsg LOG_LEVEL_WARN, "Rollup", "rollup_missing machine=" & machineId & " days=" & daysCount & " rows=" & rowCount
+            LogMsg LOG_LEVEL_WARN, "Rollup", "insufficient_rollup_rows machine=" & machineId & " period=" & daysCount & "D rows_found=" & rowCount & " rows_expected=" & daysCount & " rows_minimum=" & minRows
         Else
             fAbort = CDbl(sumAbort) + CDbl(sumWait)
             fHalt = CDbl(sumHalt) + CDbl(sumInt)
             fRun = CDbl(sumRun)
             inputValid = True
-            LogMsg LOG_LEVEL_INFO, "Rollup", "window_read_success machine=" & machineId & " days=" & daysCount & " rows=" & rowCount
+            If rowCount < CLng(daysCount) Then
+                LogMsg LOG_LEVEL_WARN, "Rollup", "partial_rollup_window machine=" & machineId & " period=" & daysCount & "D rows_found=" & rowCount & " rows_expected=" & daysCount & " rows_minimum=" & minRows
+            Else
+                LogMsg LOG_LEVEL_INFO, "Rollup", "window_read_success machine=" & machineId & " days=" & daysCount & " rows=" & rowCount
+            End If
         End If
     End If
     On Error GoTo 0
@@ -589,6 +653,56 @@ Private Sub ReadWindowFractionsFromDailyRollup(ByVal cn, ByVal runtimeCatalog, B
     Set rs = Nothing
     Set cmd = Nothing
 End Sub
+
+Private Function GetNextPeriodIndex(ByVal machineId)
+    If Not g_nextPeriodIndexByMachine.Exists(machineId) Then
+        g_nextPeriodIndexByMachine(machineId) = 0
+    End If
+    GetNextPeriodIndex = CLng(g_nextPeriodIndexByMachine(machineId))
+End Function
+
+Private Sub SetNextPeriodIndex(ByVal machineId, ByVal nextIndex)
+    g_nextPeriodIndexByMachine(machineId) = CLng(nextIndex Mod 3)
+End Sub
+
+Private Function PeriodByIndex(ByVal idx)
+    Dim safeIdx
+    safeIdx = (CLng(idx) Mod 3 + 3) Mod 3
+    Select Case safeIdx
+        Case 0
+            PeriodByIndex = "1D"
+        Case 1
+            PeriodByIndex = "7D"
+        Case Else
+            PeriodByIndex = "30D"
+    End Select
+End Function
+
+Private Function LookbackMinutesForPeriod(ByVal periodKey)
+    Select Case UCase(CStr(periodKey))
+        Case "1D"
+            LookbackMinutesForPeriod = 1440
+        Case "7D"
+            LookbackMinutesForPeriod = 10080
+        Case "30D"
+            LookbackMinutesForPeriod = 43200
+        Case Else
+            LookbackMinutesForPeriod = 1440
+    End Select
+End Function
+
+Private Function ThrottleMinutesForPeriod(ByVal periodKey)
+    Select Case UCase(CStr(periodKey))
+        Case "1D"
+            ThrottleMinutesForPeriod = THROTTLE_1D_MINUTES
+        Case "7D"
+            ThrottleMinutesForPeriod = THROTTLE_7D_MINUTES
+        Case "30D"
+            ThrottleMinutesForPeriod = THROTTLE_30D_MINUTES
+        Case Else
+            ThrottleMinutesForPeriod = THROTTLE_1D_MINUTES
+    End Select
+End Function
 
 Private Sub NormalizeFractionsToPct(ByVal fRun, ByVal fHalt, ByVal fAbort, ByRef pRun, ByRef pHalt, ByRef pAbort)
     Dim tot
@@ -633,13 +747,9 @@ Private Sub AggregatePeriod(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByV
     If UCase(CStr(periodKey)) = "1D" Then
         GetCombinedFractions cn, runtimeCatalog, machineId, tFrom, tTo, periodKey, fRun, fHalt, fAbort, inputValid, failureKind, failedStatus, failureDetail
     ElseIf UCase(CStr(periodKey)) = "7D" Then
-        EnsureDailyRollupTable cn, runtimeCatalog
-        EnsureRecentDailyRollups cn, runtimeCatalog, machineId, 7
         ReadWindowFractionsFromDailyRollup cn, runtimeCatalog, machineId, 7, fRun, fHalt, fAbort, inputValid, failureKind, failureDetail
         failedStatus = ""
     ElseIf UCase(CStr(periodKey)) = "30D" Then
-        EnsureDailyRollupTable cn, runtimeCatalog
-        EnsureRecentDailyRollups cn, runtimeCatalog, machineId, 30
         ReadWindowFractionsFromDailyRollup cn, runtimeCatalog, machineId, 30, fRun, fHalt, fAbort, inputValid, failureKind, failureDetail
         failedStatus = ""
     Else
@@ -721,6 +831,8 @@ Public Sub MainStatusAggregation(ByVal machineId)
     Dim targetPeriod, lookback
     Dim secondsSinceLastGlobal
     Dim periodFailureKey, periodFailureUntil
+    Dim startIdx, probeOffset, periodCandidate, periodDue, periodCooldownBlocked
+    Dim selectedReason, anyDue
 
     InitGlobals
 
@@ -733,32 +845,47 @@ Public Sub MainStatusAggregation(ByVal machineId)
 
     targetPeriod = ""
     lookback = 0
+    selectedReason = ""
+    anyDue = False
+    startIdx = GetNextPeriodIndex(machineId)
 
-    If ShouldRun(machineId, "1D", THROTTLE_1D_MINUTES) Then
-        targetPeriod = "1D"
-        lookback = 1440
-    ElseIf ShouldRun(machineId, "7D", THROTTLE_7D_MINUTES) Then
-        targetPeriod = "7D"
-        lookback = 10080
-    ElseIf ShouldRun(machineId, "30D", THROTTLE_30D_MINUTES) Then
-        targetPeriod = "30D"
-        lookback = 43200
-    Else
-        LogMsg LOG_LEVEL_INFO, "MainStatusAggregation", "skip machine=" & machineId & " reason=throttled"
-        Exit Sub
-    End If
+    For probeOffset = 0 To 2
+        periodCandidate = PeriodByIndex(startIdx + probeOffset)
+        periodDue = ShouldRun(machineId, periodCandidate, ThrottleMinutesForPeriod(periodCandidate))
+        If Not periodDue Then
+            LogMsg LOG_LEVEL_INFO, "MainStatusAggregation", "scheduler_skip machine=" & machineId & " period=" & periodCandidate & " reason=not_due"
+        Else
+            anyDue = True
+            periodCooldownBlocked = False
+            If periodCandidate <> "1D" Then
+                periodFailureKey = BuildMachinePeriodKey(machineId, periodCandidate)
+                If g_periodFailureCooldownUntil.Exists(periodFailureKey) Then
+                    periodFailureUntil = CDate(g_periodFailureCooldownUntil(periodFailureKey))
+                    If Now() < periodFailureUntil Then
+                        periodCooldownBlocked = True
+                        LogMsg LOG_LEVEL_INFO, "MainStatusAggregation", "scheduler_skip machine=" & machineId & " period=" & periodCandidate & " reason=cooldown"
+                    Else
+                        g_periodFailureCooldownUntil.Remove periodFailureKey
+                    End If
+                End If
+            End If
 
-    If targetPeriod <> "1D" Then
-        periodFailureKey = BuildMachinePeriodKey(machineId, targetPeriod)
-        If g_periodFailureCooldownUntil.Exists(periodFailureKey) Then
-            periodFailureUntil = CDate(g_periodFailureCooldownUntil(periodFailureKey))
-            If Now() < periodFailureUntil Then
-                LogMsg LOG_LEVEL_INFO, "MainStatusAggregation", "skip machine=" & machineId & " period=" & targetPeriod & " reason=period_failure_cooldown cooldown_until=" & TS3(periodFailureUntil)
-                Exit Sub
-            Else
-                g_periodFailureCooldownUntil.Remove periodFailureKey
+            If Not periodCooldownBlocked Then
+                targetPeriod = periodCandidate
+                lookback = LookbackMinutesForPeriod(periodCandidate)
+                selectedReason = "due_round_robin"
+                Exit For
             End If
         End If
+    Next
+
+    If targetPeriod = "" Then
+        If anyDue Then
+            LogMsg LOG_LEVEL_INFO, "MainStatusAggregation", "skip machine=" & machineId & " reason=all_due_periods_in_cooldown"
+        Else
+            LogMsg LOG_LEVEL_INFO, "MainStatusAggregation", "skip machine=" & machineId & " reason=throttled"
+        End If
+        Exit Sub
     End If
 
     If Not IsEmpty(g_lastGlobalAggregationRun) Then
@@ -776,10 +903,13 @@ Public Sub MainStatusAggregation(ByVal machineId)
     End If
 
     runtimeCatalog = GetRuntimeCatalog()
+    RunRollupMaintenance cn, runtimeCatalog, machineId
+    LogMsg LOG_LEVEL_INFO, "MainStatusAggregation", "scheduler_selected machine=" & machineId & " period=" & targetPeriod & " reason=" & selectedReason
     LogMsg LOG_LEVEL_INFO, "MainStatusAggregation", "process machine=" & machineId & " period=" & targetPeriod & " version=" & SCRIPT_VERSION
 
     g_lastGlobalAggregationRun = Now()
     AggregatePeriod cn, runtimeCatalog, machineId, targetPeriod, lookback
+    SetNextPeriodIndex machineId, (startIdx + 1)
 
     CloseConn cn
 End Sub

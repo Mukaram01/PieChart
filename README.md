@@ -56,6 +56,7 @@ The script computes aggregates for three period keys:
 - `30D` can still publish real percentages when at least 21 rows are available (partial window mode).
 - If the row count is below those minimums, the script writes zero/no-data outputs and logs `insufficient_rollup_rows`.
 - Missing rollup rows are backfilled gradually by capped maintenance each invocation so runtime work stays bounded.
+- Rollup maintenance prioritizes missing days in two phases: first the most recent 7 completed days (yesterday back to 7 days ago), then older missing days in the 30-day window (8 to 30 days ago), so 7D charts become useful sooner.
 - Backfill maintenance also tracks permanently empty archive days in `dbo.PieChartDailyRollupBackfillSkip` (reason `no_archive_data`) so those dates are skipped on future runs instead of being retried forever.
 - Period selection is round-robin among due jobs, so `30D` is not permanently starved behind `1D`/`7D`.
 

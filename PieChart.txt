@@ -3,7 +3,7 @@
 ' ======================================================================
 Option Explicit
 
-Const SCRIPT_VERSION = "PieChart-simplified-v7-fair-scheduler-rollup-maintenance"
+Const SCRIPT_VERSION = "PieChart-simplified-v7-fair-scheduler-rollup-maintenance-recent-priority"
 
 Const DEFAULT_PROVIDER = "MSOLEDBSQL"
 Const FALLBACK_PROVIDER = "SQLNCLI11"
@@ -636,7 +636,7 @@ Private Sub EnsureRecentDailyRollups(ByVal cn, ByVal runtimeCatalog, ByVal machi
 End Sub
 
 Private Sub RunRollupMaintenance(ByVal cn, ByVal runtimeCatalog, ByVal machineId)
-    Dim startDay, endDay, d
+    Dim startRecentDay, endRecentDay, startOlderDay, endOlderDay, d
     Dim missingTotal, attemptedNow, insertedNow, failedNow, skippedNow
     Dim dayInserted
     Dim failureReason
@@ -647,18 +647,36 @@ Private Sub RunRollupMaintenance(ByVal cn, ByVal runtimeCatalog, ByVal machineId
     EnsureDailyRollupTable cn, runtimeCatalog
     EnsureBackfillSkipTable cn, runtimeCatalog
 
-    startDay = DateAdd("d", -30, Date())
-    endDay = DateAdd("d", -1, Date())
+    startRecentDay = DateAdd("d", -7, Date())
+    endRecentDay = DateAdd("d", -1, Date())
+    startOlderDay = DateAdd("d", -30, Date())
+    endOlderDay = DateAdd("d", -8, Date())
     missingTotal = 0
     attemptedNow = 0
     insertedNow = 0
     failedNow = 0
     skippedNow = 0
 
-    d = startDay
-    Do While d <= endDay
+    d = startRecentDay
+    Do While d <= endRecentDay
         If Not DailyRollupRowExists(cn, runtimeCatalog, machineId, d) Then
             missingTotal = missingTotal + 1
+        End If
+        d = DateAdd("d", 1, d)
+    Loop
+
+    d = startOlderDay
+    Do While d <= endOlderDay
+        If Not DailyRollupRowExists(cn, runtimeCatalog, machineId, d) Then
+            missingTotal = missingTotal + 1
+        End If
+        d = DateAdd("d", 1, d)
+    Loop
+
+    LogMsg LOG_LEVEL_INFO, "Rollup", "rollup_backfill_priority machine=" & machineId & " phase=recent_7d"
+    d = endRecentDay
+    Do While d >= startRecentDay
+        If Not DailyRollupRowExists(cn, runtimeCatalog, machineId, d) Then
             If attemptedNow < MAX_ROLLUP_BACKFILL_DAYS_PER_INVOCATION Then
                 If HasNoArchiveSkip(cn, runtimeCatalog, machineId, d) Then
                     LogMsg LOG_LEVEL_INFO, "Rollup", "backfill_day_skipped machine=" & machineId & " day=" & TSDate(d) & " reason=no_archive_data"
@@ -677,7 +695,31 @@ Private Sub RunRollupMaintenance(ByVal cn, ByVal runtimeCatalog, ByVal machineId
                 End If
             End If
         End If
-        d = DateAdd("d", 1, d)
+        d = DateAdd("d", -1, d)
+    Loop
+
+    LogMsg LOG_LEVEL_INFO, "Rollup", "rollup_backfill_priority machine=" & machineId & " phase=older_30d"
+    d = endOlderDay
+    Do While d >= startOlderDay
+        If attemptedNow >= MAX_ROLLUP_BACKFILL_DAYS_PER_INVOCATION Then Exit Do
+        If Not DailyRollupRowExists(cn, runtimeCatalog, machineId, d) Then
+            If HasNoArchiveSkip(cn, runtimeCatalog, machineId, d) Then
+                LogMsg LOG_LEVEL_INFO, "Rollup", "backfill_day_skipped machine=" & machineId & " day=" & TSDate(d) & " reason=no_archive_data"
+                skippedNow = skippedNow + 1
+            Else
+                attemptedNow = attemptedNow + 1
+                dayInserted = UpsertDailyRollupForDate(cn, runtimeCatalog, machineId, d, failureReason)
+                If dayInserted Then
+                    insertedNow = insertedNow + 1
+                Else
+                    failedNow = failedNow + 1
+                    If failureReason = "no_archive_data" Then
+                        MarkBackfillSkipNoArchive cn, runtimeCatalog, machineId, d
+                    End If
+                End If
+            End If
+        End If
+        d = DateAdd("d", -1, d)
     Loop
 
     If Err.Number <> 0 Then

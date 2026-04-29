@@ -56,7 +56,12 @@ The script computes aggregates for three period keys:
 - `30D` can still publish real percentages when at least 21 rows are available (partial window mode).
 - If the row count is below those minimums, the script writes zero/no-data outputs and logs `insufficient_rollup_rows`.
 - Missing rollup rows are backfilled gradually by capped maintenance each invocation so runtime work stays bounded.
+- Backfill maintenance also tracks permanently empty archive days in `dbo.PieChartDailyRollupBackfillSkip` (reason `no_archive_data`) so those dates are skipped on future runs instead of being retried forever.
 - Period selection is round-robin among due jobs, so `30D` is not permanently starved behind `1D`/`7D`.
+
+### Rollup tables
+- `dbo.PieChartDailyRollup` stores one row per machine/day with five source fractions (`aborted_frac`, `halted_frac`, `running_frac`, `waiting_frac`, `interrupted_frac`).
+- `dbo.PieChartDailyRollupBackfillSkip` stores machine/day skip markers for known empty archive days and failure metadata (`failed_count`, `first_failed_at`, `last_failed_at`).
 
 ### Rollup diagnostics query
 Use this query to verify rollup completeness per machine:
@@ -133,6 +138,7 @@ Key constants maintainers should know:
 ### Pie rendering behavior
 - Pie-chart output tags are clamped with `PieVal` to a minimum of `1` so WinCC always renders segments.
 - True percentage tags remain unchanged and can be `0`.
+- Effective pie helper rule: if `*_Percentage` is `0` or below `1`, `*_Percentage_PieChart` is written as `1`; otherwise it is written as the true value.
 
 ---
 

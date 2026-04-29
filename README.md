@@ -49,26 +49,29 @@ The script computes aggregates for three period keys:
 - `30D`
 
 ### Operational behavior for 1D / 7D / 30D
-- `1D` reads machine status values directly from the WinCC archive query path.
-- `7D` reads from `dbo.PieChartDailyRollup` and targets 7 daily rows.
-- `30D` reads from `dbo.PieChartDailyRollup` and targets 30 daily rows.
+- The WinCC runtime archive catalog (`@DatasourceNameRT`) is dynamic and may change across redundancy/runtime switches (for example `CC_SLSGLO_*` names).
+- `1D` always reads machine status values directly from the **current** runtime archive catalog.
+- `7D` reads from the stable cache table `PieChartCache.dbo.PieChartDailyRollup` and targets 7 daily rows.
+- `30D` reads from the stable cache table `PieChartCache.dbo.PieChartDailyRollup` and targets 30 daily rows.
 - `7D` can still publish real percentages when at least 5 rows are available (partial window mode).
 - `30D` can still publish real percentages when at least 21 rows are available (partial window mode).
 - If the row count is below those minimums, the script writes zero/no-data outputs and logs `insufficient_rollup_rows`.
 - Missing rollup rows are backfilled gradually by capped maintenance each invocation so runtime work stays bounded.
 - Rollup maintenance prioritizes missing days in two phases: first the most recent 7 completed days (yesterday back to 7 days ago), then older missing days in the 30-day window (8 to 30 days ago), so 7D charts become useful sooner.
-- Backfill maintenance also tracks permanently empty archive days in `dbo.PieChartDailyRollupBackfillSkip` (reason `no_archive_data`) so those dates are skipped on future runs instead of being retried forever.
+- Backfill maintenance also tracks permanently empty archive days in `PieChartCache.dbo.PieChartDailyRollupBackfillSkip` (reason `no_archive_data`) so those dates are skipped on future runs instead of being retried forever.
 - Period selection is round-robin among due jobs, so `30D` is not permanently starved behind `1D`/`7D`.
+- Rollup maintenance can run on standby/redundant servers to keep the shared cache warm.
+- Final WinCC output percentage tag writes are performed only on the active/master server.
 
 ### Rollup tables
-- `dbo.PieChartDailyRollup` stores one row per machine/day with five source fractions (`aborted_frac`, `halted_frac`, `running_frac`, `waiting_frac`, `interrupted_frac`).
-- `dbo.PieChartDailyRollupBackfillSkip` stores machine/day skip markers for known empty archive days and failure metadata (`failed_count`, `first_failed_at`, `last_failed_at`).
+- `PieChartCache.dbo.PieChartDailyRollup` stores one row per machine/day with five source fractions (`aborted_frac`, `halted_frac`, `running_frac`, `waiting_frac`, `interrupted_frac`).
+- `PieChartCache.dbo.PieChartDailyRollupBackfillSkip` stores machine/day skip markers for known empty archive days and failure metadata (`failed_count`, `first_failed_at`, `last_failed_at`).
 
 ### Rollup diagnostics query
 Use this query to verify rollup completeness per machine:
 
 ```sql
-USE [CC_SLSGLO_xxxxxxxx];
+USE [PieChartCache];
 GO
 
 DECLARE @Today date = CONVERT(date, GETDATE());

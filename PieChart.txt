@@ -3,7 +3,7 @@
 ' ======================================================================
 Option Explicit
 
-Const SCRIPT_VERSION = "PieChart-simplified-v7-fair-scheduler-rollup-maintenance-recent-priority"
+Const SCRIPT_VERSION = "PieChart-simplified-v8-stable-rollup-cache-redundancy-warmup"
 
 Const DEFAULT_PROVIDER = "MSOLEDBSQL"
 Const FALLBACK_PROVIDER = "SQLNCLI11"
@@ -15,6 +15,11 @@ Const SQL_TIMEOUT_SECONDS_30D = 15
 Const GLOBAL_MIN_SECONDS_BETWEEN_MACHINE_RUNS = 120
 Const WINDOW_EXEC_WARN_THRESHOLD_MS = 15000
 Const MAX_ROLLUP_BACKFILL_DAYS_PER_INVOCATION = 2
+
+Const ROLLUP_CACHE_CATALOG = "PieChartCache"
+Const ROLLUP_SCHEMA = "dbo"
+Const ROLLUP_TABLE = "PieChartDailyRollup"
+Const ROLLUP_SKIP_TABLE = "PieChartDailyRollupBackfillSkip"
 
 Const THROTTLE_1D_MINUTES = 60
 Const THROTTLE_7D_MINUTES = 1440
@@ -166,6 +171,14 @@ End Function
 Private Function BracketIdent(ByVal s)
     BracketIdent = "[" & Replace(CStr(s), "]", "]]") & "]"
 End Function
+Private Function GetRollupTableFqn()
+    GetRollupTableFqn = BracketIdent(ROLLUP_CACHE_CATALOG) & "." & BracketIdent(ROLLUP_SCHEMA) & "." & BracketIdent(ROLLUP_TABLE)
+End Function
+
+Private Function GetRollupSkipTableFqn()
+    GetRollupSkipTableFqn = BracketIdent(ROLLUP_CACHE_CATALOG) & "." & BracketIdent(ROLLUP_SCHEMA) & "." & BracketIdent(ROLLUP_SKIP_TABLE)
+End Function
+
 
 Private Function ElapsedMs(ByVal timerStart)
     Dim timerEnd
@@ -407,12 +420,32 @@ Private Sub GetCombinedFractions(ByVal cn, ByVal runtimeCatalog, ByVal machineId
     inputValid = True
 End Sub
 
-Private Sub EnsureDailyRollupTable(ByVal cn, ByVal runtimeCatalog)
-    Dim cmd, sqlText, dbName
-    dbName = BracketIdent(runtimeCatalog)
-    sqlText = "IF OBJECT_ID(N'" & runtimeCatalog & ".dbo.PieChartDailyRollup', N'U') IS NULL " & _
+Private Sub EnsureRollupCacheDatabase(ByVal cn)
+    Dim cmd, sqlText
+    sqlText = "IF DB_ID(N'" & ROLLUP_CACHE_CATALOG & "') IS NULL CREATE DATABASE " & BracketIdent(ROLLUP_CACHE_CATALOG)
+
+    On Error Resume Next
+    Set cmd = CreateObject("ADODB.Command")
+    Set cmd.ActiveConnection = cn
+    cmd.CommandType = adCmdText
+    cmd.CommandTimeout = SQL_TIMEOUT_SECONDS_1D
+    cmd.CommandText = sqlText
+    cmd.Execute
+    If Err.Number <> 0 Then
+        LogMsg LOG_LEVEL_WARN, "Rollup", "cache_database_ensure_failed catalog=" & ROLLUP_CACHE_CATALOG & " err=" & S(Err.Description)
+        Err.Clear
+    Else
+        LogMsg LOG_LEVEL_INFO, "Rollup", "rollup_cache_database_ensured catalog=" & ROLLUP_CACHE_CATALOG
+    End If
+    On Error GoTo 0
+    Set cmd = Nothing
+End Sub
+
+Private Sub EnsureDailyRollupTable(ByVal cn)
+    Dim cmd, sqlText
+    sqlText = "IF OBJECT_ID(N'" & ROLLUP_CACHE_CATALOG & "." & ROLLUP_SCHEMA & "." & ROLLUP_TABLE & "', N'U') IS NULL " & _
               "BEGIN " & _
-              "CREATE TABLE " & dbName & ".dbo.PieChartDailyRollup(" & _
+              "CREATE TABLE " & GetRollupTableFqn() & "(" & _
               "machine_id NVARCHAR(32) NOT NULL," & _
               "summary_date DATE NOT NULL," & _
               "aborted_frac FLOAT NOT NULL," & _
@@ -436,18 +469,17 @@ Private Sub EnsureDailyRollupTable(ByVal cn, ByVal runtimeCatalog)
         LogMsg LOG_LEVEL_WARN, "Rollup", "table_ensure_failed err=" & S(Err.Description)
         Err.Clear
     Else
-        LogMsg LOG_LEVEL_INFO, "Rollup", "table_ensured catalog=" & runtimeCatalog & " table=dbo.PieChartDailyRollup"
+        LogMsg LOG_LEVEL_INFO, "Rollup", "rollup_cache_table_ensured catalog=" & ROLLUP_CACHE_CATALOG & " table=" & ROLLUP_SCHEMA & "." & ROLLUP_TABLE
     End If
     On Error GoTo 0
     Set cmd = Nothing
 End Sub
 
-Private Sub EnsureBackfillSkipTable(ByVal cn, ByVal runtimeCatalog)
-    Dim cmd, sqlText, dbName
-    dbName = BracketIdent(runtimeCatalog)
-    sqlText = "IF OBJECT_ID(N'" & runtimeCatalog & ".dbo.PieChartDailyRollupBackfillSkip', N'U') IS NULL " & _
+Private Sub EnsureBackfillSkipTable(ByVal cn)
+    Dim cmd, sqlText
+    sqlText = "IF OBJECT_ID(N'" & ROLLUP_CACHE_CATALOG & "." & ROLLUP_SCHEMA & "." & ROLLUP_SKIP_TABLE & "', N'U') IS NULL " & _
               "BEGIN " & _
-              "CREATE TABLE " & dbName & ".dbo.PieChartDailyRollupBackfillSkip(" & _
+              "CREATE TABLE " & GetRollupSkipTableFqn() & "(" & _
               "machine_id NVARCHAR(32) NOT NULL," & _
               "summary_date DATE NOT NULL," & _
               "reason NVARCHAR(64) NOT NULL," & _
@@ -468,16 +500,15 @@ Private Sub EnsureBackfillSkipTable(ByVal cn, ByVal runtimeCatalog)
         LogMsg LOG_LEVEL_WARN, "Rollup", "skip_table_ensure_failed err=" & S(Err.Description)
         Err.Clear
     Else
-        LogMsg LOG_LEVEL_INFO, "Rollup", "skip_table_ensured catalog=" & runtimeCatalog & " table=dbo.PieChartDailyRollupBackfillSkip"
+        LogMsg LOG_LEVEL_INFO, "Rollup", "rollup_cache_table_ensured catalog=" & ROLLUP_CACHE_CATALOG & " table=" & ROLLUP_SCHEMA & "." & ROLLUP_SKIP_TABLE
     End If
     On Error GoTo 0
     Set cmd = Nothing
 End Sub
 
-Private Function DailyRollupRowExists(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal dayDate)
-    Dim cmd, rs, sqlText, dbName
-    dbName = BracketIdent(runtimeCatalog)
-    sqlText = "SELECT TOP 1 1 FROM " & dbName & ".dbo.PieChartDailyRollup WHERE machine_id=" & SqlQ(machineId) & " AND summary_date=CONVERT(date," & SqlQ(TSDate(dayDate)) & ")"
+Private Function DailyRollupRowExists(ByVal cn, ByVal machineId, ByVal dayDate)
+    Dim cmd, rs, sqlText
+    sqlText = "SELECT TOP 1 1 FROM " & GetRollupTableFqn() & " WHERE machine_id=" & SqlQ(machineId) & " AND summary_date=CONVERT(date," & SqlQ(TSDate(dayDate)) & ")"
     DailyRollupRowExists = False
 
     On Error Resume Next
@@ -506,7 +537,7 @@ Private Function UpsertDailyRollupForDate(ByVal cn, ByVal runtimeCatalog, ByVal 
     Dim a, h, r, w, i
     Dim sA, sH, sR, sW, sI
     Dim eA, eH, eR, eW, eI
-    Dim cmd, sqlText, dbName
+    Dim cmd, sqlText
 
     UpsertDailyRollupForDate = False
     failureReason = ""
@@ -532,8 +563,7 @@ Private Function UpsertDailyRollupForDate(ByVal cn, ByVal runtimeCatalog, ByVal 
         Exit Function
     End If
 
-    dbName = BracketIdent(runtimeCatalog)
-    sqlText = "MERGE " & dbName & ".dbo.PieChartDailyRollup AS tgt " & _
+    sqlText = "MERGE " & GetRollupTableFqn() & " AS tgt " & _
               "USING (SELECT " & SqlQ(machineId) & " AS machine_id, CONVERT(date," & SqlQ(TSDate(dFrom)) & ") AS summary_date) AS src " & _
               "ON tgt.machine_id=src.machine_id AND tgt.summary_date=src.summary_date " & _
               "WHEN MATCHED THEN UPDATE SET aborted_frac=" & Replace(CStr(CDbl(a)), ",", ".") & ", halted_frac=" & Replace(CStr(CDbl(h)), ",", ".") & ", running_frac=" & Replace(CStr(CDbl(r)), ",", ".") & ", waiting_frac=" & Replace(CStr(CDbl(w)), ",", ".") & ", interrupted_frac=" & Replace(CStr(CDbl(i)), ",", ".") & ", updated_at=GETDATE() " & _
@@ -558,10 +588,9 @@ Private Function UpsertDailyRollupForDate(ByVal cn, ByVal runtimeCatalog, ByVal 
     Set cmd = Nothing
 End Function
 
-Private Sub MarkBackfillSkipNoArchive(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal dayDate)
-    Dim cmd, sqlText, dbName
-    dbName = BracketIdent(runtimeCatalog)
-    sqlText = "MERGE " & dbName & ".dbo.PieChartDailyRollupBackfillSkip AS tgt " & _
+Private Sub MarkBackfillSkipNoArchive(ByVal cn, ByVal machineId, ByVal dayDate)
+    Dim cmd, sqlText
+    sqlText = "MERGE " & GetRollupSkipTableFqn() & " AS tgt " & _
               "USING (SELECT " & SqlQ(machineId) & " AS machine_id, CONVERT(date," & SqlQ(TSDate(dayDate)) & ") AS summary_date) AS src " & _
               "ON tgt.machine_id=src.machine_id AND tgt.summary_date=src.summary_date " & _
               "WHEN MATCHED THEN UPDATE SET reason='no_archive_data', failed_count=tgt.failed_count+1, last_failed_at=GETDATE() " & _
@@ -582,11 +611,10 @@ Private Sub MarkBackfillSkipNoArchive(ByVal cn, ByVal runtimeCatalog, ByVal mach
     Set cmd = Nothing
 End Sub
 
-Private Function HasNoArchiveSkip(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal dayDate)
-    Dim cmd, rs, sqlText, dbName
+Private Function HasNoArchiveSkip(ByVal cn, ByVal machineId, ByVal dayDate)
+    Dim cmd, rs, sqlText
     HasNoArchiveSkip = False
-    dbName = BracketIdent(runtimeCatalog)
-    sqlText = "SELECT TOP 1 1 FROM " & dbName & ".dbo.PieChartDailyRollupBackfillSkip WHERE machine_id=" & SqlQ(machineId) & " AND summary_date=CONVERT(date," & SqlQ(TSDate(dayDate)) & ") AND reason='no_archive_data'"
+    sqlText = "SELECT TOP 1 1 FROM " & GetRollupSkipTableFqn() & " WHERE machine_id=" & SqlQ(machineId) & " AND summary_date=CONVERT(date," & SqlQ(TSDate(dayDate)) & ") AND reason='no_archive_data'"
 
     On Error Resume Next
     Set cmd = CreateObject("ADODB.Command")
@@ -620,7 +648,7 @@ Private Sub EnsureRecentDailyRollups(ByVal cn, ByVal runtimeCatalog, ByVal machi
 
     d = startDay
     Do While d <= endDay
-        If Not DailyRollupRowExists(cn, runtimeCatalog, machineId, d) Then
+        If Not DailyRollupRowExists(cn, machineId, d) Then
             missingTotal = missingTotal + 1
             If backfilled < MAX_ROLLUP_BACKFILL_DAYS_PER_INVOCATION Then
                 Call UpsertDailyRollupForDate(cn, runtimeCatalog, machineId, d, dummyReason)
@@ -644,8 +672,9 @@ Private Sub RunRollupMaintenance(ByVal cn, ByVal runtimeCatalog, ByVal machineId
     LogMsg LOG_LEVEL_INFO, "Rollup", "rollup_backfill_started machine=" & machineId
 
     On Error Resume Next
-    EnsureDailyRollupTable cn, runtimeCatalog
-    EnsureBackfillSkipTable cn, runtimeCatalog
+    EnsureRollupCacheDatabase cn
+    EnsureDailyRollupTable cn
+    EnsureBackfillSkipTable cn
 
     startRecentDay = DateAdd("d", -7, Date())
     endRecentDay = DateAdd("d", -1, Date())
@@ -659,7 +688,7 @@ Private Sub RunRollupMaintenance(ByVal cn, ByVal runtimeCatalog, ByVal machineId
 
     d = startRecentDay
     Do While d <= endRecentDay
-        If Not DailyRollupRowExists(cn, runtimeCatalog, machineId, d) Then
+        If Not DailyRollupRowExists(cn, machineId, d) Then
             missingTotal = missingTotal + 1
         End If
         d = DateAdd("d", 1, d)
@@ -667,7 +696,7 @@ Private Sub RunRollupMaintenance(ByVal cn, ByVal runtimeCatalog, ByVal machineId
 
     d = startOlderDay
     Do While d <= endOlderDay
-        If Not DailyRollupRowExists(cn, runtimeCatalog, machineId, d) Then
+        If Not DailyRollupRowExists(cn, machineId, d) Then
             missingTotal = missingTotal + 1
         End If
         d = DateAdd("d", 1, d)
@@ -676,9 +705,9 @@ Private Sub RunRollupMaintenance(ByVal cn, ByVal runtimeCatalog, ByVal machineId
     LogMsg LOG_LEVEL_INFO, "Rollup", "rollup_backfill_priority machine=" & machineId & " phase=recent_7d"
     d = endRecentDay
     Do While d >= startRecentDay
-        If Not DailyRollupRowExists(cn, runtimeCatalog, machineId, d) Then
+        If Not DailyRollupRowExists(cn, machineId, d) Then
             If attemptedNow < MAX_ROLLUP_BACKFILL_DAYS_PER_INVOCATION Then
-                If HasNoArchiveSkip(cn, runtimeCatalog, machineId, d) Then
+                If HasNoArchiveSkip(cn, machineId, d) Then
                     LogMsg LOG_LEVEL_INFO, "Rollup", "backfill_day_skipped machine=" & machineId & " day=" & TSDate(d) & " reason=no_archive_data"
                     skippedNow = skippedNow + 1
                 Else
@@ -689,7 +718,7 @@ Private Sub RunRollupMaintenance(ByVal cn, ByVal runtimeCatalog, ByVal machineId
                     Else
                         failedNow = failedNow + 1
                         If failureReason = "no_archive_data" Then
-                            MarkBackfillSkipNoArchive cn, runtimeCatalog, machineId, d
+                            MarkBackfillSkipNoArchive cn, machineId, d
                         End If
                     End If
                 End If
@@ -702,8 +731,8 @@ Private Sub RunRollupMaintenance(ByVal cn, ByVal runtimeCatalog, ByVal machineId
     d = endOlderDay
     Do While d >= startOlderDay
         If attemptedNow >= MAX_ROLLUP_BACKFILL_DAYS_PER_INVOCATION Then Exit Do
-        If Not DailyRollupRowExists(cn, runtimeCatalog, machineId, d) Then
-            If HasNoArchiveSkip(cn, runtimeCatalog, machineId, d) Then
+        If Not DailyRollupRowExists(cn, machineId, d) Then
+            If HasNoArchiveSkip(cn, machineId, d) Then
                 LogMsg LOG_LEVEL_INFO, "Rollup", "backfill_day_skipped machine=" & machineId & " day=" & TSDate(d) & " reason=no_archive_data"
                 skippedNow = skippedNow + 1
             Else
@@ -714,7 +743,7 @@ Private Sub RunRollupMaintenance(ByVal cn, ByVal runtimeCatalog, ByVal machineId
                 Else
                     failedNow = failedNow + 1
                     If failureReason = "no_archive_data" Then
-                        MarkBackfillSkipNoArchive cn, runtimeCatalog, machineId, d
+                        MarkBackfillSkipNoArchive cn, machineId, d
                     End If
                 End If
             End If
@@ -742,9 +771,9 @@ Private Sub RunRollupMaintenance(ByVal cn, ByVal runtimeCatalog, ByVal machineId
     On Error GoTo 0
 End Sub
 
-Private Sub ReadWindowFractionsFromDailyRollup(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal daysCount, ByRef fRun, ByRef fHalt, ByRef fAbort, ByRef inputValid, ByRef failureKind, ByRef failureDetail)
+Private Sub ReadWindowFractionsFromDailyRollup(ByVal cn, ByVal machineId, ByVal daysCount, ByRef fRun, ByRef fHalt, ByRef fAbort, ByRef inputValid, ByRef failureKind, ByRef failureDetail)
     Dim startDay, endExclusive
-    Dim cmd, rs, sqlText, dbName
+    Dim cmd, rs, sqlText
     Dim rowCount, sumAbort, sumHalt, sumRun, sumWait, sumInt
     Dim minRows
 
@@ -762,8 +791,7 @@ Private Sub ReadWindowFractionsFromDailyRollup(ByVal cn, ByVal runtimeCatalog, B
     sumInt = 0
     startDay = DateAdd("d", -CLng(daysCount), Date())
     endExclusive = Date()
-    dbName = BracketIdent(runtimeCatalog)
-    sqlText = "SELECT summary_date, aborted_frac, halted_frac, running_frac, waiting_frac, interrupted_frac FROM " & dbName & ".dbo.PieChartDailyRollup WHERE machine_id=" & SqlQ(machineId) & " AND summary_date>=CONVERT(date," & SqlQ(TSDate(startDay)) & ") AND summary_date<CONVERT(date," & SqlQ(TSDate(endExclusive)) & ") ORDER BY summary_date ASC"
+    sqlText = "SELECT summary_date, aborted_frac, halted_frac, running_frac, waiting_frac, interrupted_frac FROM " & GetRollupTableFqn() & " WHERE machine_id=" & SqlQ(machineId) & " AND summary_date>=CONVERT(date," & SqlQ(TSDate(startDay)) & ") AND summary_date<CONVERT(date," & SqlQ(TSDate(endExclusive)) & ") ORDER BY summary_date ASC"
 
     If CLng(daysCount) = 7 Then
         minRows = 5
@@ -892,7 +920,7 @@ Private Function PieVal(ByVal pct)
     End If
 End Function
 
-Private Sub AggregatePeriod(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal periodKey, ByVal lookbackMinutes)
+Private Sub AggregatePeriod(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal periodKey, ByVal lookbackMinutes, ByVal writeOutputs)
     Dim tFrom, tTo, t0, elapsed
     Dim fRun, fHalt, fAbort, inputValid
     Dim pRun, pHalt, pAbort
@@ -910,10 +938,10 @@ Private Sub AggregatePeriod(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByV
     If UCase(CStr(periodKey)) = "1D" Then
         GetCombinedFractions cn, runtimeCatalog, machineId, tFrom, tTo, periodKey, fRun, fHalt, fAbort, inputValid, failureKind, failedStatus, failureDetail
     ElseIf UCase(CStr(periodKey)) = "7D" Then
-        ReadWindowFractionsFromDailyRollup cn, runtimeCatalog, machineId, 7, fRun, fHalt, fAbort, inputValid, failureKind, failureDetail
+        ReadWindowFractionsFromDailyRollup cn, machineId, 7, fRun, fHalt, fAbort, inputValid, failureKind, failureDetail
         failedStatus = ""
     ElseIf UCase(CStr(periodKey)) = "30D" Then
-        ReadWindowFractionsFromDailyRollup cn, runtimeCatalog, machineId, 30, fRun, fHalt, fAbort, inputValid, failureKind, failureDetail
+        ReadWindowFractionsFromDailyRollup cn, machineId, 30, fRun, fHalt, fAbort, inputValid, failureKind, failureDetail
         failedStatus = ""
     Else
         inputValid = False
@@ -943,13 +971,17 @@ Private Sub AggregatePeriod(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByV
 
     base = machineId & "_" & periodKey & "_Machine_"
 
-    WriteNumericOutputTag base & "Running_Percentage", pRun
-    WriteNumericOutputTag base & "Halted_Percentage", pHalt
-    WriteNumericOutputTag base & "Aborted_Percentage", pAbort
+    If writeOutputs Then
+        WriteNumericOutputTag base & "Running_Percentage", pRun
+        WriteNumericOutputTag base & "Halted_Percentage", pHalt
+        WriteNumericOutputTag base & "Aborted_Percentage", pAbort
 
-    WriteNumericOutputTag base & "Running_Percentage_PieChart", PieVal(pRun)
-    WriteNumericOutputTag base & "Halted_Percentage_PieChart", PieVal(pHalt)
-    WriteNumericOutputTag base & "Aborted_Percentage_PieChart", PieVal(pAbort)
+        WriteNumericOutputTag base & "Running_Percentage_PieChart", PieVal(pRun)
+        WriteNumericOutputTag base & "Halted_Percentage_PieChart", PieVal(pHalt)
+        WriteNumericOutputTag base & "Aborted_Percentage_PieChart", PieVal(pAbort)
+    Else
+        LogMsg LOG_LEVEL_INFO, "Aggregate", "output_write_skipped_standby machine=" & machineId & " period=" & periodKey
+    End If
 
     elapsed = ElapsedMs(t0)
     If inputValid Then
@@ -995,11 +1027,12 @@ Public Sub MainStatusAggregation(ByVal machineId)
     Dim secondsSinceLastGlobal
     Dim periodFailureKey, periodFailureUntil
     Dim startIdx, probeOffset, periodCandidate, periodDue, periodCooldownBlocked
-    Dim selectedReason, anyDue
+    Dim selectedReason, anyDue, masterRole
 
     InitGlobals
 
-    If Not IsMaster() Then Exit Sub
+    masterRole = IsMaster()
+    LogMsg LOG_LEVEL_INFO, "MainStatusAggregation", "redundancy_role master=" & LCase(CStr(masterRole))
 
     If Not G_MACHINES.Exists(machineId) Then
         LogMsg LOG_LEVEL_WARN, "MainStatusAggregation", "unknown_machine=" & machineId
@@ -1066,12 +1099,17 @@ Public Sub MainStatusAggregation(ByVal machineId)
     End If
 
     runtimeCatalog = GetRuntimeCatalog()
+    LogMsg LOG_LEVEL_INFO, "MainStatusAggregation", "rollup_source_catalog current=" & runtimeCatalog
     RunRollupMaintenance cn, runtimeCatalog, machineId
     LogMsg LOG_LEVEL_INFO, "MainStatusAggregation", "scheduler_selected machine=" & machineId & " period=" & targetPeriod & " reason=" & selectedReason
     LogMsg LOG_LEVEL_INFO, "MainStatusAggregation", "process machine=" & machineId & " period=" & targetPeriod & " version=" & SCRIPT_VERSION
 
+    If Not masterRole Then
+        LogMsg LOG_LEVEL_INFO, "MainStatusAggregation", "standby_cache_warmup machine=" & machineId
+    End If
+
     g_lastGlobalAggregationRun = Now()
-    AggregatePeriod cn, runtimeCatalog, machineId, targetPeriod, lookback
+    AggregatePeriod cn, runtimeCatalog, machineId, targetPeriod, lookback, masterRole
     SetNextPeriodIndex machineId, (startIdx + 1)
 
     CloseConn cn

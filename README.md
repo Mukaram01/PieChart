@@ -23,6 +23,11 @@ For each machine and period, the script writes:
 - Standard percentage tags: `<Machine>_<Period>_Machine_<Status>_Percentage`
 - Pie rendering tags: `<Machine>_<Period>_Machine_<Status>_Percentage_PieChart`
 
+### Percentage vs PieChart tags
+- `<Machine>_<Period>_Machine_<Status>_Percentage` is the true calculated value and may be `0`.
+- `<Machine>_<Period>_Machine_<Status>_Percentage_PieChart` is visualization-only for WinCC pie/donut rendering and is clamped to a minimum of `1`.
+- This means when the true percentage is `0` (or any value below `1`), the pie tag is written as `1` while labels/text should continue to use the true percentage tag.
+
 ---
 
 ## Status Mapping
@@ -125,10 +130,9 @@ Key constants maintainers should know:
 - `WINDOW_EXEC_WARN_THRESHOLD_MS`
 - `STARTUP_NO_RECENT_SHORT_CIRCUIT` (startup `NO_RECENT` early-exit gate; default `False` for compatibility)
 
-### Zero-total rendering behavior
-- `RENDER_ZERO_TOTAL_AS_FALLBACK_PIE`
-  - `True`: deterministic fallback pie split (34/33/33)
-  - `False`: legacy all-zero pie output for idle windows
+### Pie rendering behavior
+- Pie-chart output tags are clamped with `PieVal` to a minimum of `1` so WinCC always renders segments.
+- True percentage tags remain unchanged and can be `0`.
 
 ---
 

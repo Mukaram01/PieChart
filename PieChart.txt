@@ -719,10 +719,9 @@ Private Sub NormalizeFractionsToPct(ByVal fRun, ByVal fHalt, ByVal fAbort, ByRef
     End If
 End Sub
 
+' *_Percentage_PieChart is a WinCC rendering shim (minimum 1) and must not be used as the real percentage value.
 Private Function PieVal(ByVal pct)
-    If pct <= 0 Then
-        PieVal = 0
-    ElseIf pct < 1 Then
+    If pct < 1 Then
         PieVal = 1
     Else
         PieVal = pct

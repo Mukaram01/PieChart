@@ -31,6 +31,7 @@ Const FAILURE_COOLDOWN_30D_MINUTES = 10080
 Const COUNT_TAG_PREFIX_JOINER = "\"
 Const COUNT_TAG_CORE_TEMPLATE = "{MACHINE_ID}_ProgramStatus_{STATUS_NAME}"
 Const COUNT_TAG_SUFFIX = "_Count"
+Const WINCC_REMOTE_TAG_PREFIX = "SLSGLO_TUN::"
 Const FIXED_AGG_EXPR = "AVG(RealValue)"
 
 Const adCmdText = 1
@@ -235,6 +236,41 @@ Private Function BuildMachinePeriodKey(ByVal machineId, ByVal periodKey)
     BuildMachinePeriodKey = machineId & "|" & periodKey
 End Function
 
+Private Function StripWinCCServerPrefix(ByVal tagName)
+    Dim p
+    p = InStrRev(tagName, "::")
+    If p > 0 Then
+        StripWinCCServerPrefix = Mid(tagName, p + 2)
+    Else
+        StripWinCCServerPrefix = tagName
+    End If
+End Function
+
+Private Function QualifyWinCCTagName(ByVal localTagName)
+    If InStr(1, localTagName, "::", vbTextCompare) > 0 Then
+        QualifyWinCCTagName = localTagName
+    ElseIf Len(WINCC_REMOTE_TAG_PREFIX) > 0 Then
+        QualifyWinCCTagName = WINCC_REMOTE_TAG_PREFIX & localTagName
+    Else
+        QualifyWinCCTagName = localTagName
+    End If
+End Function
+
+Private Function BuildProgramStatusTag(ByVal machineId, ByVal statusName)
+    BuildProgramStatusTag = QualifyWinCCTagName(machineId & "_ProgramStatus_" & statusName)
+End Function
+
+Private Function ExtractMachineIdFromProgramStatusTag(ByVal tagName)
+    Dim normalized, markerPos
+    normalized = StripWinCCServerPrefix(tagName)
+    markerPos = InStr(1, normalized, "_ProgramStatus_", vbTextCompare)
+    If markerPos > 1 Then
+        ExtractMachineIdFromProgramStatusTag = Left(normalized, markerPos - 1)
+    Else
+        ExtractMachineIdFromProgramStatusTag = normalized
+    End If
+End Function
+
 Private Function GetFailureCooldownMinutes(ByVal periodKey)
     Select Case UCase(CStr(periodKey))
         Case "7D"
@@ -247,16 +283,15 @@ Private Function GetFailureCooldownMinutes(ByVal periodKey)
 End Function
 
 Private Function BuildCountTagFullName(ByVal machineId, ByVal statusName)
-    Dim basePrefix, baseCore
+    Dim basePrefix, localCore
     basePrefix = G_MACHINES(machineId)
-    baseCore = COUNT_TAG_CORE_TEMPLATE
-    baseCore = Replace(baseCore, "{MACHINE_ID}", machineId)
-    baseCore = Replace(baseCore, "{STATUS_NAME}", statusName)
-    BuildCountTagFullName = basePrefix & COUNT_TAG_PREFIX_JOINER & baseCore & COUNT_TAG_SUFFIX
+    localCore = BuildProgramStatusTag(machineId, statusName)
+    BuildCountTagFullName = basePrefix & COUNT_TAG_PREFIX_JOINER & localCore & COUNT_TAG_SUFFIX
 End Function
 
 Private Sub ReadSingleFraction(ByVal cn, ByVal runtimeCatalog, ByVal tagFullName, ByVal tFrom, ByVal tTo, ByVal machineId, ByVal periodKey, ByVal statusName, ByRef fractionOut, ByRef resultState, ByRef errText)
     Dim cmd, rs, sqlText, safeTag, t0, ms
+    Dim localCoreTag, qualifiedCoreTag
     Dim timeoutSeconds
     Dim v
 
@@ -264,6 +299,8 @@ Private Sub ReadSingleFraction(ByVal cn, ByVal runtimeCatalog, ByVal tagFullName
     resultState = "error"
     errText = ""
     safeTag = Replace(tagFullName, "'", "''")
+    localCoreTag = machineId & "_ProgramStatus_" & statusName
+    qualifiedCoreTag = BuildProgramStatusTag(machineId, statusName)
     sqlText = "cp_TagStatisticEx '" & runtimeCatalog & "','TAG:R,''" & safeTag & "'',''" & TS3(tFrom) & "'',''" & TS3(tTo) & "''','" & FIXED_AGG_EXPR & "'"
     timeoutSeconds = GetCommandTimeoutSeconds(periodKey)
 
@@ -310,10 +347,27 @@ Private Sub ReadSingleFraction(ByVal cn, ByVal runtimeCatalog, ByVal tagFullName
     Else
         LogMsg LOG_LEVEL_INFO, "cp_TagStatisticEx", "machine=" & machineId & " period=" & periodKey & " status=" & statusName & " elapsed_ms=" & ms & " timeout_s=" & timeoutSeconds & " result=" & resultState
     End If
+    If localCoreTag <> qualifiedCoreTag Then
+        LogMsg LOG_LEVEL_INFO, "cp_TagStatisticEx", "machine=" & machineId & " local_tag=" & localCoreTag & " qualified_tag=" & qualifiedCoreTag
+    End If
     On Error GoTo 0
 
     Set rs = Nothing
     Set cmd = Nothing
+End Sub
+
+Private Sub ValidateWinCCTagHelpers()
+    Dim localTag, remoteTag
+
+    localTag = "MNA_0407_ProgramStatus_Aborted"
+    remoteTag = "SLSGLO_TUN::MNA_0407_ProgramStatus_Aborted"
+
+    LogMsg LOG_LEVEL_INFO, "WinCCHelpers", "strip_local result=" & StripWinCCServerPrefix(localTag)
+    LogMsg LOG_LEVEL_INFO, "WinCCHelpers", "strip_remote result=" & StripWinCCServerPrefix(remoteTag)
+    LogMsg LOG_LEVEL_INFO, "WinCCHelpers", "qualify_local result=" & QualifyWinCCTagName(localTag)
+    LogMsg LOG_LEVEL_INFO, "WinCCHelpers", "qualify_remote result=" & QualifyWinCCTagName(remoteTag)
+    LogMsg LOG_LEVEL_INFO, "WinCCHelpers", "machine_from_local result=" & ExtractMachineIdFromProgramStatusTag(localTag)
+    LogMsg LOG_LEVEL_INFO, "WinCCHelpers", "machine_from_remote result=" & ExtractMachineIdFromProgramStatusTag(remoteTag)
 End Sub
 
 Private Sub GetCombinedFractions(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal tFrom, ByVal tTo, ByVal periodKey, ByRef fRun, ByRef fHalt, ByRef fAbort, ByRef inputValid, ByRef failureKind, ByRef failedStatus, ByRef failureDetail)
@@ -1030,8 +1084,10 @@ Public Sub MainStatusAggregation(ByVal machineId)
     Dim selectedReason, anyDue, masterRole
 
     InitGlobals
+    ValidateWinCCTagHelpers
 
     masterRole = IsMaster()
+    LogMsg LOG_LEVEL_INFO, "MainStatusAggregation", "wincc_remote_tag_prefix=" & WINCC_REMOTE_TAG_PREFIX
     LogMsg LOG_LEVEL_INFO, "MainStatusAggregation", "redundancy_role master=" & LCase(CStr(masterRole))
 
     If Not G_MACHINES.Exists(machineId) Then

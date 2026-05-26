@@ -31,7 +31,8 @@ Const FAILURE_COOLDOWN_30D_MINUTES = 10080
 Const COUNT_TAG_PREFIX_JOINER = "\"
 Const COUNT_TAG_CORE_TEMPLATE = "{MACHINE_ID}_ProgramStatus_{STATUS_NAME}"
 Const COUNT_TAG_SUFFIX = "_Count"
-Const WINCC_REMOTE_TAG_PREFIX = "SLSGLO_TUN::"
+Const TAG_PREFIX_NONE = ""
+Const TAG_PREFIX_SLSGLO_TUN = "SLSGLO_TUN::"
 Const FIXED_AGG_EXPR = "AVG(RealValue)"
 
 Const adCmdText = 1
@@ -48,6 +49,7 @@ Dim g_periodFailureCooldownUntil
 Dim g_nextPeriodIndexByMachine
 Dim g_initializedScriptVersion
 Dim G_MACHINES
+Dim G_MACHINE_TAG_PREFIXES
 Dim g_inited
 
 Private Function S(ByVal v)
@@ -70,16 +72,20 @@ Private Sub InitGlobals()
         Set g_periodFailureCooldownUntil = CreateObject("Scripting.Dictionary")
         Set g_nextPeriodIndexByMachine = CreateObject("Scripting.Dictionary")
         Set G_MACHINES = CreateObject("Scripting.Dictionary")
+        Set G_MACHINE_TAG_PREFIXES = CreateObject("Scripting.Dictionary")
 
-        G_MACHINES.Add "MNA_0269", "DMG_Mori1_MNA_0269"
-        G_MACHINES.Add "MNA_0270", "DMG_Mori2_MNA_0270"
-        G_MACHINES.Add "MNA_0332", "DMG_Mori3_MNA_0332"
-        G_MACHINES.Add "MNA_0164", "Wheelabrator_MNP_0164"
-        G_MACHINES.Add "MNA_0085", "Droop_Rein_1_MNA_0085_LM33H"
-        G_MACHINES.Add "MNA_0087", "Droop_Rein_4_MNA_0087_LM33F"
-        G_MACHINES.Add "MNA_0235", "WFL_M120_MNA_0235"
-        G_MACHINES.Add "MNA_0237", "WFL_M50_MNA_0237"
-        G_MACHINES.Add "MNA_0411", "Mazak_MNA_0411"
+        RegisterMachine "MNA_0269", "DMG_Mori1_MNA_0269", TAG_PREFIX_NONE
+        RegisterMachine "MNA_0270", "DMG_Mori2_MNA_0270", TAG_PREFIX_NONE
+        RegisterMachine "MNA_0332", "DMG_Mori3_MNA_0332", TAG_PREFIX_NONE
+        RegisterMachine "MNA_0164", "Wheelabrator_MNP_0164", TAG_PREFIX_NONE
+        RegisterMachine "MNA_0085", "Droop_Rein_1_MNA_0085_LM33H", TAG_PREFIX_NONE
+        RegisterMachine "MNA_0087", "Droop_Rein_4_MNA_0087_LM33F", TAG_PREFIX_NONE
+        RegisterMachine "MNA_0235", "WFL_M120_MNA_0235", TAG_PREFIX_NONE
+        RegisterMachine "MNA_0237", "WFL_M50_MNA_0237", TAG_PREFIX_NONE
+        RegisterMachine "MNA_0411", "Mazak_MNA_0411", TAG_PREFIX_NONE
+
+        RegisterMachine "MNA_0407", "AZGrinder_MNA_0407", TAG_PREFIX_SLSGLO_TUN
+        RegisterMachine "MNA_0158", "DANOBAT_2_MNA_0158_NC", TAG_PREFIX_SLSGLO_TUN
 
         g_inited = True
         g_initializedScriptVersion = SCRIPT_VERSION
@@ -95,6 +101,27 @@ Private Sub InitGlobals()
         LogMsg LOG_LEVEL_INFO, "MainStatusAggregation", "scheduler_state_reset version=" & SCRIPT_VERSION
     End If
 End Sub
+
+Private Sub RegisterMachine(ByVal machineId, ByVal archivePrefix, ByVal tagPrefix)
+    If G_MACHINES.Exists(machineId) Then
+        LogMsg LOG_LEVEL_WARN, "InitGlobals", "duplicate_machine=" & machineId
+        Exit Sub
+    End If
+
+    G_MACHINES.Add machineId, archivePrefix
+    G_MACHINE_TAG_PREFIXES.Add machineId, tagPrefix
+End Sub
+
+Private Function GetMachineTagPrefix(ByVal machineId)
+    If IsObject(G_MACHINE_TAG_PREFIXES) Then
+        If G_MACHINE_TAG_PREFIXES.Exists(machineId) Then
+            GetMachineTagPrefix = G_MACHINE_TAG_PREFIXES(machineId)
+            Exit Function
+        End If
+    End If
+
+    GetMachineTagPrefix = TAG_PREFIX_NONE
+End Function
 
 Private Function IsMaster()
     On Error Resume Next
@@ -246,18 +273,8 @@ Private Function StripWinCCServerPrefix(ByVal tagName)
     End If
 End Function
 
-Private Function QualifyWinCCTagName(ByVal localTagName)
-    If InStr(1, localTagName, "::", vbTextCompare) > 0 Then
-        QualifyWinCCTagName = localTagName
-    ElseIf Len(WINCC_REMOTE_TAG_PREFIX) > 0 Then
-        QualifyWinCCTagName = WINCC_REMOTE_TAG_PREFIX & localTagName
-    Else
-        QualifyWinCCTagName = localTagName
-    End If
-End Function
-
 Private Function BuildProgramStatusTag(ByVal machineId, ByVal statusName)
-    BuildProgramStatusTag = QualifyWinCCTagName(machineId & "_ProgramStatus_" & statusName)
+    BuildProgramStatusTag = GetMachineTagPrefix(machineId) & machineId & "_ProgramStatus_" & statusName
 End Function
 
 Private Function ExtractMachineIdFromProgramStatusTag(ByVal tagName)
@@ -359,15 +376,17 @@ End Sub
 Private Sub ValidateWinCCTagHelpers()
     Dim localTag, remoteTag
 
-    localTag = "MNA_0407_ProgramStatus_Aborted"
-    remoteTag = "SLSGLO_TUN::MNA_0407_ProgramStatus_Aborted"
+    localTag = BuildProgramStatusTag("MNA_0269", "Aborted")
+    remoteTag = BuildProgramStatusTag("MNA_0407", "Aborted")
 
-    LogMsg LOG_LEVEL_INFO, "WinCCHelpers", "strip_local result=" & StripWinCCServerPrefix(localTag)
-    LogMsg LOG_LEVEL_INFO, "WinCCHelpers", "strip_remote result=" & StripWinCCServerPrefix(remoteTag)
-    LogMsg LOG_LEVEL_INFO, "WinCCHelpers", "qualify_local result=" & QualifyWinCCTagName(localTag)
-    LogMsg LOG_LEVEL_INFO, "WinCCHelpers", "qualify_remote result=" & QualifyWinCCTagName(remoteTag)
-    LogMsg LOG_LEVEL_INFO, "WinCCHelpers", "machine_from_local result=" & ExtractMachineIdFromProgramStatusTag(localTag)
-    LogMsg LOG_LEVEL_INFO, "WinCCHelpers", "machine_from_remote result=" & ExtractMachineIdFromProgramStatusTag(remoteTag)
+    LogMsg LOG_LEVEL_INFO, "WinCCHelpers", "normal_build MNA_0269=" & localTag
+    LogMsg LOG_LEVEL_INFO, "WinCCHelpers", "tunnel_build MNA_0407=" & remoteTag
+    LogMsg LOG_LEVEL_INFO, "WinCCHelpers", "normal_count MNA_0269=" & BuildCountTagFullName("MNA_0269", "Aborted")
+    LogMsg LOG_LEVEL_INFO, "WinCCHelpers", "tunnel_count MNA_0407=" & BuildCountTagFullName("MNA_0407", "Aborted")
+    LogMsg LOG_LEVEL_INFO, "WinCCHelpers", "strip_normal result=" & StripWinCCServerPrefix(localTag)
+    LogMsg LOG_LEVEL_INFO, "WinCCHelpers", "strip_tunnel result=" & StripWinCCServerPrefix(remoteTag)
+    LogMsg LOG_LEVEL_INFO, "WinCCHelpers", "machine_from_normal result=" & ExtractMachineIdFromProgramStatusTag(localTag)
+    LogMsg LOG_LEVEL_INFO, "WinCCHelpers", "machine_from_tunnel result=" & ExtractMachineIdFromProgramStatusTag(remoteTag)
 End Sub
 
 Private Sub GetCombinedFractions(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByVal tFrom, ByVal tTo, ByVal periodKey, ByRef fRun, ByRef fHalt, ByRef fAbort, ByRef inputValid, ByRef failureKind, ByRef failedStatus, ByRef failureDetail)
@@ -1087,7 +1106,6 @@ Public Sub MainStatusAggregation(ByVal machineId)
     ValidateWinCCTagHelpers
 
     masterRole = IsMaster()
-    LogMsg LOG_LEVEL_INFO, "MainStatusAggregation", "wincc_remote_tag_prefix=" & WINCC_REMOTE_TAG_PREFIX
     LogMsg LOG_LEVEL_INFO, "MainStatusAggregation", "redundancy_role master=" & LCase(CStr(masterRole))
 
     If Not G_MACHINES.Exists(machineId) Then

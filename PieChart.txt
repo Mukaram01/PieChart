@@ -273,6 +273,10 @@ Private Function StripWinCCServerPrefix(ByVal tagName)
     End If
 End Function
 
+Private Function BuildMachineOutputTag(ByVal machineId, ByVal periodKey, ByVal outputName)
+    BuildMachineOutputTag = GetMachineTagPrefix(machineId) & machineId & "_" & periodKey & "_Machine_" & outputName
+End Function
+
 Private Function BuildProgramStatusTag(ByVal machineId, ByVal statusName)
     BuildProgramStatusTag = GetMachineTagPrefix(machineId) & machineId & "_ProgramStatus_" & statusName
 End Function
@@ -997,7 +1001,7 @@ Private Sub AggregatePeriod(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByV
     Dim tFrom, tTo, t0, elapsed
     Dim fRun, fHalt, fAbort, inputValid
     Dim pRun, pHalt, pAbort
-    Dim base, totalCombined
+    Dim totalCombined
     Dim failureCooldownMinutes, failureUntil, failureKey
     Dim failureKind, failedStatus, failureDetail
     Dim resultLabel, stampNormalThrottle
@@ -1042,16 +1046,14 @@ Private Sub AggregatePeriod(ByVal cn, ByVal runtimeCatalog, ByVal machineId, ByV
         resultLabel = "zero_no_data"
     End If
 
-    base = machineId & "_" & periodKey & "_Machine_"
-
     If writeOutputs Then
-        WriteNumericOutputTag base & "Running_Percentage", pRun
-        WriteNumericOutputTag base & "Halted_Percentage", pHalt
-        WriteNumericOutputTag base & "Aborted_Percentage", pAbort
-
-        WriteNumericOutputTag base & "Running_Percentage_PieChart", PieVal(pRun)
-        WriteNumericOutputTag base & "Halted_Percentage_PieChart", PieVal(pHalt)
-        WriteNumericOutputTag base & "Aborted_Percentage_PieChart", PieVal(pAbort)
+        WriteNumericOutputTag BuildMachineOutputTag(machineId, periodKey, "Running_Percentage"), pRun
+        WriteNumericOutputTag BuildMachineOutputTag(machineId, periodKey, "Halted_Percentage"), pHalt
+        WriteNumericOutputTag BuildMachineOutputTag(machineId, periodKey, "Aborted_Percentage"), pAbort
+    
+        WriteNumericOutputTag BuildMachineOutputTag(machineId, periodKey, "Running_Percentage_PieChart"), PieVal(pRun)
+        WriteNumericOutputTag BuildMachineOutputTag(machineId, periodKey, "Halted_Percentage_PieChart"), PieVal(pHalt)
+        WriteNumericOutputTag BuildMachineOutputTag(machineId, periodKey, "Aborted_Percentage_PieChart"), PieVal(pAbort)
     Else
         LogMsg LOG_LEVEL_INFO, "Aggregate", "output_write_skipped_standby machine=" & machineId & " period=" & periodKey
     End If
